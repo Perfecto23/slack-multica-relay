@@ -17,8 +17,10 @@ The relay acknowledges Slack only after QStash accepts the event. Queue consumer
 ## Admission rules
 
 - Slack signature and timestamp must be valid.
-- Team, channel and mention targets are explicit allowlists.
-- Sender allowlisting is optional.
+- Team and mention targets are explicit allowlists.
+- The channel allowlist is required and accepts explicit Slack IDs or `all`.
+- The sender allowlist is optional and accepts explicit Slack IDs or `all`.
+- Channel and sender blocklists take precedence over allowlists.
 - Bot messages, edited messages and deleted messages are ignored.
 - Queue consumption rechecks the current admission policy.
 
@@ -38,7 +40,7 @@ pnpm test
 pnpm lint
 ```
 
-Copy `.env.example` into a local environment file and provide credentials through your deployment platform's secret store. Never commit prompts, credentials, private deployment records or persona material.
+See [Configuration](docs/CONFIGURATION.md) for every Relay variable and the separate Multica Agent runtime boundary. Copy `.env.example` into a local environment file and provide credentials through your deployment platform's secret store. Never commit prompts, credentials, private deployment records or persona material.
 
 The repository includes adapters for Vercel Functions and EdgeOne Cloud Functions. The shared behavior lives in `src/`.
 

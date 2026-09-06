@@ -16,6 +16,3 @@ docs/private/
 *.key
 *.crt
 .DS_Store
-.vercel
-.env*
-!.env.example
