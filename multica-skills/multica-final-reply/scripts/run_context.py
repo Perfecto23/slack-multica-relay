@@ -23,7 +23,7 @@ def write_new(path, value):
 
 def query(command):
     try:
-        result = subprocess.run(["rtk", "proxy", *command], capture_output=True,
+        result = subprocess.run(command, capture_output=True,
                                 text=True, timeout=30, check=True)
         return json.loads(result.stdout)
     except (subprocess.SubprocessError, ValueError):

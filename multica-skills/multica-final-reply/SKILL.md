@@ -10,7 +10,7 @@ description: 在 Perfecto Assistant 需要向 Slack Relay 原线程发送已获�
 ## 回复流程
 
 1. 按 `runtime/SKILLS.md` 读取 `perf-communication-style` 作为正文风格真源，并读取当前任务需要的 Slack、GitHub 或其他专项 Skill，完成业务任务并核实结果。只引用维护中的本地风格 Skill，不把私人风格内容复制进本公开 Skill。
-2. 执行 `rtk proxy python3 <本 Skill 路径>/scripts/run_context.py --issue <当前 Issue UUID> --output <任务私有目录/run-context.json>`。脚本使用真实 `MULTICA_TASK_ID`，只读取当前 run、所属 Agent 配置和 run messages；不选择其他 run，也不等待日志补齐。
+2. 执行 `python3 <本 Skill 路径>/scripts/run_context.py --issue <当前 Issue UUID> --output <任务私有目录/run-context.json>`。脚本使用真实 `MULTICA_TASK_ID` 和当前 Runtime 已认证的 `multica` CLI，只读取当前 run、所属 Agent 配置和 run messages；不选择其他 run，也不等待日志补齐。
 3. 读取 `run-context.json`。`statistics` 可直接交给 reply adapter；`code_evidence` 只是候选。根据当前业务任务选择实际相关且已成功的 PR，排除示例、仅讨论内容、失败命令、无法唯一配对或已截断的结果。必要时按 `moe-github-workflow` 只读补查。
 4. 有可核验 PR 时，在任务私有目录创建 `github-context.json`：
 
