@@ -19,7 +19,7 @@ class FinalReplyTests(unittest.TestCase):
     def message(self, kind, **fields):
         self.data["messages"].append({"seq": len(self.data["messages"]) + 1, "type": kind, "task_id": "run", "issue_id": "issue", **fields})
 
-    def test_query_uses_the_runtime_multica_cli_without_an_rtk_dependency(self):
+    def test_query_uses_the_runtime_multica_cli_directly(self):
         completed = subprocess.CompletedProcess(['multica'], 0, '{"ok": true}', '')
         with patch.object(final.subprocess, 'run', return_value=completed) as run:
             self.assertEqual(final.query(['multica', 'agent', 'list']), {'ok': True})
@@ -79,7 +79,7 @@ class FinalReplyTests(unittest.TestCase):
     def test_skill_names_deduplicate_and_tokens_never_render(self):
         self.run.update(model="gpt-6-astra", usage=[{"input_tokens": 999}])
         for _ in range(2):
-            self.message("tool_use", tool="exec_command", input={"command": "/bin/zsh -lc 'rtk proxy cat /skills/slack/SKILL.md'"})
+            self.message("tool_use", tool="exec_command", input={"command": "/bin/zsh -lc 'cat /skills/slack/SKILL.md'"})
             self.message("tool_result", tool="exec_command", output="---\nname: slack\ndescription: test\n---\n正文")
         stats = final.statistics(self.data)
         self.assertEqual(stats["tools"], 2)
