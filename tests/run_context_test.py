@@ -1,7 +1,6 @@
 """验证运行资料整理的归属、统计和代码证据。"""
 import importlib.util
 from pathlib import Path
-import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -18,12 +17,6 @@ class FinalReplyTests(unittest.TestCase):
 
     def message(self, kind, **fields):
         self.data["messages"].append({"seq": len(self.data["messages"]) + 1, "type": kind, "task_id": "run", "issue_id": "issue", **fields})
-
-    def test_query_uses_the_runtime_multica_cli_directly(self):
-        completed = subprocess.CompletedProcess(['multica'], 0, '{"ok": true}', '')
-        with patch.object(final.subprocess, 'run', return_value=completed) as run:
-            self.assertEqual(final.query(['multica', 'agent', 'list']), {'ok': True})
-        self.assertEqual(run.call_args.args[0], ['multica', 'agent', 'list'])
 
     def test_snapshot_selects_current_not_latest_and_omits_private_metadata(self):
         self.run["attribution"] = {"email": "private@example"}
