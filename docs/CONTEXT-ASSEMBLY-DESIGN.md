@@ -106,6 +106,8 @@ footer 使用每个新事件各自冻结的快照和 `messageTs`；只有配置�
 
 这里保证经适配器发送的回复格式；它不是对全部本地工具或直接 Slack API 调用的强制安全代理。普通 Relay 回复的调用入口通过私有 Skills 配置绑定。
 
+可选的最终回复 Skill 在发送前只读采集当前 `MULTICA_TASK_ID` 的运行统计和 GitHub 操作候选。业务相关性由 Agent 判断，结构化结果交给 adapter 校验并渲染；未唯一配对、失败、截断或仅出现在文档示例中的记录不能作为 PR/分支成果。现有 source scope、at-most-once ledger 和发送后回读保持不变。
+
 
 ## 消息变化标记
 

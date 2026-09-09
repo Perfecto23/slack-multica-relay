@@ -53,7 +53,70 @@ def footer_for(config, envelope):
     return footer
 
 
-def render_reply(config, envelope, text, delivery_block_id=None):
+def format_duration(seconds):
+    if not isinstance(seconds, int) or isinstance(seconds, bool) or not 0 <= seconds <= 604800:
+        return None
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f'{hours}h {minutes:02d}m'
+    if minutes:
+        return f'{minutes}m {seconds:02d}s'
+    return f'{seconds}s'
+
+
+def run_statistics(path, issue_id, task_id=None):
+    if not path:
+        return None
+    data = json.loads(Path(path).read_text())
+    if (not isinstance(data, dict) or data.get('version') != 1 or data.get('issue_id') != issue_id
+            or (task_id is not None and data.get('run_id') != task_id)):
+        raise ValueError('invalid_run_context')
+    stats = data.get('statistics')
+    if not isinstance(stats, dict):
+        raise ValueError('invalid_run_context')
+    rendered = []
+    duration = format_duration(stats.get('duration_seconds'))
+    if duration:
+        rendered.append(':agent_time: ' + duration)
+    model = stats.get('model')
+    if (stats.get('model_source') == 'agent_config' and isinstance(model, str)
+            and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}', model)):
+        rendered.append(':agent_mdi_robot_outline_muted: ' + model)
+    for key, icon, label in (('tools', ':agent_tool:', 'tools'), ('skills', ':agent_skill:', 'skills')):
+        value = stats.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 10000:
+            rendered.append(f'{icon} {value} {label}')
+    return ' · '.join(rendered) or None
+
+
+def github_footers(path):
+    if not path:
+        return []
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('pullRequests'), list):
+        raise ValueError('invalid_github_context')
+    if len(data['pullRequests']) > 5:
+        raise ValueError('invalid_github_context')
+    rows, seen = [], set()
+    for item in data['pullRequests']:
+        if not isinstance(item, dict):
+            raise ValueError('invalid_github_context')
+        repository, branch, number, url = (item.get(key) for key in ('repository', 'branch', 'number', 'url'))
+        if (not isinstance(repository, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository)
+                or not isinstance(branch, str) or not 1 <= len(branch) <= 200 or re.search(r'[\r\n`<>]', branch)
+                or not isinstance(number, int) or isinstance(number, bool) or number < 1
+                or url != f'https://github.com/{repository}/pull/{number}'):
+            raise ValueError('invalid_github_context')
+        if url in seen:
+            continue
+        seen.add(url)
+        repo = repository.split('/', 1)[1]
+        rows.append(f':agent_mdi_github: {repo} · `{branch}` · <{url}|PR #{number}>')
+    return rows
+
+
+def render_reply(config, envelope, text, delivery_block_id=None, statistics=None, github_rows=None):
     event = envelope['eventPayload']
     if event.get('teamId') != config['teamId'] or not re.fullmatch(r'[CDG][A-Z0-9]+', event.get('channelId', '')):
         raise ValueError('invalid_reply_scope')
@@ -66,11 +129,12 @@ def render_reply(config, envelope, text, delivery_block_id=None):
     if not body or len(body) > 35000:
         raise ValueError('invalid_reply_length')
     blocks = [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': body[i:i + 3000]}} for i in range(0, len(body), 3000)]
-    context = {'type': 'context', 'elements': [{'type': 'mrkdwn', 'text': footer}]}
+    context_lines = [line for line in [statistics, *(github_rows or []), footer] if line]
+    context = {'type': 'context', 'elements': [{'type': 'mrkdwn', 'text': line} for line in context_lines]}
     if delivery_block_id:
         context['block_id'] = delivery_block_id
     blocks.append(context)
-    return {'channel': event['channelId'], 'thread_ts': event['threadTs'], 'text': body + '\n\n' + footer,
+    return {'channel': event['channelId'], 'thread_ts': event['threadTs'], 'text': body + '\n\n' + '\n'.join(context_lines),
             'blocks': blocks, 'unfurl_links': False, 'unfurl_media': False}
 
 
@@ -215,6 +279,8 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     parser.add_argument('--issue-id', required=True)
     parser.add_argument('--comment-id')
     parser.add_argument('--text-file', required=True)
+    parser.add_argument('--run-context-file')
+    parser.add_argument('--github-context-file')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
     config_path = Path(args.config)
@@ -222,7 +288,9 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     envelope = read_source(config, args.issue_id, args.comment_id, runner)
     identity = delivery_identity(config, args.issue_id, args.comment_id)
     block_id = 'relay-delivery-' + identity
-    payload = render_reply(config, envelope, Path(args.text_file).read_text(), block_id)
+    stats = run_statistics(args.run_context_file, args.issue_id, os.environ.get('MULTICA_TASK_ID'))
+    github_rows = github_footers(args.github_context_file)
+    payload = render_reply(config, envelope, Path(args.text_file).read_text(), block_id, stats, github_rows)
     if args.dry_run:
         print(json.dumps(payload, ensure_ascii=False))
         return
