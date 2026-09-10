@@ -24,7 +24,7 @@ description: 在 Multica 的 Slack Relay 任务需要向原线程发送已获授
 }
 ```
 
-5. 阅读 [Footer 展示](references/footer-display.md)，将完整正文写入私有文本文件，通过配置中的 `adapterPath` 一次发送：`python3 <adapterPath> --config <FINAL_REPLY_CONFIG> --issue-id <当前 Issue UUID> --text-file <正文文件> --run-context-file <本次采集文件>`。回复 follow-up 时加本次触发的 `--comment-id`，不要复用首次来源；有已核验 GitHub 结果时加 `--github-context-file`。原频道与根 thread 从来源 Issue/comment 回读，Agent 不自行指定其他目的地。发送后的 `ok` 与 `message_ts` 必须经过 adapter 的线程回读；结果不明遵循 at-most-once ledger，不能直接重发。
+5. 阅读 [Footer 展示](references/footer-display.md)，将完整正文写入私有文本文件，通过配置中的 `adapterPath` 一次发送：`python3 <adapterPath> --config <FINAL_REPLY_CONFIG> --issue-id <当前 Issue UUID> --text-file <正文文件> --run-context-file <本次采集文件>`。回复 follow-up 时加本次触发的 `--comment-id`，不要复用首次来源；有已核验 GitHub 结果时加 `--github-context-file`。原频道与根 thread 从来源 Issue/comment 回读，Agent 不自行指定其他目的地。收到 `slack_rate_limited` 时按 `retry_after_seconds` 等待后，用相同来源命令重试；持续限流时如实说明尚未送达，不清理 ledger。发送后的 `ok` 与 `message_ts` 必须经过 adapter 的线程回读；结果不明遵循 at-most-once ledger，不能直接重发。
 
 采集失败或输出不可用时省略对应元数据参数，继续发送已获授权的正常正文；不读取遗留输出或其他 run 补值。不要把原始日志、凭据、私有路径或整份配置发到 Slack。配置缺失时回到当前 Runtime 已批准的发送入口，不猜凭据、身份或路由。
 

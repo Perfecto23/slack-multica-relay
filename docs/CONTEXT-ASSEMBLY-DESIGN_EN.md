@@ -107,6 +107,8 @@ This contract governs messages sent through the adapter. It is not a mandatory s
 
 The optional final-reply Skill reads statistics and GitHub-operation candidates only from the current `MULTICA_TASK_ID` before sending. The Agent decides business relevance, while the adapter validates and renders the structured result. Unpaired, failed, truncated, or documentation-only evidence cannot become a PR/branch result. The existing source scope, at-most-once ledger, and post-send readback remain unchanged.
 
+A definite send rate limit persists `rate_limited/retryAt` and permits retry only after cooldown. Server failures and unknown results retain `attempting`; failed reconciliation never authorizes another send. See [Configuration](CONFIGURATION_EN.md) for error classification and CLI response fields.
+
 ## Message change labels
 
 A side message uses `change=new` when absent from the sent index, `updated` when its fingerprint differs, `referenced` when explicitly linked, and `context` when retained as a parent or as one of at most two preceding messages for a change. A parent does not become updated because a child changed. An updated node contains only its current body, never an implicit old copy. New means new relative to the sent baseline, not necessarily newly posted. Without a baseline, nodes are labeled only as context or references; the Relay does not claim a comparison. Missing messages do not create deletion notices because window, pagination, and focused-selection limits can also explain absence.

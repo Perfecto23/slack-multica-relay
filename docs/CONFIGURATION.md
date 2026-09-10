@@ -113,6 +113,10 @@ adapter 根据来源 Issue/comment 生成稳定 delivery block ID，并在配置
 
 如果 POST 结果未知，重试从本机尝试时间前五分钟开始查找，以容纳 clock skew。找到 delivery block 后进入 `sent`；未找到则返回 `slack_delivery_unknown`，绝不自动重复 POST，因为“查询为空”不能证明 Slack 没有提交。清理这条状态前必须在原线程独立核对。同一来源的并发执行无法取得本机锁时立即返回 `reply_delivery_busy`，不会阻塞等待。`SLACK_USER_TOKEN` 除 `chat:write` 外，还需要 `conversations.replies` 对应的 history scope。
 
+发送错误只对已知明确的鉴权、权限、参数或目标拒绝清理 intent。`internal_error`、`fatal_error`、其他服务端/未知错误、非 429 HTTP 错误和损坏响应保留 `attempting`，下一次先回读，不能盲目再次 POST。
+
+HTTP 429 或 JSON `rate_limited`/`ratelimited` 使发送 ledger 进入 `rate_limited`，并保存 `Retry-After` 对应的 `retryAt`。CLI 返回 `slack_rate_limited`、`retryable: true` 和 `retry_after_seconds`；调用方等待后重新执行同一发送命令，等待期内不调用 Slack，到期后允许再次发送。缺失或无效的 Retry-After 使用 60 秒冷却，CLI 不自行睡眠或循环。回读时遇到限流只延后回读，不改变原 `accepted`/`attempting` 状态。
+
 footer appearance 每次发送时都从私有配置读取。`displayName` 是完整 attribution label，可以包含 Unicode emoji 或 Slack shortcode。修改后从下一次发送生效，无需重启 Runtime 或重新部署 Relay；已有消息不会改变。修改时必须保留其他路由和身份字段。
 
 ```json

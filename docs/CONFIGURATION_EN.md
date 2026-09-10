@@ -113,6 +113,10 @@ The adapter derives a stable delivery block ID from the source Issue/comment and
 
 If the POST result is unknown, a retry searches from five minutes before the local attempt time to allow for clock skew. A found delivery block advances to `sent`. An empty read returns `slack_delivery_unknown` and never repeats the POST automatically, because absence does not prove Slack failed to commit. Independently verify the original thread before clearing that state. Concurrent execution for the same source returns `reply_delivery_busy` immediately rather than waiting on a blocking lock. In addition to `chat:write`, `SLACK_USER_TOKEN` needs the history scope required by `conversations.replies`.
 
+Only known, definite authentication, permission, validation, or destination rejections clear the send intent. Internal/fatal server errors, unknown results, non-429 HTTP errors, and malformed responses retain `attempting`; later invocations reconcile by marker before any resend.
+
+HTTP 429 or JSON `rate_limited`/`ratelimited` puts the send ledger in `rate_limited` with a persisted `retryAt` derived from `Retry-After`. The CLI reports `slack_rate_limited`, `retryable: true`, and `retry_after_seconds`. The caller waits before running the same source command again; no Slack call occurs during the cooldown, and a send becomes eligible after it expires. Missing or invalid Retry-After uses a 60-second cooldown. The CLI does not sleep or loop. A rate-limited readback preserves the original `accepted`/`attempting` state and only delays reconciliation.
+
 Footer appearance is read from the private configuration on every send. `displayName` is the complete attribution label and may contain Unicode emoji or Slack shortcodes. A change applies to the next send without a Runtime restart or Relay redeploy; existing messages remain unchanged. Preserve every other routing and identity field.
 
 ```json
