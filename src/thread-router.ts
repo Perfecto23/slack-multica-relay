@@ -11,6 +11,12 @@ import {
   type ApiConfig,
 } from "./multica-api.js";
 import type { MentionMatch } from "./mentions.js";
+import { addSlackReaction } from "./reaction.js";
+import {
+  cancelThread,
+  maxTimestamp,
+  type CancellationState,
+} from "./cancellation.js";
 import { type ThreadStore } from "./thread-store.js";
 import { buildEnvelope, focusContext, messageFingerprint, compareTs, type ThreadContext } from './context-envelope.js';
 
@@ -25,23 +31,37 @@ export interface SlackThreadEvent {
   files?: unknown;
   filesTruncated?: boolean;
   sourceFingerprint?: string;
+  operation?: "dispatch" | "cancel";
 }
 export interface ThreadRouterConfig extends ApiConfig {
   store: ThreadStore;
   readContext: (event: SlackThreadEvent) => Promise<ThreadContext>;
+  slackReactionToken?: string;
+  slackReactionName?: string;
 }
-interface ThreadState {
+export interface ThreadState {
   version: 2;
   rootMessageKey: string;
   issueId?: string;
   creating: boolean;
+  lastMessageTs?: string;
+  ignoredThrough?: string;
+  reactionMessages?: string[];
+  reactionHistoryKnown?: boolean;
+  cancellation?: CancellationState;
 }
 interface MessageState {
   phase: "writing" | "done" | "rejected";
 }
 export interface ThreadRouteResult {
-  action: "created" | "comment_persisted" | "duplicate";
-  issueId: string;
+  action:
+    | "created"
+    | "comment_persisted"
+    | "duplicate"
+    | "cancelled"
+    | "no_active_run"
+    | "ignored";
+  issueId?: string;
 }
 export const STATE_TTL_SECONDS = 90 * 24 * 60 * 60;
 export function threadKey(event: SlackThreadEvent): string {
@@ -90,6 +110,53 @@ export async function routeSlackThreadEvent(
         creating: false,
       };
     const marker = `<!-- relay-thread:${scope}:${digest(threadKey(event))} -->`;
+    const save = () =>
+      config.store.set(key, JSON.stringify(state), STATE_TTL_SECONDS);
+    if (event.operation === "cancel")
+      return await cancelThread(event, state, marker, config, save, fetchImpl);
+    if (state.cancellation && state.cancellation.phase !== "done") {
+      state.ignoredThrough = maxTimestamp(
+        state.ignoredThrough,
+        event.messageTs,
+      );
+      await save();
+      return { action: "ignored", issueId: state.issueId };
+    }
+    if (
+      state.ignoredThrough &&
+      compareTs(event.messageTs, state.ignoredThrough) <= 0
+    )
+      return { action: "ignored", issueId: state.issueId };
+    state.lastMessageTs = maxTimestamp(state.lastMessageTs, event.messageTs);
+    // 保存触发消息，再尝试外部写入，取消恢复才能找到响应丢失的消息。
+    state.reactionMessages ??= raw
+      ? [state.rootMessageKey.split(":").at(-1)!]
+      : [];
+    if (!state.reactionMessages.includes(event.messageTs))
+      state.reactionMessages.push(event.messageTs);
+    await save();
+    const finish = async (
+      action: "created" | "comment_persisted" | "duplicate",
+    ): Promise<ThreadRouteResult> => {
+      // 添加和取消清理共用线程锁，避免迟到的启动 reaction 出现在已取消任务上。
+      if (config.slackReactionToken && config.slackReactionName) {
+        try {
+          await addSlackReaction(
+            config.slackReactionToken,
+            event.channelId,
+            event.messageTs,
+            config.slackReactionName,
+            fetchImpl,
+          );
+        } catch {
+          console.warn("relay_reaction", {
+            eventId: digest(messageKey(event)),
+            reason: "reaction_failed",
+          });
+        }
+      }
+      return { action, issueId: state.issueId };
+    };
     const selectionKey = key + ':sent-context-index';
     type SelectionIndex = { version: 2; cutoffTs: string; messages: Record<string,string> };
     const advanceSelection = async (): Promise<void> => {
@@ -165,6 +232,8 @@ export async function routeSlackThreadEvent(
           )
             throw new Error("invalid_thread_state");
           state.rootMessageKey = messageKey(original.eventPayload);
+          if (!state.reactionMessages!.includes(original.eventPayload.messageTs))
+            state.reactionMessages!.push(original.eventPayload.messageTs);
         }
       } else {
         if (state.creating) throw new Error("ambiguous_issue_create");
@@ -180,6 +249,7 @@ export async function routeSlackThreadEvent(
             fetchImpl,
           );
           state.issueId = created.id;
+          state.reactionHistoryKnown = true;
         } catch (error) {
           // Definite request rejection permits a later retry; 5xx/transport or
           // malformed success may have committed, so retain the write intent.
@@ -203,7 +273,7 @@ export async function routeSlackThreadEvent(
     }
     const previous = await config.store.get(msgKey);
     if (previous && (JSON.parse(previous) as MessageState).phase === "done")
-      return { action: "duplicate", issueId: state.issueId };
+      return await finish("duplicate");
     if (messageKey(event) === state.rootMessageKey) {
       await advanceSelection();
       await config.store.set(
@@ -211,7 +281,7 @@ export async function routeSlackThreadEvent(
         JSON.stringify({ phase: "done" }),
         STATE_TTL_SECONDS,
       );
-      return { action: "created", issueId: state.issueId };
+      return await finish("created");
     }
     const messageMarker = `<!-- relay-message:${digest(messageKey(event))} -->`;
     const existingComment = await findComment(
@@ -261,7 +331,7 @@ export async function routeSlackThreadEvent(
       JSON.stringify({ phase: "done" }),
       STATE_TTL_SECONDS,
     );
-    return { action: "comment_persisted", issueId: state.issueId };
+    return await finish("comment_persisted");
   } finally {
     await config.store.releaseIfOwner(lockKey, owner);
   }

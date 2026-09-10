@@ -20,7 +20,9 @@ Slack ID 使用逗号分隔的大写标识符。`SLACK_TARGET_USER_IDS` 与 `SLA
 | `SLACK_BLOCKED_CHANNEL_IDS` | 否 | 永不触发的 Channel ID；即使 allowlist 为 `all` 也优先阻止。 |
 | `SLACK_ALLOWED_SENDER_IDS` | 否 | 允许触发的 User ID。缺失或留空等同 `all`；owner-only 部署应填写 owner 的准确 ID。 |
 | `SLACK_BLOCKED_SENDER_IDS` | 否 | 永不允许触发的 User ID。 |
-| `SLACK_REACTION_TOKEN` | 是 | 用于添加确认 reaction 的 Slack user token。不得进入 Git 或日志。 |
+| `SLACK_BOT_TOKEN` | 条件必填 | reaction 添加、查询和清理优先使用的 Bot 身份，需 reactions:read/write。 |
+| `SLACK_USER_TOKEN` | 条件必填 | 未配置 Bot 时用于 reaction 的 User 身份。 |
+| `SLACK_CANCEL_KEYWORDS` | 否 | 逗号分隔的完整取消关键词，默认 cancel,取消。 |
 | `SLACK_CONTEXT_TOKEN` | 是 | 带目标会话 history scopes 的 user token。consumer 用它读取有界 history/replies；如需通过 `users.info` 补充参与者姓名，还需 `users:read`。可以与 reaction 使用同一个已授权 token，但必须显式配置。 |
 | `SLACK_REACTION_NAME` | 是 | 不带冒号的 Slack emoji shortcode，例如 `eyes`。reaction 只确认 Relay 已持久化，不证明 Agent 已完成。 |
 
@@ -51,6 +53,16 @@ Redis 必须由该 Relay 独占，用于保存线程映射、锁和写入确认�
 Redis 还会保存 24 小时的 scoped message fingerprint index（最多 500 条）用于选择 follow-up 上下文。这些记录表示已持久化内容，不代表 Agent Session 记忆。准备好的 envelope 也保存 24 小时，包括已投递副本，直到 TTL 到期。每次新 mention 都重新读取 timeline；只有同一事件的重试复用冻结快照。旧 background cache key 不再读写，按原 TTL 自然过期。Multica 按自己的保留策略保存已投递 envelope；Redis 到期不会删除 Multica 内容。
 
 Relay 在发布到 QStash 前，把每个 Slack file object 投影为 `id`、`name`、`mime`、`size` 和 `contentStatus`，并额外携带由完整安全字段生成的 fingerprint。下载内容、private URL、thumbnail、shares 和凭据不会进入队列 payload。暂时性或结果不明的失败返回 503 交给 QStash 有限重试；无效队列 payload、损坏的持久状态、scope 违反、无法消除的映射歧义和确定性体积超限返回 `rejected` 与 `retryable: false`。访问失败和有界读取缺失按上下文合同表达。
+
+## 取消与 reaction 身份
+
+在原任务 thread 发送目标 mention 加完整的 `cancel` 或 `取消` 可停止关联任务。`SLACK_CANCEL_KEYWORDS` 的非空列表替换默认词；只有 `SLACK_TARGET_USER_IDS` 中的发送者可取消，用户组 mention 不授予取消权，入队与消费时都复核准入。取消不创建新的 Agent 任务，也不读取上下文树。
+
+取消意图、run ID 集合和清理进度与原线程映射一起保存在 Redis；重试只处理原 run 集合。取消期间收到的普通消息被忽略；结束后新 mention 可继续原 Issue。回读 run 终态后仅清理所选身份自己的 reaction，其他人的表情保留。`cancelled` 证明 Multica 状态及中断请求，不是独立的 daemon 停止确认，也不会撤销已完成的外部写入。
+
+reaction 添加、查询和清理统一使用非空 `SLACK_BOT_TOKEN`，未配置时使用 `SLACK_USER_TOKEN`。所选身份需要 `reactions:read`、`reactions:write` 和目标频道访问权；调用失败不会换身份。上下文仍用 `SLACK_CONTEXT_TOKEN`，Agent 最终回复仍使用 Runtime 自己的 user token。
+
+旧 `SLACK_REACTION_TOKEN` / `SLACK_REACTION_READ_TOKEN` 不再读取。升级前将现有凭据按原身份配置到新变量，确认后再切换代码；旧变量可保留给旧部署回滚使用。若从 User 切到 Bot，历史 User reaction 保留。回滚取消功能前应先处理队列内 `operation=cancel` 的消息，避免旧消费者将其当普通请求。QStash 重试耗尽时保留 DLQ 责任，不删除 Redis 状态来强行重发。
 
 ## Multica Agent Runtime
 
@@ -110,6 +122,28 @@ footer appearance 每次发送时都从私有配置读取。`displayName` 是完
 ```
 
 以上示例只展示 appearance 字段；真实配置必须保留其余必填字段。
+
+## 最终回复与私有风格配置
+
+将 `multica-skills/multica-final-reply` 发布并绑定到目标 Agent。`FINAL_REPLY_CONFIG` 指向 owner-only 的私有 JSON；与已有 adapter 的必填字段一起保存下列可选配置。个人 Prompt、表情选择和 workspace 表情目录放在仓库外或已忽略的 `.private/` 中，不发布到公开 Skill。
+
+```json
+{
+  "adapterPath": "/path/to/relay/scripts/slack-reply.py",
+  "styleGuide": "/path/to/private/communication/SKILL.md",
+  "emojiGuide": "/path/to/private/emoji/favorites.md",
+  "emojiCatalog": "/path/to/private/emoji/catalog.json",
+  "icons": {"time": "⏱️", "model": "🤖", "tools": "🔧", "skills": "🪄", "github": "🔗", "multica": "↗️"}
+}
+```
+
+这些是附加字段，保留原 JSON 的 `displayName`、`agentId`、`workspaceId`、`projectId`、`teamId`、`serverUrl`。图标可使用当前 workspace 已确认存在的 shortcode。未指定个人风格时使用通用回复风格；表情库不全量进入每次模型输入。
+
+Agent 环境的 `FINAL_REPLY_APP_URL` 为 Multica 网页 HTTPS 根地址，`FINAL_REPLY_WORKSPACE_SLUG` 为工作区 slug。采集器支持等价的 `--app-url`、`--workspace-slug` 及 `--issue-identifier` 显式参数，优先于环境；未提供时只读补查，缺失则省略链接。隔离运行应显式配置环境值，不依赖宿主个人 CLI 配置。
+
+`--run-context-file` 除统计外携带当前任务的编号与链接；adapter 核对 Issue 和当前 run 后在统计行末尾渲染任务入口。`--github-context-file` 使用 `version: 1`、`pullRequests` 数组及可选 `branches` 数组；分支项包含 `repository`（owner/repo）与 `branch`，PR 项另含 `number` 和对应的完整 GitHub `url`，合计最多五项。每项单独一个 context block，fallback 保留同样的信息。有效本轮统计不再叠加旧 envelope 的模型行，attribution 和 delivery marker 仍保留。
+
+发布后回读 Skill 全部文件及 Agent 绑定；已有任务可能继续使用其启动时复制的旧 Skill，新任务才能证明加载。配置保存、只读 dry-run 和真实 Slack 发送分别验收。
 
 ## Cloudflare Workers
 

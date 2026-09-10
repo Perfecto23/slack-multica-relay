@@ -99,7 +99,6 @@ Relay 的固定 `task.instructions` 解释当前请求、树节点、缺失标�
 
 footer 使用每个新事件各自冻结的快照和 `messageTs`；只有配置模型已知且 Agent 匹配时显示。priority 追加 Fast，default/null 不追加 Fast，null 不证明默认档位关闭。查询失败或模型为空时省略模型字段，自动化标识仍由发送适配器追加。scripts/slack-reply.py 从原 Issue/Comment 回读 envelope，从私有配置读取固定显示名，将正文发送为 section blocks，并追加 context/mrkdwn footer；fallback text 同样包含正文和 footer。任务说明只指向运行时发送入口，格式与标识由代码负责，人格 Instructions 不要求模型生成标识。
 
-展示和 footer 参考 winchesHe/slack-multica-relay 的已合并 PR #3/#4；操作规范参考 #5，并适配本仓库的上下文与私有配置边界。
 
 
 发送适配器配置保存在私有 Runtime 中，字段为 displayName（包含 emoji 的完整显示文字）、agentId、workspaceId、projectId、teamId、serverUrl，不包含凭据。--issue-id/--comment-id 定位本次来源，--text-file 提供正文；适配器核对 Issue 的 workspace/project/assignee 与配置一致，路由取自原 envelope。认证沿用 multica CLI 和 `SLACK_USER_TOKEN`。--dry-run 只生成 payload，不发消息。每个 source Issue/comment 生成稳定的 delivery block ID，并在配置旁、已忽略的私有 `.slack-reply-state/` 原子记录 `attempting/accepted/sent`；文件和父目录均在 POST 前同步。Slack 返回的消息时间用于窄范围发送后回读；`sent` 重跑直接返回持久结果。结果不明时从本机尝试时间前五分钟开始核对，不从原请求扫描整条长线程；查不到 marker 时返回 `slack_delivery_unknown`，不得自动重复 POST，清理该状态前必须在原线程独立核对。本机同源锁不可获得时立即返回 `reply_delivery_busy`。

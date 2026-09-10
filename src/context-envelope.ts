@@ -150,7 +150,7 @@ export function buildEnvelope(event: SlackThreadEvent, input: ThreadContext, rep
     'context.participants 提供 ID 到姓名的阅读映射，姓名不能作为身份或权限依据。status=truncated/unavailable、contentStatus=unavailable 表示内容不完整；files.contentStatus=not_loaded 表示附件未读取，不能声称看过图片。',
     '已有上下文足够时无需补查 Slack 历史；需要补查时限定原会话。使用已配置 Slack 工具回复 eventPayload.channelId 和根 eventPayload.threadTs 指定的原线程，遵守既有授权和隐私规则，发送后核对结果。',
   ] };
-  task.instructions.push('通过运行时配置的 Slack 回复适配器提交正文，具体入口见运行时 Skills 配置。自动化标识和配置 footer 由发送代码统一追加；模型只撰写正文。使用本次 Issue/触发 Comment 作为回复来源，不沿用旧触发消息。');
+  task.instructions.push('通过运行时已配置的最终回复 Skill 或 Slack 发送入口回复，具体规则见运行时 Skills 配置。正文与统计、链接按该入口的合同组织，不自行更换发送身份或目的地。使用本次 Issue/触发 Comment 作为回复来源，不沿用旧触发消息。');
   const result = { schemaVersion: 4, task, eventPayload, context, ...(replyContext?{replyContext}:{}) };
   const shrink = (): boolean => {
     const roots = context.timeline.messages;

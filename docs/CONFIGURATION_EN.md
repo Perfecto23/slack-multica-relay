@@ -20,7 +20,9 @@ Slack IDs are comma-separated uppercase identifiers. `SLACK_TARGET_USER_IDS` and
 | `SLACK_BLOCKED_CHANNEL_IDS` | No | Channel IDs that must never trigger, including when the allowlist is `all`. |
 | `SLACK_ALLOWED_SENDER_IDS` | No | User IDs allowed to trigger. Missing or empty values mean `all`; an owner-only deployment should set the exact owner ID. |
 | `SLACK_BLOCKED_SENDER_IDS` | No | User IDs that must never trigger. |
-| `SLACK_REACTION_TOKEN` | Yes | Slack user token used for the acknowledgement reaction. Keep it out of Git and logs. |
+| `SLACK_BOT_TOKEN` | Conditional | Preferred identity for reaction add/read/remove; requires reactions:read and reactions:write. |
+| `SLACK_USER_TOKEN` | Conditional | Used for reactions when Bot is not configured. |
+| `SLACK_CANCEL_KEYWORDS` | No | Comma-separated whole-command words; defaults to cancel,取消. |
 | `SLACK_CONTEXT_TOKEN` | Yes | User token with history scopes for the selected conversation types. The consumer uses it for bounded history/reply reads; `users:read` enables optional participant names through `users.info`. It may contain the same authorized token as the reaction credential, but configure it explicitly. |
 | `SLACK_REACTION_NAME` | Yes | Slack emoji shortcode without colons, such as `eyes`. The reaction confirms Relay persistence, not Agent completion. |
 
@@ -51,6 +53,16 @@ The Redis database must be dedicated to this Relay. It stores thread mappings, l
 Redis also keeps scoped message-fingerprint indexes for 24 hours, up to 500 messages, to select follow-up context. These records describe persisted content rather than Agent Session memory. Prepared envelopes remain in Redis for 24 hours, including delivered copies until TTL expiry. A new mention refreshes the timeline; only retries of the same event reuse a frozen snapshot. Legacy background-cache keys are no longer read or written and expire under their existing TTL. Multica retains delivered envelopes under its own policy; Redis expiry does not delete them.
 
 Before publishing to QStash, the Relay projects every Slack file object to `id`, `name`, `mime`, `size`, and `contentStatus`, plus a fingerprint derived from the complete safe fields. Downloaded content, private URLs, thumbnails, shares, and credentials never enter the queue payload. Transient or unknown-result failures return 503 for bounded QStash retry. An invalid queued payload, corrupt persisted state, scope violation, unresolvable mapping ambiguity, or deterministic size overflow returns `rejected` with `retryable: false`. Access failures and bounded-read omissions are represented by the context contract.
+
+## Cancellation and reaction identity
+
+A target mention followed by the complete `cancel` or `取消` keyword in the original task thread stops the associated runs. A non-empty `SLACK_CANCEL_KEYWORDS` list replaces those defaults. Only senders listed in `SLACK_TARGET_USER_IDS` may cancel; user-group mentions do not grant that permission. Admission is checked before enqueueing and again during consumption. Cancellation creates no Agent task and reads no context tree.
+
+Redis persists cancellation intent, the fixed run-ID set, and remaining reaction cleanup with the thread mapping. Retries keep the original targets. Ordinary messages received during cancellation are ignored; later mentions can continue the same Issue. Terminal-state readback precedes cleanup of only the selected identity's own reactions. Multica's cancelled state and interruption request do not independently confirm daemon termination or undo completed external writes.
+
+Reaction add/read/remove consistently select a non-empty `SLACK_BOT_TOKEN`, otherwise `SLACK_USER_TOKEN`. The chosen identity needs `reactions:read`, `reactions:write`, and channel access; API failure never switches identity. Context uses `SLACK_CONTEXT_TOKEN`, while the Agent reply uses its separate Runtime user token.
+
+The old `SLACK_REACTION_TOKEN` and `SLACK_REACTION_READ_TOKEN` are no longer read. Configure the new variable for the existing identity before switching code; retain old variables for rollback if needed. Switching from User to Bot leaves historical User reactions intact. Drain or isolate queued `operation=cancel` events before rolling back, because an old consumer would dispatch them as ordinary tasks. Exhausted retries remain in QStash's DLQ; do not delete Redis state to force a resend.
 
 ## Multica Agent Runtime
 
@@ -110,6 +122,28 @@ Footer appearance is read from the private configuration on every send. `display
 ```
 
 The example shows only the appearance field. Preserve the remaining required fields in the real configuration.
+
+## Final replies and private style configuration
+
+Publish `multica-skills/multica-final-reply` and bind it to the target Agent. Set `FINAL_REPLY_CONFIG` to an owner-only private JSON file. Add the following optional fields alongside the existing adapter identity fields. Store personal prompts, favorite emojis, and workspace catalogs outside the repository or under ignored `.private/`; do not publish them with the public Skill.
+
+```json
+{
+  "adapterPath": "/path/to/relay/scripts/slack-reply.py",
+  "styleGuide": "/path/to/private/communication/SKILL.md",
+  "emojiGuide": "/path/to/private/emoji/favorites.md",
+  "emojiCatalog": "/path/to/private/emoji/catalog.json",
+  "icons": {"time": "⏱️", "model": "🤖", "tools": "🔧", "skills": "🪄", "github": "🔗", "multica": "↗️"}
+}
+```
+
+Retain `displayName`, `agentId`, `workspaceId`, `projectId`, `teamId`, and `serverUrl`. Icons may use verified workspace shortcodes. A generic reply style applies when no private style is configured; catalogs are searched on demand rather than loaded for every reply.
+
+Agent variables `FINAL_REPLY_APP_URL` and `FINAL_REPLY_WORKSPACE_SLUG` provide the Multica HTTPS web origin and workspace slug. Explicit `--app-url`, `--workspace-slug`, and `--issue-identifier` arguments take precedence; missing values use read-only discovery, and incomplete links are omitted. Isolated tasks should receive these values explicitly instead of relying on personal host CLI configuration.
+
+`--run-context-file` carries the current Issue identifier/link alongside statistics. After checking Issue and current-run identity, the adapter appends the task link to the statistics line. `--github-context-file` uses `version: 1`, a `pullRequests` array, and an optional `branches` array. Branch entries have `repository` (owner/repo) and `branch`; PR entries also carry `number` and the corresponding full GitHub `url`, with at most five entries overall. Each entry has its own context block and equivalent fallback text. Valid current-run statistics replace the older envelope model display; attribution and the delivery marker remain.
+
+Read back published Skill files and Agent bindings. Existing tasks may retain their startup copy; a new task proves loading. Configuration persistence, read-only dry-run, and real Slack delivery are separate validation stages.
 
 ## Cloudflare Workers
 

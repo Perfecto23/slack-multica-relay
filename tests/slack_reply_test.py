@@ -18,24 +18,47 @@ EVENT = {'teamId': 'T1', 'channelId': 'C1', 'threadTs': '100.000001'}
 
 class ReplyTests(unittest.TestCase):
     def test_renders_verified_run_statistics_and_github_association(self):
-        context = {'version': 1, 'issue_id': 'I1', 'run_id': 'R1', 'statistics': {
+        context = {'version': 1, 'issue_id': 'I1', 'run_id': 'R1', 'issue_identifier': 'DEMO-12', 'issue_url': 'https://multica.example/demo/issues/I1', 'statistics': {
             'duration_seconds': 187, 'model': 'gpt-6-astra', 'model_source': 'agent_config',
             'tools': 18, 'skills': 1}}
         github = {'version': 1, 'pullRequests': [{
-            'repository': 'MoeGolibrary/Boarding_Desktop', 'branch': 'bugfix-multistaff-slots',
-            'number': 6915, 'url': 'https://github.com/MoeGolibrary/Boarding_Desktop/pull/6915'}]}
+            'repository': 'example/app', 'branch': 'feature/calendar',
+            'number': 123, 'url': 'https://github.com/example/app/pull/123'}]}
         with tempfile.TemporaryDirectory() as directory:
             run_path, github_path = Path(directory) / 'run.json', Path(directory) / 'github.json'
             run_path.write_text(json.dumps(context)); github_path.write_text(json.dumps(github))
             stats = reply.run_statistics(run_path, 'I1', 'R1')
             rows = reply.github_footers(github_path)
         result = reply.render_reply(CONFIG, {'eventPayload': EVENT}, 'approved', statistics=stats, github_rows=rows)
-        self.assertEqual(result['blocks'][-1]['elements'][0]['text'],
-                         ':agent_time: 3m 07s · :agent_mdi_robot_outline_muted: gpt-6-astra · :agent_tool: 18 tools · :agent_skill: 1 skills')
-        self.assertEqual(result['blocks'][-1]['elements'][1]['text'],
-                         ':agent_mdi_github: Boarding_Desktop · `bugfix-multistaff-slots` · <https://github.com/MoeGolibrary/Boarding_Desktop/pull/6915|PR #6915>')
-        self.assertEqual(result['blocks'][-1]['elements'][2]['text'], '🤖 Example')
-        self.assertIn('PR #6915', result['text'])
+        self.assertEqual(result['blocks'][-3]['elements'][0]['text'],
+                         '⏱️ 3m 07s · 🤖 gpt-6-astra · 🔧 18 tools · 🪄 1 skills · ↗️ <https://multica.example/demo/issues/I1|DEMO-12>')
+        self.assertEqual(result['blocks'][-2]['elements'][0]['text'],
+                         '🔗 app · `feature/calendar` · <https://github.com/example/app/pull/123|PR #123>')
+        self.assertEqual(result['blocks'][-1]['elements'][0]['text'], '🤖 Example')
+        self.assertIn('PR #123', result['text'])
+
+    def test_private_icons_and_verified_branch_without_pr_render_once(self):
+        config = {**CONFIG, 'icons': {'github': ':custom_github:'}}
+        github = {'version': 1, 'pullRequests': [], 'branches': [
+            {'repository': 'owner/repo', 'branch': 'feature/a&b'},
+            {'repository': 'owner/repo', 'branch': 'feature/a&b'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'github.json'
+            path.write_text(json.dumps(github))
+            rows = reply.github_footers(path, config)
+        result = reply.render_reply(config, {'eventPayload': EVENT}, 'branch ready', github_rows=rows)
+        self.assertEqual(rows, [':custom_github: repo · `feature/a&amp;b`'])
+        self.assertIn(rows[0], result['text'])
+        self.assertNotIn('PR #', result['text'])
+
+    def test_foreign_issue_link_is_omitted_without_losing_statistics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.json'
+            path.write_text(json.dumps({'version': 1, 'issue_id': 'I1', 'run_id': 'R1',
+                'issue_identifier': 'DEMO-12', 'issue_url': 'https://multica.example/demo/issues/OTHER',
+                'statistics': {'tools': 2}}))
+            footer = reply.run_statistics(path, 'I1', 'R1')
+        self.assertEqual(footer, '🔧 2 tools')
 
     def test_rejects_unscoped_run_context_and_mismatched_github_link(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -59,7 +82,7 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(result['thread_ts'], EVENT['threadTs'])
 
     def test_display_name_is_the_complete_label(self):
-        for label in ('🤖 Little Perf', ':wave: Changed', 'Changed'):
+        for label in ('🤖 Relay Assistant', ':wave: Changed', 'Changed'):
             config = {**CONFIG, 'displayName': label}
             result = reply.render_reply(config, {'eventPayload': EVENT}, 'hello')
             self.assertEqual(result['blocks'][-1]['elements'][0]['text'], label)

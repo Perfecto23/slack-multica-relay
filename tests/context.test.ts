@@ -168,10 +168,10 @@ describe('participant display names', () => {
     context.timeline.messages = [{ts:'1999.000001',authorId:'U1',origin:'unknown',text:'hi',files:[]}];
     const f = vi.fn<typeof fetch>().mockImplementation(async input => {
       const id = new URL(String(input)).searchParams.get('user');
-      return Response.json({ok:true,user:{id,profile:{display_name:id === 'U1' ? 'Perfecto' : '',real_name:'Mingho',email:'private@example.test'}}});
+      return Response.json({ok:true,user:{id,profile:{display_name:id === 'U1' ? 'Alice' : '',real_name:'Bob',email:'private@example.test'}}});
     });
     const result = await enrichParticipantNames(event,context,'test',f);
-    expect(result.participants).toEqual([{id:'U1',name:'Perfecto'},{id:'U2',name:'Mingho'}]);
+    expect(result.participants).toEqual([{id:'U1',name:'Alice'},{id:'U2',name:'Bob'}]);
     expect(f).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(result)).not.toContain('private@example.test');
     expect(JSON.parse(buildEnvelope(event,result)).context.participants).toEqual(result.participants);

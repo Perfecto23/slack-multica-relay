@@ -24,6 +24,8 @@
 - **可检查的裁剪**：分页、消息数量、响应大小和 envelope 字节上限都会留下 `truncated` 或 `unavailable` 状态。
 - **隐私最小化**：Slack file object 在进入 QStash 前完成字段投影；private URL、thumbnail、shares、下载内容和凭据不会进入队列 payload。
 - **确定性 footer**：显示名、配置 model 和 Fast 标记由 adapter 代码生成，不依赖模型正文。
+- **原线程取消**：目标用户可通过 mention + cancel/取消停止关联 run，持久化取消与 reaction 清理进度。
+- **最终回复资料**：并行 Skill 统计、Multica 任务入口和 GitHub PR/分支关联；个人风格与表情由私有配置提供。
 - **最终发送去重**：每个来源 Issue/comment 对应稳定 delivery block ID；本地 ledger 记录 `attempting → accepted → sent`。
 - **多平台入口**：共享核心逻辑可由 Vercel Functions、EdgeOne Cloud Functions 或 Cloudflare Workers 承载。
 
@@ -39,7 +41,8 @@ QStash
   ▼
 Queue consumer
   ├─ 再次校验准入策略
-  ├─ 读取有界 Slack 上下文
+  ├─ 取消指令：固定目标 run、回读终态、清理自有 reaction
+  ├─ 普通请求：读取有界 Slack 上下文
   ├─ 使用 Redis 恢复线程与事件状态
   └─ 创建 Multica Issue 或追加 comment
        │

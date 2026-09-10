@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+from urllib.parse import urlsplit
+from uuid import UUID
 
 
 class RunContextError(Exception):
@@ -21,11 +23,11 @@ def write_new(path, value):
         json.dump(value, file, ensure_ascii=False, indent=2)
 
 
-def query(command):
+def query(command, *, text=False):
     try:
         result = subprocess.run(command, capture_output=True,
                                 text=True, timeout=30, check=True)
-        return json.loads(result.stdout)
+        return result.stdout if text else json.loads(result.stdout)
     except (subprocess.SubprocessError, ValueError):
         raise RunContextError("只读查询失败；请检查 CLI 认证和目标") from None
 
@@ -101,6 +103,65 @@ def words(message):
         return []
 
 
+def skill_paths(message):
+    parsed = words(message)
+    if len(parsed) > 1 and parsed[1] == "--":
+        parsed = [parsed[0], *parsed[2:]]
+    paths = parsed[1:]
+    if paths and parsed[0] in ("cat", "/bin/cat") and all(
+            re.fullmatch(r"(?:/|~/)[^*?\[\]]+/SKILL\.md", path) for path in paths):
+        return paths
+    return []
+
+
+def loaded_names(output, count):
+    if not isinstance(output, str) or not re.match(r"^---\r?\n", output):
+        return []
+    # 单文件只读取开头的 frontmatter，正文中的 Skill 示例不参与统计。
+    headers = re.findall(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", output, re.S | re.M)
+    if count == 1:
+        headers = headers[:1]
+    loaded = [re.findall(r"^name:\s*['\"]?([A-Za-z0-9_:/.-]+)['\"]?\s*$", header, re.M) for header in headers]
+    if len(loaded) == count and all(len(name) == 1 for name in loaded):
+        return [name[0] for name in loaded]
+    return []
+
+
+def skill_names(messages):
+    names = set()
+    calls, results = [], []
+    for message in messages:
+        if message["type"] == "tool_use":
+            calls.append(message)
+        elif message["type"] == "tool_result":
+            results.append(message)
+        else:
+            continue
+        if not calls or len(results) != len(calls):
+            continue
+        # API 没有 call_id。等待并行批次收齐，按实际 frontmatter 与请求路径
+        # 关联 Skill；不按返回顺序配对，也不让无关搜索清空已确认的名称。
+        reads = [(call, skill_paths(call)) for call in calls]
+        for result in results:
+            matches = []
+            for call, paths in reads:
+                if not paths or call["seq"] >= result["seq"] or call.get("tool") != result.get("tool"):
+                    continue
+                loaded = loaded_names(result.get("output"), len(paths))
+                if not loaded:
+                    continue
+                sequential_single = len(calls) == 1 and len(paths) == 1
+                path_names = [Path(path).parent.name for path in paths]
+                returned_names = [name.rsplit(":", 1)[-1] for name in loaded]
+                if sequential_single or returned_names == path_names:
+                    matches.append(loaded)
+            # 多个候选仅在名称完全一致时可按名称去重，具体 call 归属不作推断。
+            if matches and all(match == matches[0] for match in matches):
+                names.update(matches[0])
+        calls, results = [], []
+    return names
+
+
 def statistics(data):
     stats = {}
     try:
@@ -116,42 +177,8 @@ def statistics(data):
     calls = [m for m in messages if m["type"] == "tool_use"]
     if calls:
         stats["tools"] = len(calls)
-    names = set()
-    known = True
-    pending = []
-    for message in messages:
-        if message["type"] == "tool_use":
-            pending.append(message)
-            continue
-        if message["type"] != "tool_result":
-            continue
-        call = pending[0] if len(pending) == 1 else None
-        candidates = [p for p in pending if p.get("tool") == message.get("tool")]
-        for candidate in candidates:
-            if "SKILL.md" not in json.dumps(candidate.get("input", {})):
-                continue
-            parsed = words(candidate)
-            if len(parsed) > 1 and parsed[1] == "--":
-                parsed = [parsed[0], *parsed[2:]]
-            paths = parsed[1:]
-            is_read = bool(paths) and parsed[0] in ("cat", "/bin/cat") and all(
-                re.fullmatch(r"(?:/|~/)[^*?\[\]]+/SKILL\.md", path) for path in paths)
-            if not is_read or call != candidate or candidate["seq"] + 1 != message["seq"]:
-                known = False
-                continue
-            output = message.get("output") or ""
-            headers = re.findall(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", output, re.S | re.M)
-            loaded = [re.findall(r"^name:\s*['\"]?([A-Za-z0-9_:/.-]+)['\"]?\s*$", header, re.M) for header in headers]
-            # 批量 cat 仅在每个路径都返回一个完整且唯一的 frontmatter 时计数。
-            if len(loaded) == len(paths) and all(len(name) == 1 for name in loaded):
-                names.update(name[0] for name in loaded)
-            elif not re.match(r"cat: .*: (No such file or directory|Permission denied)", output):
-                known = False
-        if candidates:
-            pending.remove(candidates[0])
-    if any("SKILL.md" in json.dumps(c.get("input", {})) for c in pending):
-        known = False
-    if known and names:
+    names = skill_names(messages)
+    if names:
         stats.update(skills=len(names), skill_names=sorted(names))
     return stats
 
@@ -185,9 +212,68 @@ def code_evidence(messages):
     return evidence
 
 
-def summarize(data):
+def link_context(data, identifier=None, workspace_slug=None, app_url=None, env=None):
+    env = env or {}
+    if workspace_slug is None:
+        workspace_slug = env.get("FINAL_REPLY_WORKSPACE_SLUG")
+    if app_url is None:
+        app_url = env.get("FINAL_REPLY_APP_URL")
+    identity = data["scope"]
+    cli = ["multica", "--server-url", identity["MULTICA_SERVER_URL"],
+           "--workspace-id", identity["MULTICA_WORKSPACE_ID"]]
+    if identifier is None:
+        try:
+            issue = query(cli + ["issue", "get", data["run"]["issue_id"], "--output", "json"])
+            if (isinstance(issue, dict) and issue.get("id") == data["run"]["issue_id"]
+                    and issue.get("workspace_id") == identity["MULTICA_WORKSPACE_ID"]):
+                identifier = issue.get("identifier")
+        except RunContextError:
+            pass
+    if workspace_slug is None:
+        try:
+            workspace = query(cli + ["workspace", "get", identity["MULTICA_WORKSPACE_ID"], "--output", "json"])
+            if isinstance(workspace, dict) and workspace.get("id") == identity["MULTICA_WORKSPACE_ID"]:
+                workspace_slug = workspace.get("slug")
+        except RunContextError:
+            pass
+    if app_url is None:
+        try:
+            # config show 暂无 JSON 输出；只读取完整配置键，不把 API 地址猜成网页地址。
+            config = query(cli + ["config", "show"], text=True)
+            values = dict(re.findall(r"^(server_url|app_url):[ \t]*(.+)$", config, re.M))
+            if values.get("server_url", "").strip().rstrip("/") == identity["MULTICA_SERVER_URL"].rstrip("/"):
+                app_url = values.get("app_url", "").strip()
+        except RunContextError:
+            pass
+    return identifier, workspace_slug, app_url
+
+
+def issue_link(data, identifier, workspace_slug, app_url):
+    # 参数已由调用方提供或通过当前任务配置补齐，此处只组装链接。
+    if not isinstance(identifier, str) or not re.fullmatch(r"[A-Z][A-Z0-9]{0,31}-[1-9][0-9]{0,15}", identifier):
+        return {}
+    if not isinstance(workspace_slug, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", workspace_slug):
+        return {}
+    if len(workspace_slug) > 100 or not isinstance(app_url, str):
+        return {}
+    try:
+        issue_id = str(UUID(data["run"]["issue_id"]))
+        origin = urlsplit(app_url)
+        if (origin.scheme != "https" or not origin.hostname or origin.username is not None
+                or origin.password is not None or origin.path not in ("", "/")
+                or origin.query or origin.fragment or origin.port == 0
+                or re.search(r"[\s<>|\\]", app_url)):
+            return {}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {}
+    return {"issue_identifier": identifier,
+            "issue_url": f"{origin.scheme}://{origin.netloc}/{workspace_slug}/issues/{issue_id}"}
+
+
+def summarize(data, issue_identifier=None, workspace_slug=None, app_url=None):
     messages = valid_messages(data)
     return {"version": 1, "run_id": data["run"]["id"], "issue_id": data["run"]["issue_id"],
+            **issue_link(data, issue_identifier, workspace_slug, app_url),
             "captured_at": data["captured_at"], "last_message_seq": messages[-1]["seq"] if messages else None,
             "statistics": statistics(data), "code_evidence": code_evidence(messages)}
 
@@ -195,10 +281,15 @@ def summarize(data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--issue", required=True)
+    parser.add_argument("--issue-identifier", help="已有任务详情中的编号，例如 DEMO-12")
+    parser.add_argument("--workspace-slug", help="已确认的当前工作区 slug，例如 demo")
+    parser.add_argument("--app-url", help="已确认的 Multica 网页根地址，必须为 HTTPS")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     try:
-        summary = summarize(snapshot(args.issue, os.environ))
+        data = snapshot(args.issue, os.environ)
+        link_args = link_context(data, args.issue_identifier, args.workspace_slug, args.app_url, os.environ)
+        summary = summarize(data, *link_args)
         write_new(args.output, summary)
     except Exception as error:
         print(json.dumps({"error": str(error) if isinstance(error, RunContextError) else "运行资料整理失败，请检查 CLI 返回和输出路径"}, ensure_ascii=False))
