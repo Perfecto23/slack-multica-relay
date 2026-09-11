@@ -174,19 +174,14 @@ def render_reply(config, envelope, text, delivery_block_id=None, statistics=None
 
 
 def read_source(config, issue_id, comment_id, runner=subprocess.run):
-    command = ['multica', '--server-url', config['serverUrl'], '--workspace-id', config['workspaceId']]
-    def get(args):
-        result = runner(command + args + ['--output', 'json'], capture_output=True, text=True, timeout=15)
-        if result.returncode:
-            raise ValueError('multica_read_failed')
-        return json.loads(result.stdout)
-    issue = get(['issue', 'get', issue_id])
+    issue = multica_json(config, ['issue', 'get', issue_id], runner)
     if (issue.get('workspace_id') != config['workspaceId'] or issue.get('project_id') != config['projectId']
             or issue.get('assignee_id') != config['agentId'] or issue.get('assignee_type') != 'agent'):
         raise ValueError('invalid_issue_scope')
     source = issue.get('description', '')
     if comment_id:
-        rows = get(['issue', 'comment', 'list', issue_id, '--thread', comment_id, '--tail', '0'])
+        rows = multica_json(config, ['issue', 'comment', 'list', issue_id,
+                                     '--thread', comment_id, '--tail', '0'], runner)
         row = next((row for row in rows if row.get('id') == comment_id), None)
         if not row:
             raise ValueError('source_comment_missing')
@@ -194,6 +189,51 @@ def read_source(config, issue_id, comment_id, runner=subprocess.run):
     if not source.startswith('<!-- relay-message:' if comment_id else '<!-- relay-thread:'):
         raise ValueError('invalid_relay_source')
     return envelope_from_text(source)
+
+
+def multica_json(config, args, runner=subprocess.run, timeout=15):
+    command = ['multica', '--server-url', config['serverUrl'],
+               '--workspace-id', config['workspaceId'], *args, '--output', 'json']
+    result = runner(command, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        raise ValueError('multica_read_failed')
+    try:
+        return json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        raise ValueError('multica_read_failed') from None
+
+
+def task_attachments(config, issue_id, task_id, runner=subprocess.run):
+    if not isinstance(task_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', task_id):
+        raise ValueError('invalid_attachment_task')
+    rows = multica_json(config, ['issue', 'comment', 'list', issue_id,
+                                 '--roots-only', '--summary'], runner)
+    if not isinstance(rows, list):
+        raise ValueError('invalid_task_attachments')
+    attachments, seen, total = [], set(), 0
+    for row in rows:
+        if not isinstance(row, dict) or row.get('source_task_id') != task_id:
+            continue
+        for item in row.get('attachments', []):
+            if not isinstance(item, dict):
+                raise ValueError('invalid_task_attachments')
+            attachment_id, filename, size = item.get('id'), item.get('filename'), item.get('size_bytes')
+            if (not isinstance(attachment_id, str)
+                    or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', attachment_id)
+                    or not isinstance(filename, str) or not 1 <= len(filename) <= 255
+                    or Path(filename).name != filename or re.search(r'[\x00-\x1f\x7f]', filename)
+                    or not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= 25 * 1024 * 1024):
+                raise ValueError('invalid_task_attachments')
+            if attachment_id in seen:
+                continue
+            seen.add(attachment_id)
+            total += size
+            attachments.append({'id': attachment_id, 'filename': filename, 'size_bytes': size})
+    if not attachments:
+        raise ValueError('task_attachments_missing')
+    if len(attachments) > 20 or total > 100 * 1024 * 1024:
+        raise ValueError('task_attachments_too_large')
+    return attachments
 
 
 def delivery_identity(config, issue_id, comment_id):
@@ -261,6 +301,18 @@ def slack_call(token, method, payload=None, query=None, opener=urllib.request.ur
     return data
 
 
+def verify_reply_root(token, envelope, opener=urllib.request.urlopen):
+    event = envelope['eventPayload']
+    data = slack_call(token, 'conversations.replies', query={
+        'channel': event['channelId'], 'ts': event['threadTs'], 'inclusive': 'true', 'limit': '1'
+    }, opener=opener)
+    messages = data.get('messages')
+    if not isinstance(messages, list):
+        raise ValueError('slack_lookup_failed')
+    if not any(isinstance(message, dict) and message.get('ts') == event['threadTs'] for message in messages):
+        raise ValueError('slack_thread_not_found')
+
+
 def find_delivered_reply(token, envelope, block_id, oldest, opener=urllib.request.urlopen):
     event = envelope['eventPayload']
     cursor, seen = '', set()
@@ -300,6 +352,13 @@ def delivery_paths(config_path, identity):
     root.mkdir(mode=0o700, exist_ok=True)
     root.chmod(0o700)
     return root / (identity + '.json'), root / (identity + '.lock')
+
+
+def attachment_delivery_paths(config_path, identity, attachments):
+    attachment_ids = [item['id'] for item in attachments]
+    suffix = hashlib.sha256('\0'.join([identity, *attachment_ids]).encode()).hexdigest()
+    root = delivery_paths(config_path, identity)[0].parent
+    return root / ('attachments-' + suffix + '.json'), root / ('attachments-' + suffix + '.lock')
 
 
 def delivery_lock(lock_path):
@@ -350,6 +409,95 @@ def write_delivery_state(state_path, state):
             os.unlink(temporary)
 
 
+def read_attachment_state(state_path):
+    if not state_path.exists():
+        return None
+    state = json.loads(state_path.read_text())
+    if (not isinstance(state, dict) or state.get('version') != 1
+            or state.get('phase') not in ('attempting', 'sent')):
+        raise ValueError('invalid_attachment_delivery_state')
+    if not re.fullmatch(r'\d+\.\d{6}', state.get('attemptedAt', '')):
+        raise ValueError('invalid_attachment_delivery_state')
+    if state['phase'] == 'sent':
+        if (not isinstance(state.get('fileIds'), list) or not state['fileIds']
+                or not all(isinstance(value, str) and re.fullmatch(r'F[A-Z0-9]+', value)
+                           for value in state['fileIds'])):
+            raise ValueError('invalid_attachment_delivery_state')
+    return state
+
+
+def download_task_attachments(config, attachments, directory, runner=subprocess.run):
+    downloaded = []
+    for item in attachments:
+        item_dir = Path(directory) / item['id']
+        item_dir.mkdir(mode=0o700)
+        command = ['multica', '--server-url', config['serverUrl'], '--workspace-id', config['workspaceId'],
+                   'attachment', 'download', item['id'], '--output-dir', str(item_dir)]
+        result = runner(command, capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            raise ValueError('multica_attachment_download_failed')
+        candidates = list(item_dir.iterdir())
+        if len(candidates) != 1:
+            raise ValueError('invalid_downloaded_attachment')
+        path = candidates[0]
+        stat = path.lstat()
+        if path.is_symlink() or not path.is_file() or stat.st_size != item['size_bytes']:
+            raise ValueError('invalid_downloaded_attachment')
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        downloaded.append({'path': path, 'sha256': digest, **item})
+    return downloaded
+
+
+def upload_task_attachments(config_path, config, envelope, identity, attachments, runner=subprocess.run):
+    state_path, lock_path = attachment_delivery_paths(config_path, identity, attachments)
+    with delivery_lock(lock_path):
+        state = read_attachment_state(state_path)
+        if state and state['phase'] == 'sent':
+            return {'duplicate': True, 'count': len(state['fileIds']), 'file_ids': state['fileIds']}
+        if state and state['phase'] == 'attempting':
+            raise ValueError('slack_attachment_delivery_unknown')
+
+        slack_cli = config.get('slackCliPath')
+        if (not isinstance(slack_cli, str) or not os.path.isabs(slack_cli)
+                or not Path(slack_cli).is_file() or Path(slack_cli).is_symlink()):
+            raise ValueError('invalid_slack_cli_path')
+        with tempfile.TemporaryDirectory(prefix='.slack-attachments-', dir=Path.cwd()) as directory:
+            downloaded = download_task_attachments(config, attachments, directory, runner)
+            command = [sys.executable, slack_cli, 'files_upload', '--as', 'user',
+                       '--channel', envelope['eventPayload']['channelId'],
+                       '--thread-ts', envelope['eventPayload']['threadTs']]
+            for item in downloaded:
+                command.extend(['--file', str(item['path']), '--sha256', item['sha256']])
+            attempted_at = slack_timestamp()
+            write_delivery_state(state_path, {'version': 1, 'phase': 'attempting',
+                                              'attemptedAt': attempted_at})
+            child_env = os.environ.copy()
+            child_env['SLACK_SKILL_ALLOWED_CHANNELS'] = envelope['eventPayload']['channelId']
+            result = runner(command, capture_output=True, text=True, timeout=180, env=child_env)
+            if result.returncode:
+                try:
+                    failure = json.loads(result.stdout)
+                except (json.JSONDecodeError, TypeError):
+                    failure = None
+                if isinstance(failure, dict) and failure.get('retry_safe') is True:
+                    state_path.unlink(missing_ok=True)
+                    raise ValueError('slack_attachment_send_rejected')
+                raise ValueError('slack_attachment_delivery_unknown')
+            try:
+                report = json.loads(result.stdout)
+            except (json.JSONDecodeError, TypeError):
+                raise ValueError('slack_attachment_delivery_unknown') from None
+            uploaded = report.get('uploaded') if isinstance(report, dict) else None
+            file_ids = [item.get('id') for item in uploaded] if isinstance(uploaded, list) else []
+            if (report.get('operation_status') != 'succeeded' or len(file_ids) != len(attachments)
+                    or not all(isinstance(value, str) and re.fullmatch(r'F[A-Z0-9]+', value)
+                               for value in file_ids)):
+                raise ValueError('slack_attachment_delivery_unknown')
+            write_delivery_state(state_path, {'version': 1, 'phase': 'sent',
+                                              'attemptedAt': attempted_at, 'fileIds': file_ids})
+            return {'duplicate': False, 'count': len(file_ids), 'file_ids': file_ids}
+
+
 def slack_timestamp(now=None):
     value = time.time() if now is None else now
     seconds = int(value)
@@ -364,6 +512,7 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     parser.add_argument('--text-file', required=True)
     parser.add_argument('--run-context-file')
     parser.add_argument('--github-context-file')
+    parser.add_argument('--deliver-task-attachments', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
     config_path = Path(args.config)
@@ -374,13 +523,25 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     stats = run_statistics(args.run_context_file, args.issue_id, os.environ.get('MULTICA_TASK_ID'), config)
     github_rows = github_footers(args.github_context_file, config)
     payload = render_reply(config, envelope, Path(args.text_file).read_text(), block_id, stats, github_rows)
+    attachments = None
+    if args.deliver_task_attachments:
+        attachments = task_attachments(config, args.issue_id, os.environ.get('MULTICA_TASK_ID'), runner)
     if args.dry_run:
+        if attachments is not None:
+            payload['attachment_count'] = len(attachments)
         print(json.dumps(payload, ensure_ascii=False))
         return
     token = os.environ.get('SLACK_USER_TOKEN')
     if not token:
         raise ValueError('slack_user_token_missing')
     state_path, lock_path = delivery_paths(config_path, identity)
+
+    def finish(result):
+        if attachments is not None:
+            result['attachments'] = upload_task_attachments(
+                config_path, config, envelope, identity, attachments, runner)
+        print(json.dumps(result, ensure_ascii=False))
+
     with delivery_lock(lock_path):
         state = read_delivery_state(state_path)
         if state and state['phase'] == 'rate_limited':
@@ -388,26 +549,27 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
             if remaining > 0:
                 raise SlackRateLimited(remaining)
         if state and state['phase'] == 'sent':
-            print(json.dumps({'ok': True, 'duplicate': True, 'channel': payload['channel'], 'message_ts': state['messageTs'],
-                              'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']}, ensure_ascii=False))
+            finish({'ok': True, 'duplicate': True, 'channel': payload['channel'], 'message_ts': state['messageTs'],
+                    'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']})
             return
         if state and state['phase'] == 'accepted':
             verified = find_delivered_reply(token, envelope, block_id, state['messageTs'], opener)
             if not verified:
                 raise ValueError('slack_send_unverified')
             write_delivery_state(state_path, {'version': 1, 'phase': 'sent', 'messageTs': verified})
-            print(json.dumps({'ok': True, 'duplicate': True, 'channel': payload['channel'], 'message_ts': verified,
-                              'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']}, ensure_ascii=False))
+            finish({'ok': True, 'duplicate': True, 'channel': payload['channel'], 'message_ts': verified,
+                    'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']})
             return
         if state and state['phase'] == 'attempting':
             existing = find_delivered_reply(token, envelope, block_id, state['lookupFromTs'], opener)
             if existing:
                 write_delivery_state(state_path, {'version': 1, 'phase': 'sent', 'messageTs': existing})
-                print(json.dumps({'ok': True, 'duplicate': True, 'channel': payload['channel'], 'message_ts': existing,
-                                  'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']}, ensure_ascii=False))
+                finish({'ok': True, 'duplicate': True, 'channel': payload['channel'], 'message_ts': existing,
+                        'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']})
                 return
             # Absence after an ambiguous POST is not proof that Slack did not commit it.
             raise ValueError('slack_delivery_unknown')
+        verify_reply_root(token, envelope, opener)
         attempted_at = slack_timestamp()
         lookup_from = slack_timestamp(time.time() - 300)
         write_delivery_state(state_path, {'version': 1, 'phase': 'attempting', 'attemptedAt': attempted_at,
@@ -430,8 +592,8 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         if not verified:
             raise ValueError('slack_send_unverified')
         write_delivery_state(state_path, {'version': 1, 'phase': 'sent', 'messageTs': verified})
-        print(json.dumps({'ok': True, 'duplicate': False, 'channel': data.get('channel'), 'message_ts': verified,
-                          'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']}, ensure_ascii=False))
+        finish({'ok': True, 'duplicate': False, 'channel': data.get('channel'), 'message_ts': verified,
+                'thread_ts': payload['thread_ts'], 'footer': payload['blocks'][-1]['elements'][0]['text']})
 
 
 if __name__ == '__main__':

@@ -105,11 +105,13 @@ consumer 在准备消息时使用现有 Multica PAT 读取一次目标 Agent 配
 
 ## 本地 reply adapter
 
-运行 `python3 scripts/slack-reply.py --help` 查看 CLI。把 adapter 绑定到私有 Runtime Skill，并提供包含 `displayName`、`agentId`、`workspaceId`、`projectId`、`teamId` 和 `serverUrl` 的私有 JSON。该配置不包含 token；adapter 沿用 Runtime 已有的 Multica CLI 认证与 `SLACK_USER_TOKEN`。Agent 通过 `--text-file` 提供正文；路由和 model metadata 从来源 Issue/comment 回读。adapter 用 Slack section blocks 发送正文，再追加 attribution context block，格式不依赖模型正文或 persona instructions。
+运行 `python3 scripts/slack-reply.py --help` 查看 CLI。把 adapter 绑定到私有 Runtime Skill，并提供包含 `displayName`、`agentId`、`workspaceId`、`projectId`、`teamId` 和 `serverUrl` 的私有 JSON。该配置不包含 token；adapter 沿用 Runtime 已有的 Multica CLI 认证与 `SLACK_USER_TOKEN`。Agent 通过 `--text-file` 提供正文；路由和 model metadata 从来源 Issue/comment 回读。adapter 用 Slack section blocks 发送正文，再追加 attribution context block，格式不依赖模型正文或 persona instructions。首次发送前会通过 `conversations.replies` 确认精确根消息仍存在，避免 Slack 将无效 thread 降级为频道或 DM 根消息。
 
 绑定 `multica-skills/multica-final-reply` 后，Agent 在发送前用其中的只读脚本生成当前 run context，并按业务证据选择相关 PR。adapter 通过可选的 `--run-context-file` 和 `--github-context-file` 校验 Issue 归属、统计来源以及 GitHub repository/branch/PR URL 的一致性，再追加运行统计和 GitHub 关联行；没有可核验成果时省略对应行。Agent 不直接控制路由、delivery marker 或重试。
 
-adapter 根据来源 Issue/comment 生成稳定 delivery block ID，并在配置 JSON 旁的 `.slack-reply-state/` 保存私有 delivery ledger。该目录已被 Git 忽略，目录和原子 JSON 使用 owner-only 权限；文件和父目录状态都在 POST 前完成 `fsync`。状态依次为 `attempting`、`accepted`、`sent`：Slack 返回的 message timestamp 将发送后验证收窄到新回复，只有 thread readback 成功才进入 `sent`。后续 Runtime 重试直接返回已持久化结果，不扫描旧线程历史。
+adapter 根据来源 Issue/comment 生成稳定 delivery block ID，并在配置 JSON 旁的 `.slack-reply-state/` 保存私有 delivery ledger。该目录已被 Git 忽略，目录和原子 JSON 使用 owner-only 权限；文件和父目录状态都在 POST 前完成 `fsync`。正文状态依次为 `attempting`、`accepted`、`sent`：Slack 返回的 message timestamp 将发送后验证收窄到新回复，只有 thread readback 成功才进入 `sent`。后续 Runtime 重试直接返回已持久化结果，不扫描旧线程历史。
+
+请求明确要求文件时，Agent 先用本轮 task 的 Multica 评论保存最终附件，再给 adapter 增加 `--deliver-task-attachments`。adapter 只选择 `source_task_id` 等于当前 `MULTICA_TASK_ID` 的附件，下载后核对 size 与 SHA-256，并通过配置的 `slackCliPath` 调用 Slack Skill `files_upload --as user`。附件使用独立 `attempting/sent` receipt；结果未知时不自动重复上传。Slack Skill 明确标记 `retry_safe: true` 的确定拒绝会清理 intent，修正权限或参数后可再次执行。限制为 20 个文件、单文件 25 MiB、总计 100 MiB。
 
 如果 POST 结果未知，重试从本机尝试时间前五分钟开始查找，以容纳 clock skew。找到 delivery block 后进入 `sent`；未找到则返回 `slack_delivery_unknown`，绝不自动重复 POST，因为“查询为空”不能证明 Slack 没有提交。清理这条状态前必须在原线程独立核对。同一来源的并发执行无法取得本机锁时立即返回 `reply_delivery_busy`，不会阻塞等待。`SLACK_USER_TOKEN` 除 `chat:write` 外，还需要 `conversations.replies` 对应的 history scope。
 
@@ -134,6 +136,7 @@ footer appearance 每次发送时都从私有配置读取。`displayName` 是完
 ```json
 {
   "adapterPath": "/path/to/relay/scripts/slack-reply.py",
+  "slackCliPath": "/path/to/slack-skill/scripts/slack.py",
   "styleGuide": "/path/to/private/communication/SKILL.md",
   "emojiGuide": "/path/to/private/emoji/favorites.md",
   "emojiCatalog": "/path/to/private/emoji/catalog.json",
