@@ -110,6 +110,8 @@ footer 使用每个新事件各自冻结的快照和 `messageTs`；只有配置�
 
 发送明确限流时持久化 `rate_limited/retryAt`，到期才允许重试；服务端错误和未知结果保留 `attempting`，回读失败不授权再次发送。详细错误分类与 CLI 返回字段见 [配置说明](CONFIGURATION.md)。
 
+`--deliver-task-attachments` 交付当前 task 的 Multica 评论附件。正文首次发送及每个附件上传前均检查精确 Slack 根消息；附件逐个保存回执，未知上传不重复执行。附件发现、下载、权限与回执合同见 [附件交付](../multica-skills/multica-final-reply/references/attachment-delivery.md)。
+
 ## 消息变化标记
 
 旁支消息的 change 为 new（相对已发送索引未出现）、updated（指纹变化）、referenced（明确链接引用）、context（必要背景）。父节点不因子回复变化就标为更新；更新只提供当前正文，不默认附旧文本。新增不等同于此刻刚发布。基线不可用时只标背景/引用，避免声称已完成变化比较。窗口、分页和精选裁剪都可能让消息缺席，因此缺席不生成删除通知。

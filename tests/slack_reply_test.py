@@ -226,7 +226,9 @@ class ReplyTests(unittest.TestCase):
                     self.assertEqual(command[command.index('--thread-ts') + 1], '100.000001')
                     self.assertEqual(command.count('--file'), 1)
                     self.assertEqual(command.count('--sha256'), 1)
-                    body = {'operation_status': 'succeeded', 'uploaded': [{'id': 'F123ABC'}]}
+                    body = {'operation_status': 'succeeded', 'uploaded': [{'id': 'F123ABC'}],
+                            'actor': {'selected': 'user', 'team_id': 'T1'},
+                            'channel': {'id': 'C1'}, 'thread_ts': '100.000001'}
                     return subprocess.CompletedProcess(command, 0, json.dumps(body), '')
                 self.fail(f'unexpected command: {command}')
 
@@ -237,7 +239,7 @@ class ReplyTests(unittest.TestCase):
                     posted.append(json.loads(request.data))
                     return io.BytesIO(json.dumps({'ok': True, 'channel': 'C1', 'ts': '102.000001'}).encode())
                 lookup_count += 1
-                messages = ([{'ts': '100.000001'}] if lookup_count == 1 else
+                messages = ([{'ts': '100.000001'}] if 'limit=1' in request.full_url else
                             [{'ts': '102.000001', 'blocks': posted[0]['blocks']}])
                 return io.BytesIO(json.dumps({'ok': True, 'messages': messages}).encode())
 
@@ -262,7 +264,7 @@ class ReplyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / 'config.json'; config_path.write_text(json.dumps(config))
             identity = reply.delivery_identity(config, 'I1', None)
-            state_path, _ = reply.attachment_delivery_paths(config_path, identity, attachments)
+            state_path, _ = reply.attachment_delivery_paths(config_path, identity, attachments[0])
             reply.write_delivery_state(state_path, {'version': 1, 'phase': 'attempting',
                                                     'attemptedAt': '100.000001'})
             with self.assertRaisesRegex(ValueError, 'slack_attachment_delivery_unknown'):
@@ -285,14 +287,142 @@ class ReplyTests(unittest.TestCase):
                     output_dir = Path(command[command.index('--output-dir') + 1])
                     (output_dir / 'report.xlsx').write_bytes(b'abcde')
                     return subprocess.CompletedProcess(command, 0, 'downloaded', '')
-                failure = {'operation_status': 'failed', 'retry_safe': True,
+                failure = {'status': 'failed', 'operation_status': 'failed', 'retry_safe': True,
                            'reason': 'missing_scope'}
                 return subprocess.CompletedProcess(command, 4, json.dumps(failure), '')
-            with self.assertRaisesRegex(ValueError, 'slack_attachment_send_rejected'):
+            with patch.object(reply, 'verify_reply_root'), \
+                    self.assertRaisesRegex(ValueError, 'slack_attachment_send_rejected'):
                 reply.upload_task_attachments(config_path, config, envelope, identity, attachments,
-                                              runner=runner)
-            state_path, _ = reply.attachment_delivery_paths(config_path, identity, attachments)
+                                              runner=runner, token='xoxp-test')
+            state_path, _ = reply.attachment_delivery_paths(config_path, identity, attachments[0])
             self.assertFalse(state_path.exists())
+
+    def test_sent_body_does_not_allow_upload_to_a_deleted_root(self):
+        task_id = '11111111-1111-4111-8111-111111111111'
+        attachment = {'id': '22222222-2222-4222-8222-222222222222',
+                      'filename': 'report.xlsx', 'size_bytes': 5}
+        envelope = {'eventPayload': EVENT}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slack_cli = root / 'slack.py'; slack_cli.write_text('# fake')
+            config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1',
+                      'serverUrl': 'https://multica.test', 'slackCliPath': str(slack_cli)}
+            config_path = root / 'config.json'; config_path.write_text(json.dumps(config))
+            body = root / 'body.txt'; body.write_text('answer')
+            identity = reply.delivery_identity(config, 'I1', None)
+            state_path, _ = reply.delivery_paths(config_path, identity)
+            reply.write_delivery_state(state_path, {'version': 1, 'phase': 'sent', 'messageTs': '102.000001'})
+            def runner(command, **_kwargs):
+                self.assertEqual(command[5:7], ['attachment', 'download'])
+                output_dir = Path(command[command.index('--output-dir') + 1])
+                (output_dir / 'report.xlsx').write_bytes(b'abcde')
+                return subprocess.CompletedProcess(command, 0, '', '')
+            def opener(request, **_kwargs):
+                self.assertIsNone(request.data)
+                return io.BytesIO(b'{"ok":true,"messages":[]}')
+            with patch.object(reply, 'read_source', return_value=envelope), \
+                    patch.object(reply, 'task_attachments', return_value=[attachment]), \
+                    patch.dict(os.environ, {'SLACK_USER_TOKEN': 'xoxp-test', 'MULTICA_TASK_ID': task_id}), \
+                    self.assertRaisesRegex(ValueError, 'slack_thread_not_found'):
+                reply.main(['--config', str(config_path), '--issue-id', 'I1', '--text-file', str(body),
+                            '--deliver-task-attachments'], runner=runner, opener=opener)
+            attachment_state, _ = reply.attachment_delivery_paths(config_path, identity, attachment)
+            self.assertFalse(attachment_state.exists())
+            self.assertEqual(reply.read_delivery_state(state_path)['phase'], 'sent')
+
+    def test_attachment_receipts_survive_reordering_and_added_files(self):
+        attachments = [{'id': f'{index}' * 8 + '-2222-4222-8222-222222222222',
+                        'filename': f'{index}.txt', 'size_bytes': 5} for index in (1, 2, 3)]
+        envelope = {'eventPayload': EVENT}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slack_cli = root / 'slack.py'; slack_cli.write_text('# fake')
+            config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1',
+                      'serverUrl': 'https://multica.test', 'slackCliPath': str(slack_cli)}
+            config_path = root / 'config.json'; config_path.write_text(json.dumps(config))
+            identity = reply.delivery_identity(config, 'I1', None)
+            uploads = []
+            def runner(command, **_kwargs):
+                if command[0] == 'multica':
+                    item = next(item for item in attachments if item['id'] in command)
+                    output_dir = Path(command[command.index('--output-dir') + 1])
+                    (output_dir / item['filename']).write_bytes(b'abcde')
+                    return subprocess.CompletedProcess(command, 0, '', '')
+                name = Path(command[command.index('--file') + 1]).name
+                uploads.append(name)
+                report = {'operation_status': 'succeeded', 'uploaded': [{'id': 'F' + name[0]}],
+                          'actor': {'selected': 'user', 'team_id': 'T1'},
+                          'channel': {'id': 'C1'}, 'thread_ts': '100.000001'}
+                return subprocess.CompletedProcess(command, 0, json.dumps(report), '')
+            with patch.object(reply, 'verify_reply_root'):
+                reply.upload_task_attachments(config_path, config, envelope, identity, attachments[:2],
+                                              runner=runner, token='xoxp-test')
+                result = reply.upload_task_attachments(config_path, config, envelope, identity, attachments[::-1],
+                                                      runner=runner, token='xoxp-test')
+            self.assertEqual(uploads, ['1.txt', '2.txt', '3.txt'])
+            self.assertEqual(result['count'], 3)
+
+    def test_unknown_attachment_result_is_not_repeated_after_collection_changes(self):
+        attachment = {'id': '22222222-2222-4222-8222-222222222222',
+                      'filename': 'report.xlsx', 'size_bytes': 5}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            slack_cli = root / 'slack.py'; slack_cli.write_text('# fake')
+            config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1',
+                      'serverUrl': 'https://multica.test', 'slackCliPath': str(slack_cli)}
+            config_path = root / 'config.json'; config_path.write_text(json.dumps(config))
+            identity = reply.delivery_identity(config, 'I1', None)
+            uploads = []
+            def runner(command, **_kwargs):
+                if command[0] == 'multica':
+                    output_dir = Path(command[command.index('--output-dir') + 1])
+                    (output_dir / 'report.xlsx').write_bytes(b'abcde')
+                    return subprocess.CompletedProcess(command, 0, '', '')
+                uploads.append(command)
+                raise subprocess.TimeoutExpired(command, 180)
+            with patch.object(reply, 'verify_reply_root'):
+                for items in ([attachment], [attachment, {**attachment, 'id': '33333333-3333-4333-8333-333333333333'}]):
+                    with self.assertRaisesRegex(ValueError, 'slack_attachment_delivery_unknown'):
+                        reply.upload_task_attachments(config_path, config, {'eventPayload': EVENT}, identity, items,
+                                                      runner=runner, token='xoxp-test')
+            self.assertEqual(len(uploads), 1)
+
+    def test_upload_unknown_keeps_file_id_and_rejects_mismatched_success(self):
+        attachment = {'id': '22222222-2222-4222-8222-222222222222',
+                      'filename': 'report.xlsx', 'size_bytes': 5}
+        cases = [
+            (5, {'status': 'unknown', 'retry_safe': False, 'delivery_phase': 'complete_upload',
+                 'completed_files': [{'id': 'F123', 'title': 'private filename'}]}),
+            (0, {'operation_status': 'succeeded', 'uploaded': [{'id': 'F123'}],
+                 'actor': {'selected': 'user', 'team_id': 'T1'},
+                 'channel': {'id': 'C1'}, 'thread_ts': '999.000001'}),
+            (0, []),
+        ]
+        for returncode, report in cases:
+            with self.subTest(report=report), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                slack_cli = root / 'slack.py'; slack_cli.write_text('# fake')
+                config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1',
+                          'serverUrl': 'https://multica.test', 'slackCliPath': str(slack_cli)}
+                config_path = root / 'config.json'; config_path.write_text(json.dumps(config))
+                identity = reply.delivery_identity(config, 'I1', None)
+                def runner(command, **_kwargs):
+                    if command[0] == 'multica':
+                        output_dir = Path(command[command.index('--output-dir') + 1])
+                        (output_dir / 'report.xlsx').write_bytes(b'abcde')
+                        return subprocess.CompletedProcess(command, 0, '', '')
+                    return subprocess.CompletedProcess(command, returncode, json.dumps(report), '')
+                with patch.object(reply, 'verify_reply_root'), \
+                        self.assertRaisesRegex(ValueError, 'slack_attachment_delivery_unknown'):
+                    reply.upload_task_attachments(config_path, config, {'eventPayload': EVENT}, identity,
+                                                  [attachment], runner=runner, token='xoxp-test')
+                state_path, _ = reply.attachment_delivery_paths(config_path, identity, attachment)
+                receipt = reply.read_attachment_state(state_path)
+                self.assertEqual(receipt['phase'], 'attempting')
+                if returncode:
+                    self.assertEqual(receipt['fileIds'], ['F123'])
+                    self.assertEqual(receipt['deliveryPhase'], 'complete_upload')
+                    self.assertNotIn('private filename', state_path.read_text())
 
     def test_persisted_sent_delivery_skips_history_and_post_even_for_a_long_thread(self):
         envelope = {'eventPayload': {**EVENT, 'messageTs': '101.000001'}}

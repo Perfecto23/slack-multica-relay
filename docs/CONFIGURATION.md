@@ -111,7 +111,7 @@ consumer 在准备消息时使用现有 Multica PAT 读取一次目标 Agent 配
 
 adapter 根据来源 Issue/comment 生成稳定 delivery block ID，并在配置 JSON 旁的 `.slack-reply-state/` 保存私有 delivery ledger。该目录已被 Git 忽略，目录和原子 JSON 使用 owner-only 权限；文件和父目录状态都在 POST 前完成 `fsync`。正文状态依次为 `attempting`、`accepted`、`sent`：Slack 返回的 message timestamp 将发送后验证收窄到新回复，只有 thread readback 成功才进入 `sent`。后续 Runtime 重试直接返回已持久化结果，不扫描旧线程历史。
 
-请求明确要求文件时，Agent 先用本轮 task 的 Multica 评论保存最终附件，再给 adapter 增加 `--deliver-task-attachments`。adapter 只选择 `source_task_id` 等于当前 `MULTICA_TASK_ID` 的附件，下载后核对 size 与 SHA-256，并通过配置的 `slackCliPath` 调用 Slack Skill `files_upload --as user`。附件使用独立 `attempting/sent` receipt；结果未知时不自动重复上传。Slack Skill 明确标记 `retry_safe: true` 的确定拒绝会清理 intent，修正权限或参数后可再次执行。限制为 20 个文件、单文件 25 MiB、总计 100 MiB。
+请求明确要求文件时，Agent 先用本轮 task 的 Multica 评论保存最终附件，再给 adapter 增加 `--deliver-task-attachments`。adapter 只选择 `source_task_id` 等于当前 `MULTICA_TASK_ID` 的附件，下载后核对 size 与 SHA-256，并通过配置的 `slackCliPath` 调用 Slack Skill `files_upload --as user`。每个 attachment ID 使用独立 `attempting/sent` receipt，列表顺序变化或新增附件不重传成功项；未知结果保留上传阶段和已取得的 file ID，不自动重复上传。每个附件上传前重新核对精确根消息，包括正文已送达后的重试；检查后根消息仍可能被删除。Slack Skill 明确标记 `retry_safe: true` 的确定拒绝会清理 intent，修正权限或参数后可再次执行。限制为 20 个文件、单文件 25 MiB、总计 100 MiB。文件上传需要 User token 已获批的 `files:write`；申请待审批时报告权限阻塞，不切换身份。
 
 如果 POST 结果未知，重试从本机尝试时间前五分钟开始查找，以容纳 clock skew。找到 delivery block 后进入 `sent`；未找到则返回 `slack_delivery_unknown`，绝不自动重复 POST，因为“查询为空”不能证明 Slack 没有提交。清理这条状态前必须在原线程独立核对。同一来源的并发执行无法取得本机锁时立即返回 `reply_delivery_busy`，不会阻塞等待。`SLACK_USER_TOKEN` 除 `chat:write` 外，还需要 `conversations.replies` 对应的 history scope。
 

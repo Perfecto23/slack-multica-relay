@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -214,14 +215,18 @@ def task_attachments(config, issue_id, task_id, runner=subprocess.run):
     for row in rows:
         if not isinstance(row, dict) or row.get('source_task_id') != task_id:
             continue
-        for item in row.get('attachments', []):
+        items = row.get('attachments', [])
+        if not isinstance(items, list):
+            raise ValueError('invalid_task_attachments')
+        for item in items:
             if not isinstance(item, dict):
                 raise ValueError('invalid_task_attachments')
             attachment_id, filename, size = item.get('id'), item.get('filename'), item.get('size_bytes')
             if (not isinstance(attachment_id, str)
                     or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', attachment_id)
                     or not isinstance(filename, str) or not 1 <= len(filename) <= 255
-                    or Path(filename).name != filename or re.search(r'[\x00-\x1f\x7f]', filename)
+                    or filename in ('.', '..') or Path(filename).name != filename
+                    or re.search(r'[\\\x00-\x1f\x7f]', filename)
                     or not isinstance(size, int) or isinstance(size, bool) or not 1 <= size <= 25 * 1024 * 1024):
                 raise ValueError('invalid_task_attachments')
             if attachment_id in seen:
@@ -354,9 +359,9 @@ def delivery_paths(config_path, identity):
     return root / (identity + '.json'), root / (identity + '.lock')
 
 
-def attachment_delivery_paths(config_path, identity, attachments):
-    attachment_ids = [item['id'] for item in attachments]
-    suffix = hashlib.sha256('\0'.join([identity, *attachment_ids]).encode()).hexdigest()
+def attachment_delivery_paths(config_path, identity, attachment):
+    # A changed comment order or another attachment must not bypass an earlier receipt.
+    suffix = hashlib.sha256('\0'.join([identity, attachment['id']]).encode()).hexdigest()
     root = delivery_paths(config_path, identity)[0].parent
     return root / ('attachments-' + suffix + '.json'), root / ('attachments-' + suffix + '.lock')
 
@@ -440,16 +445,29 @@ def download_task_attachments(config, attachments, directory, runner=subprocess.
         if len(candidates) != 1:
             raise ValueError('invalid_downloaded_attachment')
         path = candidates[0]
-        stat = path.lstat()
-        if path.is_symlink() or not path.is_file() or stat.st_size != item['size_bytes']:
+        metadata = path.lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_size != item['size_bytes'] or path.name != item['filename']):
             raise ValueError('invalid_downloaded_attachment')
+        path.chmod(0o600)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         downloaded.append({'path': path, 'sha256': digest, **item})
     return downloaded
 
 
-def upload_task_attachments(config_path, config, envelope, identity, attachments, runner=subprocess.run):
-    state_path, lock_path = attachment_delivery_paths(config_path, identity, attachments)
+def upload_task_attachments(config_path, config, envelope, identity, attachments,
+                            runner=subprocess.run, token=None, opener=urllib.request.urlopen):
+    file_ids, duplicate = [], True
+    for attachment in attachments:
+        result = upload_task_attachment(config_path, config, envelope, identity, attachment,
+                                        runner, token, opener)
+        file_ids.extend(result['file_ids'])
+        duplicate = duplicate and result['duplicate']
+    return {'duplicate': duplicate, 'count': len(file_ids), 'file_ids': file_ids}
+
+
+def upload_task_attachment(config_path, config, envelope, identity, attachment, runner, token, opener):
+    state_path, lock_path = attachment_delivery_paths(config_path, identity, attachment)
     with delivery_lock(lock_path):
         state = read_attachment_state(state_path)
         if state and state['phase'] == 'sent':
@@ -457,12 +475,17 @@ def upload_task_attachments(config_path, config, envelope, identity, attachments
         if state and state['phase'] == 'attempting':
             raise ValueError('slack_attachment_delivery_unknown')
 
+        if not token:
+            raise ValueError('slack_user_token_missing')
+
         slack_cli = config.get('slackCliPath')
         if (not isinstance(slack_cli, str) or not os.path.isabs(slack_cli)
                 or not Path(slack_cli).is_file() or Path(slack_cli).is_symlink()):
             raise ValueError('invalid_slack_cli_path')
         with tempfile.TemporaryDirectory(prefix='.slack-attachments-', dir=Path.cwd()) as directory:
-            downloaded = download_task_attachments(config, attachments, directory, runner)
+            downloaded = download_task_attachments(config, [attachment], directory, runner)
+            # The body may have been sent in an earlier invocation; recheck before each upload.
+            verify_reply_root(token, envelope, opener)
             command = [sys.executable, slack_cli, 'files_upload', '--as', 'user',
                        '--channel', envelope['eventPayload']['channelId'],
                        '--thread-ts', envelope['eventPayload']['threadTs']]
@@ -472,24 +495,49 @@ def upload_task_attachments(config_path, config, envelope, identity, attachments
             write_delivery_state(state_path, {'version': 1, 'phase': 'attempting',
                                               'attemptedAt': attempted_at})
             child_env = os.environ.copy()
+            child_env['SLACK_USER_TOKEN'] = token
             child_env['SLACK_SKILL_ALLOWED_CHANNELS'] = envelope['eventPayload']['channelId']
-            result = runner(command, capture_output=True, text=True, timeout=180, env=child_env)
+            try:
+                result = runner(command, capture_output=True, text=True, timeout=180, env=child_env)
+            except (OSError, subprocess.SubprocessError):
+                raise ValueError('slack_attachment_delivery_unknown') from None
             if result.returncode:
                 try:
                     failure = json.loads(result.stdout)
                 except (json.JSONDecodeError, TypeError):
                     failure = None
-                if isinstance(failure, dict) and failure.get('retry_safe') is True:
+                if (isinstance(failure, dict) and failure.get('status') == 'failed'
+                        and failure.get('retry_safe') is True):
                     state_path.unlink(missing_ok=True)
                     raise ValueError('slack_attachment_send_rejected')
+                if isinstance(failure, dict):
+                    known_files = [failure.get('current_file', {})]
+                    known_files += failure.get('completed_files', []) if isinstance(failure.get('completed_files'), list) else []
+                    known_ids = [item['id'] for item in known_files if isinstance(item, dict)
+                                 and isinstance(item.get('id'), str) and re.fullmatch(r'F[A-Z0-9]+', item['id'])]
+                    receipt = {'version': 1, 'phase': 'attempting', 'attemptedAt': attempted_at,
+                               'fileIds': list(dict.fromkeys(known_ids))}
+                    stage = failure.get('delivery_phase')
+                    if stage in ('get_upload_url', 'bytes_upload', 'complete_upload'):
+                        receipt['deliveryPhase'] = stage
+                    write_delivery_state(state_path, receipt)
                 raise ValueError('slack_attachment_delivery_unknown')
             try:
                 report = json.loads(result.stdout)
             except (json.JSONDecodeError, TypeError):
                 raise ValueError('slack_attachment_delivery_unknown') from None
-            uploaded = report.get('uploaded') if isinstance(report, dict) else None
-            file_ids = [item.get('id') for item in uploaded] if isinstance(uploaded, list) else []
-            if (report.get('operation_status') != 'succeeded' or len(file_ids) != len(attachments)
+            if not isinstance(report, dict):
+                raise ValueError('slack_attachment_delivery_unknown')
+            uploaded = report.get('uploaded')
+            if not isinstance(uploaded, list) or any(not isinstance(item, dict) for item in uploaded):
+                raise ValueError('slack_attachment_delivery_unknown')
+            file_ids = [item.get('id') for item in uploaded]
+            actor, channel = report.get('actor'), report.get('channel')
+            if (report.get('operation_status') != 'succeeded' or len(file_ids) != 1
+                    or not isinstance(actor, dict) or actor.get('selected') != 'user'
+                    or actor.get('team_id') != config['teamId']
+                    or not isinstance(channel, dict) or channel.get('id') != envelope['eventPayload']['channelId']
+                    or report.get('thread_ts') != envelope['eventPayload']['threadTs']
                     or not all(isinstance(value, str) and re.fullmatch(r'F[A-Z0-9]+', value)
                                for value in file_ids)):
                 raise ValueError('slack_attachment_delivery_unknown')
@@ -539,7 +587,7 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     def finish(result):
         if attachments is not None:
             result['attachments'] = upload_task_attachments(
-                config_path, config, envelope, identity, attachments, runner)
+                config_path, config, envelope, identity, attachments, runner, token, opener)
         print(json.dumps(result, ensure_ascii=False))
 
     with delivery_lock(lock_path):
