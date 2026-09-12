@@ -8,6 +8,8 @@ import {
   createComment,
   findComment,
   getSlackReplyContext,
+  getIssue,
+  listRelayMessageContents,
   type ApiConfig,
 } from "./multica-api.js";
 import type { MentionMatch } from "./mentions.js";
@@ -18,7 +20,8 @@ import {
   type CancellationState,
 } from "./cancellation.js";
 import { type ThreadStore } from "./thread-store.js";
-import { buildEnvelope, focusContext, messageFingerprint, compareTs, type ThreadContext } from './context-envelope.js';
+import { buildEnvelope, compactInitialContext, projectFiles, compareTs, timestampValid, type ThreadContext } from './context-envelope.js';
+import type { ContextReadOptions } from './slack-context.js';
 
 export interface SlackThreadEvent {
   teamId: string;
@@ -35,7 +38,7 @@ export interface SlackThreadEvent {
 }
 export interface ThreadRouterConfig extends ApiConfig {
   store: ThreadStore;
-  readContext: (event: SlackThreadEvent) => Promise<ThreadContext>;
+  readContext: (event: SlackThreadEvent, options?: ContextReadOptions) => Promise<ThreadContext>;
   slackReactionToken?: string;
   slackReactionName?: string;
 }
@@ -158,7 +161,8 @@ export async function routeSlackThreadEvent(
       return { action, issueId: state.issueId };
     };
     const selectionKey = key + ':sent-context-index';
-    type SelectionIndex = { version: 2; cutoffTs: string; messages: Record<string,string> };
+    type SelectionIndex = { version: 3; cutoffTs: string; initialContext: ThreadContext; request: SlackThreadEvent };
+    let recoveredDescription: string | undefined;
     const advanceSelection = async (): Promise<void> => {
       const pending=await config.store.get(msgKey+':selection-index');
       if(!pending)return;
@@ -174,16 +178,75 @@ export async function routeSlackThreadEvent(
         console.info('relay_context',{eventId:digest(messageKey(event)),snapshot:'reused',envelopeBytes:Buffer.byteLength(frozen)});
         return frozen;
       }
-      const source=await config.readContext(event);
       const savedIndex=await config.store.get(selectionKey);
-      const index:SelectionIndex|undefined=savedIndex?JSON.parse(savedIndex):undefined;
-      const baseline=index?.version===2&&compareTs(index.cutoffTs,event.messageTs)<0?index.messages:undefined;
-      const followup=messageKey(event)!==state.rootMessageKey;
+      let index:SelectionIndex|undefined=savedIndex?JSON.parse(savedIndex):undefined;
+      if(index?.version===3&&(!index.request||threadKey(index.request)!==threadKey(event)||!timestampValid(index.cutoffTs)||index.request.messageTs!==index.cutoffTs||index.initialContext?.anchorTs!==event.threadTs||!Array.isArray(index.initialContext.timeline?.messages)))throw new Error('invalid_thread_state');
+      const followup=!!state.issueId&&messageKey(event)!==state.rootMessageKey;
+      // A is a persisted mention, never a read attempt or an unconfirmed write.
+      // Cache loss and out-of-order events recover A from the scoped Issue/comments.
+      if(followup&&(!index||index.version!==3||compareTs(index.cutoffTs,event.messageTs)>=0)){
+        const description=recoveredDescription??(await getIssue(config,state.issueId!,fetchImpl)).description;
+        if(!description?.startsWith(marker+'\n'))throw new Error('invalid_thread_state');
+        const first=readTaskEnvelope(description);
+        if(threadKey(first.eventPayload)!==threadKey(event))throw new Error('invalid_thread_state');
+        const history=[first];
+        for(const content of await listRelayMessageContents(config,state.issueId!,fetchImpl)){
+          const item=readTaskEnvelope(content);
+          if(threadKey(item.eventPayload)!==threadKey(event)||!content.startsWith(`<!-- relay-message:${digest(messageKey(item.eventPayload))} -->\n`))continue;
+          history.push(item);
+        }
+        const previous=history.filter(item=>compareTs(item.eventPayload.messageTs,event.messageTs)<0)
+          .sort((a,b)=>compareTs(b.eventPayload.messageTs,a.eventPayload.messageTs))[0];
+        const original=first.context as ThreadContext|undefined;
+        // Legacy envelopes may not have a tree. Their request still bounds A.
+        const initialContext:ThreadContext=original?.timeline?(first.schemaVersion===5?structuredClone(original):compactInitialContext(original)):{
+          anchorTs:event.threadTs,cutoffTs:first.eventPayload.messageTs,capturedAt:'',timeline:{status:'unavailable',reason:'legacy_background_unavailable',messages:[]},
+        };
+        initialContext.timeline.messages=initialContext.timeline.messages.filter(m=>m.ts!==event.threadTs);
+        const latest=history.sort((a,b)=>compareTs(b.eventPayload.messageTs,a.eventPayload.messageTs))[0]!;
+        // A late event after cache loss must not replace a newer persisted cursor.
+        await config.store.set(selectionKey,JSON.stringify({version:3,cutoffTs:latest.eventPayload.messageTs,initialContext,request:latest.eventPayload}),24*60*60);
+        if(previous)index={version:3,cutoffTs:previous.eventPayload.messageTs,initialContext,request:previous.eventPayload};
+        else index=undefined;
+      }
+      const baseline=index?.version===3&&compareTs(index.cutoffTs,event.messageTs)<0?index:undefined;
+      const source=await config.readContext(event,{sinceTs:baseline?.cutoffTs,includeNearby:!followup,referenceTexts:typeof baseline?.request.text==='string'?[baseline.request.text]:[]});
+      const initialContext=baseline?.initialContext;
+      if(initialContext){
+        const sides=structuredClone(initialContext.timeline.messages).filter(m=>compareTs(m.ts,event.messageTs)<=0);
+        const fresh=source.timeline.messages;
+        const combined=new Map(sides.map(m=>[m.ts,m]));
+        for(const message of fresh){
+          const previous=combined.get(message.ts);
+          if(previous?.replies&&message.replies){
+            message.replies.messages=[...new Map([...previous.replies.messages,...message.replies.messages].map(m=>[m.ts,m])).values()].sort((a,b)=>compareTs(a.ts,b.ts));
+          }
+          combined.set(message.ts,message);
+        }
+        source.timeline.messages=[...combined.values()].sort((a,b)=>compareTs(a.ts,b.ts));
+        source.initialCutoffTs=initialContext.cutoffTs;
+        if(initialContext.timeline.status!=='complete'){
+          source.initialStatus=initialContext.timeline.status;source.initialReason=initialContext.timeline.reason;
+        }
+        source.participants=[...new Map([...(source.participants??[]),...(initialContext.participants??[])].map(p=>[p.id,p])).values()];
+      }else source.initialCutoffTs=event.messageTs;
+      const anchor=source.timeline.messages.find(m=>m.ts===event.threadTs);
+      if(baseline&&baseline.cutoffTs!==event.threadTs&&anchor?.replies&&!anchor.replies.messages.some(m=>m.ts===baseline.cutoffTs)){
+        if(typeof baseline.request.text!=='string')throw new Error('context_required_unavailable');
+        anchor.replies.messages.unshift({ts:baseline.cutoffTs,authorId:baseline.request.senderUserId,origin:'unknown',text:baseline.request.text,files:projectFiles(baseline.request.files,Number.MAX_SAFE_INTEGER)});
+        anchor.replies.messages.sort((a,b)=>compareTs(a.ts,b.ts));
+      }
       const agentConfigStartedAt=Date.now();
       const replyContext=await getSlackReplyContext(config,fetchImpl);
       const agentConfigMs=Date.now()-agentConfigStartedAt;
       const assemblyStart=Date.now();
-      const selected=followup?focusContext(event,source,baseline):source;
+      // First nearby discussion is immutable background; no unrelated new timeline on follow-up.
+      const selected=source;
+      if(followup){
+        selected.sinceTs=baseline?.cutoffTs;
+        selected.selection={mode:'focused',baseline:baseline?'available':'unavailable',omittedRoots:0,omittedCurrentReplies:0};
+        if(anchor?.replies&&baseline)anchor.replies.messages=anchor.replies.messages.filter(m=>compareTs(m.ts,baseline.cutoffTs)>=0||m.change==='referenced'||m.change==='context');
+      }
       const body=buildEnvelope(event,selected,replyContext);
       const output=JSON.parse(body).context as ThreadContext;
       const delivered=output.timeline.messages;
@@ -203,19 +266,12 @@ export async function routeSlackThreadEvent(
         readReasons,reasons,messageReadMs:source.readStats?.messageReadMs,nameLookupCalls:source.readStats?.nameLookupCalls,
         nameReadMs:source.readStats?.nameReadMs,agentConfigMs,assemblyMs:Date.now()-assemblyStart,envelopeBytes:Buffer.byteLength(body),
       });
-      const hashes={...baseline};
-      const sourceMessages=new Map(source.timeline.messages.flatMap(m=>[m,...(m.replies?.messages??[])]).map(m=>[m.ts,m]));
-      for(const root of delivered){
-        for(const message of [root,...(root.replies?.messages??[])]){
-          const original=sourceMessages.get(message.ts);
-          if(original)hashes[message.ts]=messageFingerprint(original);
-        }
-      }
-      const messages=Object.fromEntries(Object.entries(hashes).sort(([a],[b])=>compareTs(b,a)).slice(0,500));
       await config.store.setIfAbsent(preparedKey, body, 24 * 60 * 60);
       const saved = await config.store.get(preparedKey);
       if (!saved) throw new Error('invalid_thread_state');
-      if(saved===body)await config.store.set(msgKey+':selection-index',JSON.stringify({version:2,cutoffTs:event.messageTs,messages}),24*60*60);
+      const firstContext=initialContext??structuredClone(output);
+      firstContext.timeline.messages=firstContext.timeline.messages.filter(m=>m.ts!==event.threadTs);
+      if(saved===body)await config.store.set(msgKey+':selection-index',JSON.stringify({version:3,cutoffTs:event.messageTs,initialContext:firstContext,request:JSON.parse(body).eventPayload}),24*60*60);
       return saved;
     };
     if (!state.issueId) {
@@ -224,6 +280,7 @@ export async function routeSlackThreadEvent(
       const existing = await findIssue(config, marker, fetchImpl);
       if (existing) {
         state.issueId = existing.id;
+        recoveredDescription=existing.description??undefined;
         if (!raw) {
           const original = readTaskEnvelope(existing.description!);
           if (

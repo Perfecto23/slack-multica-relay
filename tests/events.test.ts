@@ -94,8 +94,8 @@ describe("durable admission", () => {
       ...Array.from({length:5},(_,i)=>({id:`F${i+2}`,name:`${i+2}.png`,mimetype:"image/png"}))];
     await acceptSlack(request({...event,files}),env,fetcher);
     const queued=JSON.parse(String(fetcher.mock.calls[0]![1]?.body));
-    expect(queued.files).toHaveLength(5);expect(queued.files[0]).toEqual({id:"F1",name:"photo.png",mime:"image/png",size:12,contentStatus:"not_loaded"});
-    expect(queued.filesTruncated).toBe(true);
+    expect(queued.files).toHaveLength(6);expect(queued.files[0]).toEqual({id:"F1",name:"photo.png",mime:"image/png",size:12,contentStatus:"not_loaded"});
+    expect(queued.filesTruncated).toBeUndefined();
     expect(queued.sourceFingerprint).toMatch(/^[a-f0-9]{64}$/u);
     expect(JSON.stringify(queued)).not.toContain("private.test");
     const initial=await readContext(queued,"test",async()=>Response.json({ok:true,messages:[]}));

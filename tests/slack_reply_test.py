@@ -130,6 +130,17 @@ class ReplyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reply.envelope_from_text(text.replace('<!-- /relay-payload -->', ''))
 
+    def test_compact_schema_5_keeps_reply_route_and_footer(self):
+        payload = {'schemaVersion': 5, 'eventPayload': EVENT,
+                   'context': {'timeline': {'messages': [
+                       {'ts': '100.000001', 'authorId': 'U1', 'text': 'hello'}]}}}
+        text = '<!-- relay-thread:x -->\n<!-- relay-payload:v1 -->\n```json\n' + json.dumps(payload, separators=(',', ':')) + '\n```\n<!-- /relay-payload -->'
+        parsed = reply.envelope_from_text(text)
+        rendered = reply.render_reply(CONFIG, parsed, 'result')
+        self.assertEqual(rendered['channel'], EVENT['channelId'])
+        self.assertEqual(rendered['thread_ts'], EVENT['threadTs'])
+        self.assertEqual(rendered['blocks'][-1]['elements'][0]['text'], CONFIG['displayName'])
+
     def test_main_reads_exact_comment_and_verifies_one_slack_send(self):
         envelope = {'eventPayload': {**EVENT, 'messageTs': '101.000001'}}
         marker_text = '<!-- relay-message:x -->\n' + json.dumps(envelope)

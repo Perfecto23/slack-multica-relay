@@ -180,7 +180,7 @@ export async function findComment(
   fetchImpl: typeof fetch = fetch,
 ): Promise<MulticaComment | undefined> {
   for await (const page of issueCommentPages(config, issueId, fetchImpl)) {
-    const match = page.find((comment) => comment.content.includes(marker));
+    const match = page.find((comment) => comment.content.startsWith(marker+'\n'));
     if (match) return match;
   }
 }

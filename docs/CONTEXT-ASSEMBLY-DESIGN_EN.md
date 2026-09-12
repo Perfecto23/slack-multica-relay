@@ -2,93 +2,80 @@
 
 **English** | [简体中文](CONTEXT-ASSEMBLY-DESIGN.md)
 
-For every accepted mention, the Relay reads the preceding 24 hours of the same conversation's main timeline, expands the current thread and up to five recently active side threads, and always retains the current thread. The resulting tree is delivered to Multica so the Agent can identify the discussion it must answer.
+The Relay puts the current request first and renders each message on one JSON line, retaining original text and thread relationships. Selection uses explicit time, thread, and link rules. No model summarizes the input, and ordinary thread messages are not filtered by length, emoji, or guessed relevance.
 
-## Input and time boundaries
+## Deterministic input scope
 
-- `eventPayload` is the source of truth for the current request and route. `messageTs` is the cutoff for the entire tree.
-- The main timeline window is `[messageTs - 24 hours, messageTs]` and retains at most the latest 40 root messages. Broadcast thread replies do not become separate roots.
-- The Relay selects the latest 40 roots directly from the 24-hour window. It does not widen the window in stages. Side threads are ordered by `latest_reply`, and only the five most recently active roots are expanded.
-- `threadTs` identifies the current root. It is added even when it predates the window and is deduplicated when already present in the main timeline.
-- Replies in every branch stop at the current mention. A new mention refreshes the tree; retries of the same event reuse the prepared snapshot.
-- Threads rooted outside the window are not expanded, except for the current thread. Replies inside a selected thread may predate the window so that the discussion retains its relationships.
+B is the current mention. A is the latest earlier mention confirmed persisted to Multica in the same workspace/project/agent/thread.
 
-## Data contract
+| Case | Included content |
+| --- | --- |
+| First mention | Every current-thread message from root through B; a new root contains B itself |
+| Initial nearby discussion | Latest 12 other roots in the same conversation within `[B - 30 minutes, B)`; expand the 2 most recently active threads, retaining 5 trailing replies each |
+| Follow-up | Root, A, and every message in `(A, B]`, including non-mentions, other authors, bots, emoji, and attachment references |
+| Initial background | Preserve the nearby discussion first delivered, identified by `initialCutoffTs`; do not refresh unrelated main-timeline messages on follow-up |
+| Explicit links | Up to 3 distinct same-conversation Slack permalinks, discovered in current request, A, root, and interval messages; include root, target, and 2 preceding/following replies; a linked root includes its first 2 replies |
+| No reliable A | Read root through B without assuming earlier delivery |
 
-The marker remains on the first line. A readable quote and source follow it, then a JSON data section enclosed by matching `relay-payload:v1` markers. Recovery accepts both this representation and the historical marker-plus-bare-JSON format. It rejects damaged or duplicated payload blocks. `schemaVersion: 4` identifies the focused follow-up tree contract. `eventPayload` remains stable so older JSON can still recover routes for existing Issues.
+The entire current thread remains mandatory even when its root is old. Nearby roots are selected newest first and displayed chronologically; activity uses `latest_reply`. Sparse conversations do not widen the time window. Links are not followed recursively, other-conversation links remain text, and targets already in the mandatory interval are not fetched again. Unresolved links and optional read failures never imply that the linked content was read.
+
+Required replies use `oldest=A`, `latest=B`, `inclusive=true` and cursor pagination. Fetch the exact root separately if Slack excludes it from this interval. See the official [replies contract](https://docs.slack.dev/reference/methods/conversations.replies/) and [single-message history contract](https://docs.slack.dev/reference/methods/conversations.history/).
+
+## Compact presentation and wire contract
+
+Keep the original marker on the first line, followed by the request quote, one source line, scope explanation, and JSON data. Paired `relay-payload:v1` markers and dynamically sized fences remain unchanged.
+
+`schemaVersion: 5` renders each ordinary message on one line. Presentation omits default `origin=unknown`, empty `files`, and the empty text of a currentRequest node. Actual bot origins, attachments, and missing-content flags remain. Timestamps, author IDs, participant names, original text, thread relationships, and routing coordinates are preserved.
 
 ```json
 {
-  "schemaVersion": 4,
-  "task": { "instructions": ["Relay-owned request and original-thread reply instructions"] },
-  "eventPayload": { "channelId": "C…", "threadTs": "2000.000001", "messageTs": "2100.000001", "text": "current request" },
+  "schemaVersion": 5,
+  "eventPayload": {"teamId":"T1","channelId":"C1","threadTs":"1000.000001","messageTs":"1100.000001","text":"current request"},
   "context": {
-    "anchorTs": "2000.000001",
-    "cutoffTs": "2100.000001",
-    "capturedAt": "capture time",
-    "participants": [{"id": "U…", "name": "display name"}],
-    "timeline": {
-      "status": "complete",
-      "messages": [
-        { "ts": "1900.000001", "authorId": "U…", "text": "nearby root", "replies": {"status": "complete", "messages": [{"ts":"1950.000001", "text":"reply"}]} },
-        { "ts": "2000.000001", "authorId": "U…", "text": "current root", "replies": {"status": "complete", "messages": [{"ts":"2100.000001", "currentRequest":true, "text":"", "files":[]}]} }
-      ]
-    }
+    "anchorTs":"1000.000001","sinceTs":"1050.000001","cutoffTs":"1100.000001",
+    "timeline": {"status":"complete","messages":[
+      {"ts":"1000.000001","authorId":"U1","text":"root","replies":{"status":"complete","messages":[
+        {"ts":"1050.000001","authorId":"U1","text":"previous mention"},
+        {"ts":"1060.000001","authorId":"U2","text":"non-mention discussion"},
+        {"ts":"1100.000001","authorId":"U1","currentRequest":true}
+      ]}}
+    ]}
   }
 }
 ```
 
-The example omits `origin`, `files`, and some route fields from ordinary messages. A node with `currentRequest: true` refers to the current request in `eventPayload`; it does not duplicate the body or attachments. Each `replies` collection contains only child replies and does not repeat its parent.
+This example omits fixed task instructions and some routing fields. Complete request text and attachments remain in eventPayload; currentRequest references them. The readable quote is limited to 4 KiB, while the data preserves the complete request. The TS reader restores omitted defaults. The Python reply adapter continues reading the same eventPayload/replyContext. Legacy bare JSON, v4 fenced payloads, and old markers remain readable. Duplicate or corrupt payload blocks are rejected. Historical Issues/comments are not rewritten.
 
-`complete` describes only the read range of that collection. Child branches may independently be `truncated` or `unavailable`. `coveredFromTs` and `coveredThroughTs` describe the retained range; they do not prove that every message between them is present. If the current root cannot be read, its ID is retained with `contentStatus: unavailable`.
+`complete` describes only that collection's read scope. Coverage timestamps describe retained content, not unseen history. Optional branches independently carry truncated/unavailable markers; `initialStatus/initialReason` can carry initial-background gaps forward. Attachment references remain `not_loaded` and never prove content was inspected.
 
-## Focused follow-ups in the same thread
+## Budgets and failures
 
-The first Issue contains a bounded tree. Later comments use `context.selection.mode=focused`: they always retain the current request, thread root, and latest 20 replies in the current thread. They also retain an already-read older message explicitly referenced by a standard same-channel Slack permalink matching `/archives/<channel>/p<timestamp>`. Side branches prioritize explicit references, then recent branches with new or updated messages, with at most five roots. Every selected branch retains its parent. Replies include new, updated, or explicitly referenced messages plus up to two necessary predecessors for each change. Referencing a root retains bounded context for that branch. A link outside the read range may still require a follow-up lookup.
-
-Every comment is a self-contained focused snapshot rather than a delta the Agent must merge. Omitting an old side branch may affect an ambiguous reference, so `task.instructions` requires answers to stay within the available scope and to look up or clarify missing context. `omittedRoots` and `omittedCurrentReplies` count candidates omitted from this snapshot; they are not totals for the entire channel.
-
-Each message gets an internal fingerprint over its author, untruncated text, and stable reference fields for all attachments. The Agent still receives at most 4 KiB of text and five attachments. The internal fingerprint does not enter the envelope. Child replies, capture time, and display markers do not affect the same fingerprint. The sent-message index advances only after Multica persistence succeeds or marker readback confirms the write. This is a write receipt; it does not prove the model read or retained the content. The index is scoped to the current route, lasts 24 hours, and retains at most 500 message fingerprints. Out-of-order events never move it backward. If the index is missing, `baseline=unavailable`; the snapshot retains up to five recent side branches without claiming they were previously sent.
-
-A message removed by the byte budget is not recorded as sent. The index includes only messages that reached the persisted body, never omitted siblings in the same branch. It contains no chat text, and expiry only reduces follow-up compactness. The Relay selects at most five recently active side roots before reading their replies, avoiding network reads for old branches that would be omitted. The 24-hour window bounds candidates; Slack network reads are not cached.
-
-## Budgets and failure behavior
-
-| Item | Limit and behavior |
+| Item | Policy |
 | --- | --- |
-| Main-timeline roots | Latest 40; the current root may be added from outside the window |
-| Current thread | Root plus up to 100 replies from the latest fully reached scan range |
-| Side thread | Root plus up to 20 replies from the latest fully reached scan range |
-| Total replies | 200; current-thread replies take priority, then roots from most to least recent |
-| Pagination | Up to 5 history pages, 10 current-thread pages, and 3 pages per side thread; at most 20 conversation requests in total |
-| Time and concurrency | 20 seconds for message reads; current thread and main timeline first, then at most 4 side reads in parallel |
-| One message | 4 KiB text and 5 attachment references; attachment content is `not_loaded` |
-| Input response | At most 2 MiB per Slack response |
-| Output | 32 KiB tree and 48 KiB serialized envelope, including task instructions and names |
+| Required current thread | No last-20/100 limit, text clipping, or attachment-reference dropping |
+| Optional message | 4 KiB text and 5 attachment references, with explicit truncation markers |
+| Pagination | 5 history pages, 10 required reply pages, 3 optional reply pages; 20 conversation requests overall |
+| Time | 20 seconds for message reads; current thread first, then nearby discussion and links; at most 2 side threads concurrently |
+| Input response | 2 MiB per Slack response |
+| Output | 48 KiB envelope and 64 KiB final Issue/comment |
 
-`conversations.replies` contributes recent replies only after pagination reaches the final cursor. If the page, request, or time budget cannot reach the latest suffix, the Relay discards the scanned old prefix and marks the branch `latest_suffix_unavailable`. When the total reply budget is exceeded, older side replies are removed first. The byte budget removes older optional trees, then reduces current-thread replies while preserving the current root and request reference; it may finally truncate the current root body. If the current request itself cannot fit, the Relay rejects it rather than silently changing it.
+Byte pressure removes optional side roots first, then optional referenced replies older than A. If root, A, `(A,B]`, and B still cannot fit, return `context_request_too_large` without creating an incomplete task or advancing A. Unfinished mandatory pagination returns `context_required_page_limit`; definite access failures or a missing root return `context_required_unavailable`. These are deterministic rejections. Temporary 429, 5xx, and timeouts use bounded queue retries. Optional failures mark the affected background. Cross-channel and cross-thread responses are always rejected.
 
-Temporary current-thread or main-timeline failures, including 429, 5xx, and timeout responses, are left for queue retry. Definite permission failures become `unavailable`. A side-branch failure marks only that branch. A temporary side failure stops later optional network calls, and unread branches use the `read_budget` reason. Cross-channel and cross-thread responses are always rejected.
+## Persistence, cache, and recovery
 
-## Participant names and ownership
+- The event envelope and pending context state are frozen for 24 hours; retries do not rebuild them.
+- The v3 `:sent-context-index` caches the latest persisted request/boundary and initial background for 24 hours. Message fingerprints no longer determine interval omissions. It contains minimal delivered context, never attachment content or private URLs.
+- Advance A only after a successful Issue/comment write or stable-marker confirmation. Successful reads, preparation, and startup reactions are not delivery receipts.
+- Missing caches, old indexes, and out-of-order events recover the latest persisted mention before B from the scoped Issue and Relay comments. Recover the overall latest persisted cursor as well, so a late event cannot move it backward.
+- Old first-Issue trees are reduced to the current 30-minute / 12-root / 2-thread / 5-reply policy using only their saved evidence. They do not perpetuate large old snapshots or rewrite historical bodies.
+- Without a reliable A, retain root through B. Unknown writes still use existing idempotent recovery rather than blind creation retries.
+- Missing thread mappings recover through the unique thread marker. Multica history retention remains independent of Redis TTL.
 
-`context.participants` maps IDs to display names for the current sender, mentioned target users, and authors retained in the tree. At most 10 unique users are resolved, with concurrency 4 and a total budget of 3 seconds. Resolution prefers `display_name`, then `real_name`, then username. A failed lookup omits the name while retaining the ID and does not block the request. Email and the complete profile are never projected. Names do not participate in authorization.
+## Names, ownership, and acceptance
 
-Relay-owned `task.instructions` explain the current request, tree nodes, missing-data markers, and original-thread reply contract. Slack text cannot replace them. Long-lived Agent Instructions retain personality, authorization, and privacy rules. The Multica Runtime owns task execution and lifecycle. The Slack Skill and private Runtime configuration own credentials and tool bindings. A marker is not a signature, and task text is not an authorization source.
+Display names are optional metadata: up to 10 users, concurrency 4, and a 3-second deadline. Failed lookups retain IDs; email and complete profiles are excluded. Fixed task instructions explain data and original-thread replies. Background is not new authorization, markers are not signatures, and private long-lived instructions remain Runtime-owned.
 
-## Snapshots and recovery
-
-- The full `:envelope` is frozen per event for 24 hours. Duplicate delivery does not rebuild the input.
-- A new mention does not read the first message's background, old context from the Issue, or the historical `:background` cache.
-- Old cache entries expire under their TTL. Existing Issues/comments are not rewritten. Historical envelopes are used only to recover the original route and message identity.
-- If the Redis thread mapping is missing, the Relay recovers the Issue through Multica search for the unique thread marker instead of linearly scanning the Project. Write idempotency and unknown-result recovery remain unchanged.
-- Multica retains historical snapshots under its own policy. Redis expiry does not delete Multica content.
-
-## Acceptance
-
-Automated coverage includes the time window, 40-root limit, current-root deduplication and out-of-window retention, five recently active side threads, shared cutoff, total-reply budget, latest-suffix pagination, byte limits, permission and rate-limit markers, pre-queue attachment projection, full safe-content fingerprints, participant names, frozen retries, and recovery from an older Issue through marker search before a new mention refreshes the tree.
-
-Live acceptance creates a side thread in an authorized test channel and then triggers the current thread. Verify the tree stored in Multica and the Agent's answer about side-thread content. Add a new main message and side reply, mention the Agent again in the current thread, and independently confirm refreshed context, reuse of the same Issue, and delivery to the original thread.
+Automated coverage includes first nearby threads, all 130 paginated non-mentions, long text and complete attachment references, explicit link windows, cross-conversation rejection, cache loss, out-of-order delivery, failed writes, frozen retries, v4/v5 recovery, and reply destination compatibility. Offline checks and a Worker build do not establish live Slack → Multica → reply E2E.
 
 ## Presentation and Agent configuration snapshot
 
@@ -111,16 +98,6 @@ A definite send rate limit persists `rate_limited/retryAt` and permits retry onl
 
 `--deliver-task-attachments` delivers attachments from comments created by the current task. The exact Slack root is checked before the first body send and before each file upload. Per-attachment receipts prevent repeating unknown uploads. See [Attachment delivery](../multica-skills/multica-final-reply/references/attachment-delivery.md) for discovery, download, permissions, and receipt handling.
 
-## Message change labels
+## Build diagnostics
 
-A side message uses `change=new` when absent from the sent index, `updated` when its fingerprint differs, `referenced` when explicitly linked, and `context` when retained as a parent or as one of at most two preceding messages for a change. A parent does not become updated because a child changed. An updated node contains only its current body, never an implicit old copy. New means new relative to the sent baseline, not necessarily newly posted. Without a baseline, nodes are labeled only as context or references; the Relay does not claim a comparison. Missing messages do not create deletion notices because window, pagination, and focused-selection limits can also explain absence.
-
-`context.selection.added`, `updated`, and `referenced` count side messages that actually reached the final snapshot. The current request and retained current-thread conversation are excluded. The readable presentation shows the same counts. A legacy branch-level index is treated as unavailable; a new message index is established after persistence. Historical envelope and marker recovery remain compatible.
-
-## Preceding context and clipping diagnostics
-
-Every new, updated, or explicitly referenced side reply retains up to two earlier replies in the same branch as `context`. Overlapping windows are merged and deduplicated without reordering. Later messages are not pulled in automatically. All existing count and byte budgets still apply. This heuristic helps resolve references but does not guarantee that two preceding messages explain every one.
-
-The builder emits a structured `relay_context` log with the event-key digest, full/focused mode, baseline state, Slack message-read calls, raw returned messages, candidate and retained root/message counts, omitted counts, side additions/updates/references, read omissions, unchanged-root omissions, side-root-limit omissions, selected sibling omissions, current-thread omissions, byte-budget clipping, output-truncation reasons, `messageReadMs`, `nameLookupCalls`, `nameReadMs`, `agentConfigMs`, `assemblyMs`, and `envelopeBytes`. Raw counts may include duplicate messages returned by different pages or read paths. Candidate counts describe the tree after window filtering and projection. Retained counts describe the final envelope. Timing fields separately measure Slack message reads, name resolution, Agent configuration lookup, and pure assembly.
-
-These metrics diagnose construction; they do not prove Multica persistence. Correlate them with the `relay_dispatch` action and result. Reusing the same event snapshot logs `snapshot=reused` and its byte count without another Slack read. Logs exclude chat text, names, attachment content, credentials, and the complete envelope. `readStats` and `selectionStats` exist only for builder telemetry and never enter model input.
+`relay_context` records only the event digest, read/retained counts, missing-data reasons, stage timings, and envelope bytes. It excludes chat text, names, credentials, and full snapshots. Correlate it with the separate `relay_dispatch` persistence result.

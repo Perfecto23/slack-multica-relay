@@ -102,6 +102,8 @@ function reason(error: unknown): string {
     "invalid_issue_scope",
     "invalid_context_scope",
     "context_request_too_large",
+    "context_required_page_limit",
+    "context_required_unavailable",
     "task_presentation_too_large",
     "context_rate_limited",
     "context_upstream_failed",
@@ -128,6 +130,8 @@ const permanentConsumerErrors = new Set([
   "invalid_issue_scope",
   "invalid_context_scope",
   "context_request_too_large",
+  "context_required_page_limit",
+  "context_required_unavailable",
   "task_presentation_too_large",
   "comment_lookup_limit",
 ]);
@@ -206,8 +210,7 @@ export async function acceptSlack(
       text: event.text,
       mention,
       sourceFingerprint: sourceMessageFingerprint(event),
-      ...(event.files ? { files: projectFiles(event.files),
-        ...(Array.isArray(event.files) && event.files.length > 5 ? { filesTruncated: true } : {}) } : {}),
+      ...(event.files ? { files: projectFiles(event.files,Number.MAX_SAFE_INTEGER) } : {}),
     });
   } catch {
     return json({ error: "invalid_event" }, 400);
@@ -337,8 +340,8 @@ export async function consumeQueue(
       event,
       {
         ...config,
-        readContext: async (event) => enrichParticipantNames(event,
-          await readContext(event, config.slackContextToken, boundedFetch),
+        readContext: async (event, options) => enrichParticipantNames(event,
+          await readContext(event, config.slackContextToken, boundedFetch, options),
           config.slackContextToken, boundedFetch),
         store: new UpstashThreadStore(
           config.kvRestApiUrl,

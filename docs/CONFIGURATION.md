@@ -50,9 +50,9 @@ Relay 调用普通 Issue 和 Comment API，不需要 Multica Autopilot 或 webho
 
 Redis 必须由该 Relay 独占，用于保存线程映射、锁和写入确认状态。QStash 保存排队的 Slack payload，并重试失败的 consumer；其访问控制与保留时间应按 Slack 消息内容的敏感程度配置。
 
-Redis 还会保存 24 小时的 scoped message fingerprint index（最多 500 条）用于选择 follow-up 上下文。这些记录表示已持久化内容，不代表 Agent Session 记忆。准备好的 envelope 也保存 24 小时，包括已投递副本，直到 TTL 到期。每次新 mention 都重新读取 timeline；只有同一事件的重试复用冻结快照。旧 background cache key 不再读写，按原 TTL 自然过期。Multica 按自己的保留策略保存已投递 envelope；Redis 到期不会删除 Multica 内容。
+Redis 将 v3 已交付边界、最近请求及首次附近背景缓存 24 小时；缓存包含已交付的最小消息文本与附件引用，不含附件内容或 private URL。只有 Multica 写入确认后才推进边界；过期或乱序时从 scoped Issue/comments 恢复。准备好的 envelope 同样冻结 24 小时。新 mention 读取完整同线程间隔并沿用首次背景，重试复用冻结输入；旧 Issue/comment 不回写。Multica 的保留策略与 Redis TTL 独立。
 
-Relay 在发布到 QStash 前，把每个 Slack file object 投影为 `id`、`name`、`mime`、`size` 和 `contentStatus`，并额外携带由完整安全字段生成的 fingerprint。下载内容、private URL、thumbnail、shares 和凭据不会进入队列 payload。暂时性或结果不明的失败返回 503 交给 QStash 有限重试；无效队列 payload、损坏的持久状态、scope 违反、无法消除的映射歧义和确定性体积超限返回 `rejected` 与 `retryable: false`。访问失败和有界读取缺失按上下文合同表达。
+Relay 在发布到 QStash 前，把每个 Slack file object 投影为 `id`、`name`、`mime`、`size` 和 `contentStatus`，并额外携带由完整安全字段生成的 fingerprint。下载内容、private URL、thumbnail、shares 和凭据不会进入队列 payload。暂时性或结果不明的失败返回 503 交给 QStash 有限重试；无效队列 payload、损坏的持久状态、scope 违反、无法消除的映射歧义和确定性体积超限返回 `rejected` 与 `retryable: false`。必需区间的明确权限失败、根缺失或分页预算耗尽也拒绝启动；可选背景缺失则按上下文合同标记。
 
 ## 取消与 reaction 身份
 

@@ -49,7 +49,7 @@ describe("Multica API contract", () => {
           },
         });
       expect(String(input)).toContain("before_id=old");
-      return Response.json([{ id: "c", content: "marker" }]);
+      return Response.json([{ id: "c", content: "marker\nbody" }]);
     };
     expect((await findComment(config, "issue", "marker", f))?.id).toBe("c");
     expect(calls).toBe(2);
@@ -72,10 +72,15 @@ describe("Multica API contract", () => {
               "X-Multica-Next-Before-Id": "id-" + calls,
             },
           })
-        : Response.json([{ id: "c", content: "marker" }]);
+        : Response.json([{ id: "c", content: "marker\nbody" }]);
     };
     expect((await findComment(config, "issue", "marker", fetcher))?.id).toBe(
       "c",
     );
   });
+});
+
+it('does not recover a write from a marker quoted inside another comment',async()=>{
+  const result=await findComment(config,'issue','marker',async()=>Response.json([{id:'quoted',content:'some text\nmarker\nbody'}]));
+  expect(result).toBeUndefined();
 });

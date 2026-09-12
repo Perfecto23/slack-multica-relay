@@ -19,9 +19,9 @@
 - **严格准入**：校验 Slack 签名与时间戳，并支持 Team、mention target、channel、sender 的 allowlist/blocklist。
 - **持久化接收**：使用 QStash 解耦 Slack 的短响应窗口与后续上下文读取、Multica 写入。
 - **Thread → Issue 路由**：同一 Slack thread 首次创建 Issue，后续 mention 追加 comment。
-- **有界对话上下文**：读取 mention 前 24 小时内最多 40 条主时间线消息，始终保留当前线程，并展开最多五个最近活跃旁支。
-- **独立可读的 follow-up**：后续 comment 携带当前线程、最近回复以及新增、更新或显式引用的相关旁支，无需 Agent 合并 delta。
-- **可检查的裁剪**：分页、消息数量、响应大小和 envelope 字节上限都会留下 `truncated` 或 `unavailable` 状态。
+- **有界附近讨论**：首次 mention 带入前 30 分钟最近 12 条主消息，展开其中 2 个最近活跃线程，各保留 5 条回复。
+- **完整后续对话**：保留根、上次已交付的 mention 和此后全部线程发言，沿用首次附近背景；每条消息一行，无需 Agent 合并差异。
+- **明确的缺失边界**：可选背景缺失显式标记；必需对话读取不完整或放不下时拒绝启动，不静默裁剪。
 - **隐私最小化**：Slack file object 在进入 QStash 前完成字段投影；private URL、thumbnail、shares、下载内容和凭据不会进入队列 payload。
 - **确定性 footer**：显示名、配置 model 和 Fast 标记由 adapter 代码生成，不依赖模型正文。
 - **原线程取消**：目标用户可通过 mention + cancel/取消停止关联 run，持久化取消与 reaction 清理进度。
@@ -60,7 +60,7 @@ Relay 部署环境和 Agent Runtime 是两个独立的信任域。Vercel/EdgeOne
 
 ## 上下文模型
 
-每条新 mention 都会生成一个冻结的 versioned envelope。它以本次消息为截止时间，读取有界的 24 小时主时间线，始终保留当前线程，并只展开最近活跃的有限旁支。分页必须到达最新后缀后才能把内容描述为“最近回复”；读取、权限或字节预算不足时，envelope 会明确标记缺失范围。同一事件的重试复用冻结输入，新 mention 才重新采集上下文。
+每条新 mention 生成冻结的 v5 envelope。首次提供完整当前线程和有界附近讨论；后续保留两次已交付 mention 之间的全部同线程对话，并沿用首次背景。消息以紧凑单行 JSON 展示，省略空字段。必需分页未完成或内容放不下时明确拒绝，不静默裁掉对话；可选背景缺失单独标记。同一事件重试复用冻结输入。
 
 完整数据结构、精确数量、分页和失败语义见 [Slack 上下文组装](docs/CONTEXT-ASSEMBLY-DESIGN.md)。
 

@@ -61,6 +61,8 @@ function fixture() {
       }
       return Response.json(comments);
     }
+    const found=issues.find(issue=>url.endsWith('/api/issues/'+issue.id));
+    if(found)return Response.json(found);
     throw new Error("unexpected endpoint");
   };
   const config: ThreadRouterConfig = {
@@ -219,28 +221,30 @@ describe("direct Issue routing", () => {
 });
 
 
-it('keeps cumulative sent branch fingerprints across compact follow-ups, edits and lost responses',async()=>{
+it('freezes first nearby discussion across follow-ups, cache loss and out-of-order events',async()=>{
   const f=fixture();let text='original';let reads=0;
-  f.config.readContext=async e=>{reads++;return {anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[{ts:'99.000001',authorId:'U1',origin:'unknown',text,files:[]},{ts:e.threadTs,authorId:'U2',origin:'unknown',text:'root',files:[]}]}};};
+  f.config.readContext=async (e,options)=>{reads++;return {anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[...(options?.includeNearby?[{ts:'99.000001',authorId:'U1',origin:'unknown' as const,text,files:[]}]:[]),{ts:e.threadTs,authorId:'U2',origin:'unknown',text:'root',files:[]}]}};};
   const decode=(s:string):any=>readTaskEnvelope(s);
   await routeSlackThreadEvent(root,f.config,f.fetcher);
   for(const ts of ['101.000001','102.000001'])await routeSlackThreadEvent({...root,messageTs:ts},f.config,f.fetcher);
-  expect(f.comments.every(c=>decode(c.content).context.timeline.messages.length===1)).toBe(true);
+  expect(f.comments.every(c=>decode(c.content).context.timeline.messages.length===2)).toBe(true);
   text='edited';f.loseCommentResponse();
   const e={...root,messageTs:'103.000001'};
   await expect(routeSlackThreadEvent(e,f.config,f.fetcher)).rejects.toThrow();
   const before=reads;await routeSlackThreadEvent(e,f.config,f.fetcher);expect(reads).toBe(before);
-  expect(decode(f.comments.at(-1)!.content).context.timeline.messages[0].text).toBe('edited');
+  expect(decode(f.comments.at(-1)!.content).context.timeline.messages[0].text).toBe('original');
   const fetcher:typeof fetch=async(input,init)=>{
     if(init?.method==='POST'){const value={id:'last',content:JSON.parse(String(init.body)).content};f.comments.push(value);return Response.json(value);}
     return f.fetcher(input,init);
   };
   await routeSlackThreadEvent({...root,messageTs:'104.000001'},f.config,fetcher);
-  expect(decode(f.comments.at(-1)!.content).context.timeline.messages).toHaveLength(1);
+  expect(decode(f.comments.at(-1)!.content).context.timeline.messages).toHaveLength(2);
+  f.config.store=new MemoryThreadStore();
   await routeSlackThreadEvent({...root,messageTs:'102.500001'},f.config,fetcher);
-  expect(decode(f.comments.at(-1)!.content).context.selection.baseline).toBe('unavailable');
+  expect(decode(f.comments.at(-1)!.content).context.sinceTs).toBe('102.000001');
   await routeSlackThreadEvent({...root,messageTs:'105.000001'},f.config,fetcher);
-  expect(decode(f.comments.at(-1)!.content).context.timeline.messages).toHaveLength(1);
+  expect(decode(f.comments.at(-1)!.content).context.timeline.messages).toHaveLength(2);
+  expect(decode(f.comments.at(-1)!.content).context.sinceTs).toBe('104.000001');
 });
 
 it('freezes the Agent configuration snapshot across retries and refreshes it for new messages',async()=>{
@@ -259,22 +263,23 @@ it('freezes the Agent configuration snapshot across retries and refreshes it for
   expect(readTaskEnvelope(f.comments[0]!.content).replyContext).toMatchObject({model:'model-two'});
 });
 
-it('retains necessary predecessor context when a side thread gains a reply',async()=>{
+it('retains first sibling context without refreshing unrelated side replies',async()=>{
   const f=fixture();let added=false;
-  f.config.readContext=async e=>({anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[
-    {ts:'90.000001',authorId:'U1',origin:'unknown',text:'side-root',files:[],replies:{status:'complete',messages:[
-      {ts:'91.000001',authorId:'U1',origin:'unknown',text:'old-reply',files:[]},
+  f.config.readContext=async (e,options)=>({anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[
+    ...(options?.includeNearby?[
+    {ts:'90.000001',authorId:'U1',origin:'unknown' as const,text:'side-root',files:[],replies:{status:'complete' as const,messages:[
+      {ts:'91.000001',authorId:'U1',origin:'unknown' as const,text:'old-reply',files:[]},
       ...(added?[{ts:'100.500001',authorId:'U1',origin:'unknown' as const,text:'new-reply',files:[]}]:[])
-    ]}},
+    ]}}]:[]),
     {ts:e.threadTs,authorId:'U2',origin:'unknown',text:'current-root',files:[]}
   ]}});
   await routeSlackThreadEvent(root,f.config,f.fetcher);added=true;
   await routeSlackThreadEvent({...root,messageTs:'101.000001'},f.config,f.fetcher);
   const second=readTaskEnvelope(f.comments[0]!.content) as any;
-  expect(second.context.timeline.messages[0].replies.messages.map((m:any)=>m.text)).toEqual(['old-reply','new-reply']);
-  expect(f.comments[0]!.content).toContain('旁支变化：新增 1 条，更新 0 条');
+  expect(second.context.timeline.messages[0].replies.messages.map((m:any)=>m.text)).toEqual(['old-reply']);
+  expect(second.context.initialCutoffTs).toBe(root.messageTs);
   await routeSlackThreadEvent({...root,messageTs:'102.000001'},f.config,f.fetcher);
-  expect((readTaskEnvelope(f.comments[1]!.content) as any).context.timeline.messages).toHaveLength(1);
+  expect((readTaskEnvelope(f.comments[1]!.content) as any).context.timeline.messages).toHaveLength(2);
 });
 
 
@@ -289,4 +294,28 @@ it('logs content-free clipping measurements',async()=>{
     expect(row.agentConfigMs).toBeGreaterThanOrEqual(0);expect(row.envelopeBytes).toBeGreaterThan(0);
     const log=JSON.stringify(row);expect(log).not.toContain('PRIVATE_BODY_MARKER');expect(log).not.toContain(root.text);expect(log).not.toContain('multicaApiToken');
   } finally {info.mockRestore();}
+});
+
+it('advances the interval only after confirmed persistence, not after a rejected prepared comment',async()=>{
+  const f=fixture();const bounds:(string|undefined)[]=[];
+  f.config.readContext=async(e,options)=>{
+    bounds.push(options?.sinceTs);
+    return {anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[]}};
+  };
+  let reject=true;
+  const fetcher:typeof fetch=async(input,init)=>{
+    if(reject&&String(input).includes('/comments')&&init?.method==='POST'){
+      reject=false;return new Response('',{status:429});
+    }
+    return f.fetcher(input,init);
+  };
+  await routeSlackThreadEvent(root,f.config,fetcher);
+  const failed={...root,messageTs:'101.000001'};
+  await expect(routeSlackThreadEvent(failed,f.config,fetcher)).rejects.toThrow('multica_http_error');
+  await routeSlackThreadEvent({...root,messageTs:'102.000001'},f.config,fetcher);
+  expect(bounds).toEqual([undefined,root.messageTs,root.messageTs]);
+  await routeSlackThreadEvent(failed,f.config,fetcher); // frozen earlier event; no new context read
+  expect(bounds).toHaveLength(3);
+  await routeSlackThreadEvent({...root,messageTs:'103.000001'},f.config,fetcher);
+  expect(bounds.at(-1)).toBe('102.000001');
 });
