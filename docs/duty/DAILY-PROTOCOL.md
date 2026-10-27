@@ -55,7 +55,7 @@ plan 返回 investigate_candidate 后只处理该 candidateId。每工位使用�
 从本轮固定的本仓版本导出 duty-dispatch.py 和 duty-queue.py 到同一 Runtime 目录；同 Runtime 全部工位共享 `~/.config/moego/daily-bug-duty/dispatch/<workspace>/<agent>/` 的锁与 journal。它是本机协调，部署须将同一队列约束在单一 Runtime/共享文件系统。Agent 并发配置由部署时明确设置为 2，脚本不修改该配置。
 
 ```text
-python3 <目录>/duty-dispatch.py plan|advance 
+python3 <目录>/duty-dispatch.py plan|advance
   --server-url <server> --workspace-id <workspace> --project-id <project>
   --agent-id <agent> --runtime-id <runtime> --revision <固定SHA>
   --round-id <扫描UUID> --current-issue <当前Issue> --current-run <当前run>
