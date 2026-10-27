@@ -4,7 +4,7 @@
 
 ## 私有配置
 
-`DUTY_CONFIG` 指向 Runtime 私有 JSON。以下为字段示例，替换值必须经实际回读。配置不放 token；认证使用现有凭据存储。来源范围、调度和写入权限用有效授权记录标识，避免把模板当默认授权。
+优先使用 Multica 原生 Instructions、custom_env 和 Autopilot 保存部署参数。需要本地集中维护时，可选用 `DUTY_CONFIG` 指向 Runtime 私有 JSON。以下为字段示例，替换值必须经实际回读。配置不放 token；认证使用现有凭据存储。来源范围、调度和写入权限用有效授权记录标识，避免把模板当默认授权。
 
 ```json
 {

@@ -8,7 +8,7 @@
 mode=scan
 executionPolicy=lane_investigation_serial_repair_v2
 schedulerRevision=<OUR_PUBLISHED_40_CHAR_SHA>
-读取 DUTY_CONFIG，核对当前 Agent/项目与 daily 配置。
+读取当前 Instructions 与 custom_env 的部署参数，核对当前 Agent/项目与 daily 配置。
 按照 daily-duty 运行：采集目标反馈日 → 完整登记 → 双工位调查 → 汇总 → 串行修复与交付。
 沿已有轮次状态恢复；每源日期边界来自批准的时区和周期。
 ```
@@ -18,7 +18,7 @@ schedulerRevision=<OUR_PUBLISHED_40_CHAR_SHA>
 ```text
 mode=board
 schedulerRevision=<OUR_PUBLISHED_40_CHAR_SHA>
-读取 DUTY_CONFIG，按 duty-board 生成当日摘要与 HTML，核对实际阶段与 warnings。
+读取当前 Instructions 与 custom_env 的部署参数，按 duty-board 生成当日摘要与 HTML，核对实际阶段与 warnings。
 按通知授权发送并回读；重复触发只补缺失产物。
 ```
 
@@ -28,6 +28,6 @@ schedulerRevision=<OUR_PUBLISHED_40_CHAR_SHA>
 mode=delivery
 flowVersion=weekly-v5-adapted
 period=<APPROVED_PERIOD>
-读取 DUTY_CONFIG，按 weekly-leader 核对来源、产出决策卡、串行实施 ready 项并核验交付。
+读取当前 Instructions 与 custom_env 的部署参数，按 weekly-leader 核对来源、产出决策卡、串行实施 ready 项并核验交付。
 真人决定保存在原问题任务，待决定项不阻塞其他 ready 项。
 ```

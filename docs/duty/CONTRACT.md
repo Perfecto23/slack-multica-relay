@@ -2,7 +2,7 @@
 
 ## 身份与授权
 
-私有 `DUTY_CONFIG` 指向本次部署配置，先核对 serverUrl、workspaceId、projectId、当前 Agent/Team、Runtime 和任务真实归属。决策人由配置中的 ownerUserId 或该任务的有效委派确定；展示名称与职位只用于阅读。沿用目标 Agent 的人格与个人风格配置。
+本次部署参数由 Agent Instructions 与 custom_env 提供；部署者也可选择私有 DUTY_CONFIG 文件。先核对 serverUrl、workspaceId、projectId、当前 Agent/Team、Runtime 和任务真实归属。决策人由配置中的 ownerUserId 或该任务的有效委派确定；展示名称与职位只用于阅读。沿用目标 Agent 的人格与个人风格配置。
 
 配置只标识目标。实际写入范围来自本次请求或已批准的工作流授权记录。分别确认代码修改、commit/push/PR、测试环境、Multica 调度、Slack 交付、来源平台回告和 Jira/飞书写入。执行已经获准的常规步骤；缺少某项写入授权时保存可审阅产物，并明确最小待决事项，继续独立工作。生产状态、凭据/权限、付费、破坏性操作及 Git 历史改写按对应目标的明确授权处理。
 
