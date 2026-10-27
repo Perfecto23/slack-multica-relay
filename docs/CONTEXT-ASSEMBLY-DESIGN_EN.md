@@ -121,3 +121,7 @@ A definite send rate limit persists `rate_limited/retryAt` and permits retry onl
 ## Build diagnostics
 
 `relay_context` records only the event digest, read/retained counts, missing-data reasons, stage timings, and envelope bytes. It excludes chat text, names, credentials, and full snapshots. Correlate it with the separate `relay_dispatch` persistence result.
+
+## Team scope
+
+Thread scope follows the configured assignee or explicit migration scope. Existing Agent keys stay stable. Teams retain the same v5 context, frozen retries and recovery model; cached Issue mappings are checked before writes. Team replyContext is unavailable with agentId=null. The designated delivery role collects the current run's Agent model and known service tier; the adapter renders the Fast marker deterministically. See [configuration](CONFIGURATION_EN.md#agent--team-routing) for shared-ledger migration.

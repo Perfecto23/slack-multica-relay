@@ -34,7 +34,11 @@ Slack App Request URL 为 `https://<deployment-host>/api/slack/events`。只订�
 | `MULTICA_API_TOKEN` | 是 | 能访问目标 Workspace、Project 和 Agent 的专用 Multica PAT。 |
 | `MULTICA_WORKSPACE_ID` | 是 | Relay Project 所属 Workspace 的 UUID。 |
 | `MULTICA_PROJECT_ID` | 是 | Relay 创建 Issue 的专用 Project UUID。 |
-| `MULTICA_AGENT_ID` | 是 | Relay Issue 指派的 Agent UUID。Agent 必须属于同一 Workspace，并已绑定 Runtime。 |
+| `MULTICA_AGENT_ID` | 条件必填 | 兼容单 Agent；type=agent 且未提供 ASSIGNEE_ID 时使用。 |
+| `MULTICA_ASSIGNEE_TYPE` | 否 | agent（默认）或 squad（Team）。 |
+| `MULTICA_ASSIGNEE_ID` | 条件必填 | 目标 Agent/Team UUID；squad 必填。 |
+| `MULTICA_THREAD_SCOPE_ID` | 否 | 迁移已有线程时保留的旧 Agent ID。 |
+| `MULTICA_LEGACY_AGENT_ID` | 否 | 过渡期旧 Agent 允许值；仅 squad 且等于 THREAD_SCOPE_ID 时有效。 |
 
 Relay 调用普通 Issue 和 Comment API，不需要 Multica Autopilot 或 webhook URL。
 
@@ -111,7 +115,7 @@ consumer 在准备消息时使用现有 Multica PAT 读取一次目标 Agent 配
 
 附件发现读取完整评论树（含回复和已解决线程），再按当前 `source_task_id` 过滤；不能使用 `--roots-only`，否则 follow-up 回复中的附件会漏掉。更新 token 后同时核对实际登录 shell 的环境：`.zshenv` 中的旧导出值会覆盖 Runtime 注入的新值，仅更新 Skill `.env` 不足以证明生效。
 
-运行 `python3 scripts/slack-reply.py --help` 查看 CLI。把 adapter 绑定到私有 Runtime Skill，并提供包含 `displayName`、`agentId`、`workspaceId`、`projectId`、`teamId` 和 `serverUrl` 的私有 JSON。该配置不包含 token；adapter 沿用 Runtime 已有的 Multica CLI 认证与 `SLACK_USER_TOKEN`。Agent 通过 `--text-file` 提供正文；路由和 model metadata 从来源 Issue/comment 回读。adapter 用 Slack section blocks 发送正文，再追加 attribution context block，格式不依赖模型正文或 persona instructions。首次发送前会通过 `conversations.replies` 确认精确根消息仍存在，避免 Slack 将无效 thread 降级为频道或 DM 根消息。
+运行 `python3 scripts/slack-reply.py --help` 查看 CLI。把 adapter 绑定到私有 Runtime Skill，并提供包含 `displayName`、单 Agent 的 `agentId` 或 Team 的 `assigneeType`/`assigneeId`、`workspaceId`、`projectId`、`teamId` 和 `serverUrl` 的私有 JSON。该配置不包含 token；adapter 沿用 Runtime 已有的 Multica CLI 认证与 `SLACK_USER_TOKEN`。Agent 通过 `--text-file` 提供正文；路由和 model metadata 从来源 Issue/comment 回读。adapter 用 Slack section blocks 发送正文，再追加 attribution context block，格式不依赖模型正文或 persona instructions。首次发送前会通过 `conversations.replies` 确认精确根消息仍存在，避免 Slack 将无效 thread 降级为频道或 DM 根消息。
 
 绑定 `multica-skills/multica-final-reply` 后，Agent 在发送前用其中的只读脚本生成当前 run context，并按业务证据选择相关 PR。adapter 通过可选的 `--run-context-file` 和 `--github-context-file` 校验 Issue 归属、统计来源以及 GitHub repository/branch/PR URL 的一致性，再追加运行统计和 GitHub 关联行；没有可核验成果时省略对应行。Agent 不直接控制路由、delivery marker 或重试。
 
@@ -174,3 +178,19 @@ Wrangler 本地开发和测试支持 Node.js 22.12+，推荐 Node.js 24 LTS；`.
 发布记录将 Git commit、Worker version 和实际流量比例分别保存到私有部署记录；可用 Wrangler 的 `--tag`、`--message` 标识构建来源。发布后通过 `deployments list --json`、`versions view <version-id> --json` 回读目标版本，并核对 runtime、绑定与原域名。`/api/health` 应返回 200；缺少有效签名的 Slack/QStash POST 应返回 401，且不触发任务。真实 mention 的上下文和最终回复仍需独立验收。
 
 Cloudflare 沿用现有 QStash 和 Upstash Redis，不使用 Cloudflare Queues、KV 或 D1。Python reply adapter 和持久 ledger 继续运行在私有 Multica Runtime。账号的 CPU 和 subrequest 限制仍须适配上下文读取与恢复路径；本地测试和 dry-run 不代表线上完整链路验收。
+
+## Agent / Team 路由
+
+单 Agent 旧配置继续使用 MULTICA_AGENT_ID，默认 scope 不变。新配置使用 MULTICA_ASSIGNEE_TYPE=agent|squad 和 MULTICA_ASSIGNEE_ID；squad 必须显式提供 Team ID。新 Team 的线程 scope 为 squad:<ID>。
+
+从 Agent 切换 Team 并继续既有线程时，先核对任务归属与原线程，再把 MULTICA_THREAD_SCOPE_ID 固定为旧 Agent ID。过渡期仍有旧 Agent 任务时，显式设置 MULTICA_LEGACY_AGENT_ID 为同一旧 ID；只接受原项目中的该 Agent 或当前 Team。全部迁移结束后移除 LEGACY 字段，THREAD_SCOPE_ID 保持稳定，保留既有 Redis、marker 和 ledger。
+
+每次使用缓存映射前回读当前 Issue 的项目、assignee 和 marker。取消只绑定该 Issue、该工作区的活动 run；Team 内多个 Agent 的运行可一起取消，结果不明重试沿原 run ID 集合，新出现的 run 保留并报告。Team 快照 agentId=null、status=unavailable，最终统计来自本次实际 run。
+
+唯一交付角色的私有 adapter JSON 使用 assigneeType="squad"、assigneeId="<Team ID>"。迁移时同步 threadScopeId="<旧Agent ID>" 和必要的 legacyAgentId，保持旧回复的 delivery identity。旧 agentId 配置在单 Agent 模式继续兼容；Team 的 agentId 不作为成员之间的 ledger 隔离键。所有交付角色共享同一 FINAL_REPLY_CONFIG 路径及持久目录；不同机器/配置目录的文件锁不构成全局去重。
+
+此配置改变任务路由，实际上线时核对目标 Team 的 Leader、工程接续和唯一回复责任；Relay 部署、Agent 配置和真实线程验收分别记录。
+
+## 每日 / 周度工作流
+
+值守脚本与角色模板见 [配置与发布](duty/SETUP.md) 和 [角色入口](../prompts/README.md)。固定本仓脚本版本，显式配置工作区、Agent、工具路径与通知目标。每轮两调查工位、全局串行修复、失败有界跳过和独立只读看板由各自协议负责。

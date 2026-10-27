@@ -666,5 +666,51 @@ class ReplyTests(unittest.TestCase):
             reply.read_source(config, 'I1', None, runner)
 
 
+
+
+
+class TeamReplyTests(unittest.TestCase):
+    def config(self, **fields):
+        return {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.example',
+                'assigneeType': 'squad', 'assigneeId': 'S1', **fields}
+
+    def source(self, config, kind, target):
+        issue = {'workspace_id': 'W1', 'project_id': 'P1', 'assignee_type': kind, 'assignee_id': target,
+                 'description': '<!-- relay-thread:test -->\n' + json.dumps({'eventPayload': EVENT})}
+        runner = lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, json.dumps(issue))
+        return reply.read_source(config, 'I1', None, runner)
+
+    def test_team_accepts_its_source_and_rejects_other_assignment(self):
+        config = self.config()
+        self.assertEqual(self.source(config, 'squad', 'S1')['eventPayload'], EVENT)
+        for kind, target in [('agent', 'S1'), ('squad', 'other'), ('agent', 'A1')]:
+            with self.assertRaisesRegex(ValueError, 'invalid_issue_scope'):
+                self.source(config, kind, target)
+
+    def test_migration_preserves_existing_delivery_identity_and_requires_legacy_scope(self):
+        old = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1'}
+        migrated = self.config(threadScopeId='A1', legacyAgentId='A1')
+        self.assertEqual(reply.delivery_identity(old, 'I1', 'C1'), reply.delivery_identity(migrated, 'I1', 'C1'))
+        self.assertEqual(self.source(migrated, 'agent', 'A1')['eventPayload'], EVENT)
+        with self.assertRaisesRegex(ValueError, 'invalid_migration_scope'):
+            self.source(self.config(legacyAgentId='A1'), 'agent', 'A1')
+
+    def test_members_share_a_ledger_scope_and_team_hides_old_agent_snapshot(self):
+        config = self.config()
+        self.assertEqual(reply.delivery_identity(config, 'I1', None),
+                         reply.delivery_identity({**config, 'agentId': 'another-member'}, 'I1', None))
+        envelope = {'replyContext': {'type': 'slack_reply_context', 'source': 'agent_config',
+                    'status': 'available', 'agentId': 'A1', 'model': 'old-model'}}
+        self.assertEqual(reply.footer_for(config, envelope), CONFIG['displayName'])
+
+    def test_fast_marker_uses_verified_tier_with_current_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'stats.json'
+            for tier, source, fast in [('priority', 'agent_config', True), ('default', 'agent_config', False),
+                                       ('priority', None, False), ('unknown', 'agent_config', False)]:
+                path.write_text(json.dumps({'version': 1, 'issue_id': 'I1', 'run_id': 'R1', 'statistics': {
+                    'model': 'model', 'model_source': 'agent_config', 'service_tier': tier, 'service_tier_source': source}}))
+                self.assertEqual('⚡ Fast' in reply.run_statistics(path, 'I1', 'R1'), fast)
+
 if __name__ == '__main__':
     unittest.main()

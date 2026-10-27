@@ -7,3 +7,5 @@ adapter 从结构化文件生成 context blocks 及等价的 fallback text，Age
 - `duration_seconds` 截至采集时刻，tools 是已返回日志的 tool_use 数量；skills 按读取路径及返回 frontmatter 关联并去重，兼容并行乱序，无法确认的读取省略。它们不代表 run 结束后的最终总量；模型来自 run 所属 Agent 配置，不代表实际计费或执行模型证明。
 - 图标默认为标准 Unicode，可通过私有 JSON 的 `icons` 覆盖 time/model/tools/skills/github/multica。workspace 自定义图标和个人 attribution 不写死在公共代码中。
 - 有本轮统计时不重复旧 envelope 模型行，始终保留配置的 attribution。source scope、delivery marker、at-most-once ledger 与发送后回读仍由 adapter 负责。
+
+模型统计中的 service_tier 只有与已核验 Agent 配置同源、且值为 priority 时，adapter 才显示 ⚡ Fast。default、未知或缺失时省略标记。Team 从当前真实 run 的 Agent 采集，不使用旧 Agent 的冻结快照冒充实际执行者。

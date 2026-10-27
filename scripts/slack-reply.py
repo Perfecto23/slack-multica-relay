@@ -45,7 +45,7 @@ def footer_for(config, envelope):
     if not isinstance(snapshot, dict):
         return footer
     if (snapshot.get('type') != 'slack_reply_context' or snapshot.get('source') != 'agent_config'
-            or snapshot.get('status') != 'available' or snapshot.get('agentId') != config['agentId']):
+            or snapshot.get('status') != 'available' or reply_assignee(config) != ('agent', snapshot.get('agentId'))):
         return footer
     model = snapshot.get('model')
     if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}', model):
@@ -94,7 +94,8 @@ def run_statistics(path, issue_id, task_id=None, config=None):
     model = stats.get('model')
     if (stats.get('model_source') == 'agent_config' and isinstance(model, str)
             and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}', model)):
-        rendered.append(icon(config, 'model') + ' ' + model)
+        fast = ' ⚡ Fast' if stats.get('service_tier_source') == 'agent_config' and stats.get('service_tier') == 'priority' else ''
+        rendered.append(icon(config, 'model') + ' ' + model + fast)
     for key in ('tools', 'skills'):
         value = stats.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 10000:
@@ -174,10 +175,24 @@ def render_reply(config, envelope, text, delivery_block_id=None, statistics=None
             'blocks': blocks, 'unfurl_links': False, 'unfurl_media': False}
 
 
+def reply_assignee(config):
+    kind = config.get('assigneeType', 'agent')
+    target = config.get('assigneeId') or (config.get('agentId') if kind == 'agent' else None)
+    if kind not in ('agent', 'squad') or not isinstance(target, str) or not target.strip():
+        raise ValueError('invalid_assignee_config')
+    legacy = config.get('legacyAgentId')
+    if legacy and (kind != 'squad' or config.get('threadScopeId') != legacy):
+        raise ValueError('invalid_migration_scope')
+    return kind, target
+
+
 def read_source(config, issue_id, comment_id, runner=subprocess.run):
     issue = multica_json(config, ['issue', 'get', issue_id], runner)
+    kind, target = reply_assignee(config)
+    assigned = (issue.get('assignee_type'), issue.get('assignee_id'))
+    legacy = kind == 'squad' and config.get('legacyAgentId') and assigned == ('agent', config['legacyAgentId'])
     if (issue.get('workspace_id') != config['workspaceId'] or issue.get('project_id') != config['projectId']
-            or issue.get('assignee_id') != config['agentId'] or issue.get('assignee_type') != 'agent'):
+            or (assigned != (kind, target) and not legacy)):
         raise ValueError('invalid_issue_scope')
     source = issue.get('description', '')
     if comment_id:
@@ -242,7 +257,9 @@ def task_attachments(config, issue_id, task_id, runner=subprocess.run):
 
 
 def delivery_identity(config, issue_id, comment_id):
-    fields = [config['workspaceId'], config['projectId'], config['agentId'], issue_id, comment_id or '']
+    kind, target = reply_assignee(config)
+    scope = config.get('threadScopeId') or (target if kind == 'agent' else 'squad:' + target)
+    fields = [config['workspaceId'], config['projectId'], scope, issue_id, comment_id or '']
     return hashlib.sha256('\0'.join(fields).encode()).hexdigest()
 
 

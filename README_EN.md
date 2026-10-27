@@ -192,6 +192,15 @@ Offline tests prove code contracts. They do not prove a real deployment, Agent e
 - [Multica Operations](docs/MULTICA-OPERATIONS_EN.md)
 - [Contributing Guide](CONTRIBUTING.md)
 
+
+## Team routing and duty workflows
+
+Single-Agent and Team (squad) routing support explicit migration of existing thread scopes. The v5 context model, deterministic replies, attachment receipts and Cloudflare compatibility remain intact. See [routing configuration](docs/CONFIGURATION_EN.md#agent--team-routing).
+
+Daily duty includes source collection, two investigation lanes, a complete evidence index, serial repair, bounded retries and blocked-item handoff. Weekly duty adds decision cards, versioned human decisions and Leader/Engineer handoff. The static HTML board tracks stages and historical dates, and distinguishes merged PRs from verified production delivery.
+
+Role templates keep private persona, style, tool bindings and authorization separate. [Setup](docs/duty/SETUP.md), [role templates](prompts/README.md) and [upstream maintenance](docs/UPSTREAM.md) describe the integration; workflow templates are currently in Chinese.
+
 ## License
 
 This repository does not currently declare an open-source license. Public source visibility does not automatically grant permission to use, modify, or distribute the code. Do not assume those rights until the maintainer selects and commits a `LICENSE`.

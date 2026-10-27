@@ -144,6 +144,7 @@ describe('snapshot delivery recovery',()=>{
         if(reject){reject=false;return new Response('',{status:400});}
         const data=JSON.parse(String(init?.body));const legacy=decode(data.description);delete legacy.task;legacy.schemaVersion=1;legacy.context={background:{status:'complete',messages:[]},thread:{status:'complete',messages:[]}};const row={...data,description:data.description.split('\n')[0]+'\n'+JSON.stringify(legacy),id:'I1'};issues.push(row);return Response.json(row);
       }
+      if(url.endsWith('/api/issues/I1'))return Response.json(issues[0]);
       if(init?.method==='POST'){const row={id:'C1',content:JSON.parse(String(init.body)).content};comments.push(row);return Response.json(row);}
       return Response.json(comments);
     };

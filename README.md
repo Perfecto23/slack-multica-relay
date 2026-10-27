@@ -192,6 +192,18 @@ pnpm lint   # TypeScript typecheck
 - [Multica 操作说明](docs/MULTICA-OPERATIONS.md)
 - [贡献指南](CONTRIBUTING_ZH.md)
 
+
+## Team 路由与值守工作流
+
+支持单 Agent 和 Team（squad），可显式保留旧 Agent 线程 scope 迁移；已有 v5 上下文、确定性回复、附件回执与 Cloudflare 支持继续保留。配置见 [Agent / Team 路由](docs/CONFIGURATION.md#agent--team-路由)。
+
+- 每日值守：三源采集、两工位调查、完整索引、全局串行修复、有界失败跳过和受阻接续。
+- 周度值守：Leader 选题和七项决策卡、真人决定版本、Engineer 串行交付与验收。
+- 看板：阶段进度、历史日期、静态 HTML、回告与回应跟踪；PR 已合并和生产发布已核验分开统计。
+- Prompt：通用角色协议与私有人格分离，保留自己的表达、工具绑定、身份和授权。
+
+[接入与验收](docs/duty/SETUP.md) · [角色模板](prompts/README.md) · [上游版本与维护边界](docs/UPSTREAM.md)
+
 ## 许可证
 
 本仓库当前尚未声明开源许可证。源码公开可见不等同于自动授予使用、修改或分发权；在维护者选择并提交 `LICENSE` 前，请勿假定存在这些授权。

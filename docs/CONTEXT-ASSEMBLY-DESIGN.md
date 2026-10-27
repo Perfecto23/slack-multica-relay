@@ -121,3 +121,7 @@ footer 使用每个新事件各自冻结的快照和 `messageTs`；只有配置�
 ## 构建诊断
 
 `relay_context` 只记录事件摘要、读取/保留数量、缺失原因、阶段耗时和 envelope 字节数；不包含聊天正文、姓名、凭据或完整快照。与 `relay_dispatch` 的写入结果分别核对。
+
+## Team 作用域
+
+线程 scope 由 assignee 或显式迁移 scope 决定，既有单 Agent 的 key 保持不变。Team 仍使用同一 v5 上下文与冻结/恢复协议；从缓存继续写入前核对真实 Issue 归属和 marker。Team 的 replyContext 标记 unavailable、agentId=null，避免借用旧 Agent 模型。唯一回复角色从当前 run 采集模型与已知 service_tier，adapter 确定性追加 Fast 标记。配置及共享 ledger 迁移见 [配置说明](CONFIGURATION.md#agent--team-路由)。

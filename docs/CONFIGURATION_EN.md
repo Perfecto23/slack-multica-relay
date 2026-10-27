@@ -34,7 +34,11 @@ The Slack App Request URL is `https://<deployment-host>/api/slack/events`. Subsc
 | `MULTICA_API_TOKEN` | Yes | Dedicated Multica PAT with access to the target Workspace, Project, and Agent. |
 | `MULTICA_WORKSPACE_ID` | Yes | UUID of the Workspace that owns the Relay Project. |
 | `MULTICA_PROJECT_ID` | Yes | UUID of the dedicated Project in which Relay Issues are created. |
-| `MULTICA_AGENT_ID` | Yes | UUID of the Agent assigned to Relay Issues. The Agent must belong to the same Workspace and be bound to a Runtime. |
+| `MULTICA_AGENT_ID` | Conditional | Legacy Agent UUID, used when type=agent and ASSIGNEE_ID is absent. |
+| `MULTICA_ASSIGNEE_TYPE` | No | agent (default) or squad (Team). |
+| `MULTICA_ASSIGNEE_ID` | Conditional | Target Agent/Team UUID; required for squad. |
+| `MULTICA_THREAD_SCOPE_ID` | No | Stable original Agent ID when migrating existing threads. |
+| `MULTICA_LEGACY_AGENT_ID` | No | Temporary old Agent allowance; squad only, matching THREAD_SCOPE_ID. |
 
 The Relay calls ordinary Issue and Comment APIs. It does not require a Multica Autopilot or webhook URL.
 
@@ -111,7 +115,7 @@ Snapshot GET requests use `redirect: manual`; workerd does not support `redirect
 
 Attachment discovery reads the complete comment tree, including replies and resolved threads, then filters by the current source_task_id. Do not use --roots-only: follow-up attachments may belong to replies. After token changes, verify the actual login-shell environment; stale exports in .zshenv can override Runtime-injected values, so updating the Skill dotenv file alone does not establish effectiveness.
 
-Run `python3 scripts/slack-reply.py --help` for the CLI. Bind the adapter in the private Runtime Skill and provide private JSON containing `displayName`, `agentId`, `workspaceId`, `projectId`, `teamId`, and `serverUrl`. The JSON contains no token. The adapter reuses the Runtime's Multica CLI authentication and `SLACK_USER_TOKEN`. The Agent supplies body text through `--text-file`; route and model metadata are read back from the source Issue/comment. The adapter sends body sections plus an attribution context block, independent of model text or persona instructions. Before a first POST, it confirms that the exact Slack root message still exists so an invalid thread cannot be downgraded to a channel or DM root.
+Run `python3 scripts/slack-reply.py --help` for the CLI. Bind the adapter in the private Runtime Skill and provide private JSON containing `displayName`, the Agent `agentId` or Team `assigneeType`/`assigneeId`, `workspaceId`, `projectId`, `teamId`, and `serverUrl`. The JSON contains no token. The adapter reuses the Runtime's Multica CLI authentication and `SLACK_USER_TOKEN`. The Agent supplies body text through `--text-file`; route and model metadata are read back from the source Issue/comment. The adapter sends body sections plus an attribution context block, independent of model text or persona instructions. Before a first POST, it confirms that the exact Slack root message still exists so an invalid thread cannot be downgraded to a channel or DM root.
 
 After binding `multica-skills/multica-final-reply`, the Agent uses its read-only helper to create current-run context before sending and selects only GitHub PRs supported by the business task evidence. The adapter accepts optional `--run-context-file` and `--github-context-file` inputs, validates Issue ownership, statistic provenance, and repository/branch/PR URL consistency, then appends run statistics and GitHub association rows. It omits fields that cannot be verified. The Agent does not control routing, delivery markers, or retries.
 
@@ -174,3 +178,17 @@ Wrangler development and tests support Node.js 22.12+; Node.js 24 LTS is recomme
 Private deployment records track the Git commit, Worker version, and actual traffic percentage separately. Wrangler `--tag` and `--message` can identify the build source. After publishing, use `deployments list --json` and `versions view <version-id> --json` to confirm the target version, runtime, bindings, and original domain. Health returns 200; Slack/QStash POSTs without valid signatures return 401 without starting a task. Real mention context and final replies still require independent acceptance.
 
 Cloudflare retains QStash and Upstash Redis; it does not replace them with Cloudflare Queues, KV, or D1. The Python reply adapter and durable ledger stay on the private Multica Runtime. Account CPU and subrequest limits must accommodate context reads and recovery paths. Local tests and dry-run builds do not prove a live end-to-end deployment.
+
+## Agent / Team routing
+
+Existing MULTICA_AGENT_ID configurations retain their Agent scope. New configurations use MULTICA_ASSIGNEE_TYPE (agent or squad) and MULTICA_ASSIGNEE_ID; Teams require an explicit ID. A new Team uses squad:<ID> as its thread scope.
+
+To preserve existing threads during an Agent-to-Team migration, set MULTICA_THREAD_SCOPE_ID to the old Agent ID after verifying the target issues. Set MULTICA_LEGACY_AGENT_ID to the same ID only while old Agent assignments must remain accepted. Remove the legacy allowance after migration; retain the thread scope and all Redis, marker and delivery records.
+
+Cached mappings are revalidated against the current project, assignee and marker. Cancellation binds the current Issue/workspace run set, including multiple Team members; later runs are preserved and reported. Team reply snapshots have agentId=null and status=unavailable. Final model statistics come from the current run's actual Agent.
+
+The designated reply adapter uses private assigneeType="squad" and assigneeId fields. Match threadScopeId and legacyAgentId during migration to preserve existing delivery identities. Existing single-Agent agentId configurations remain supported. Team members must share one FINAL_REPLY_CONFIG path and persistent ledger directory; per-host file locks do not deduplicate across separate machines or directories. Keep one designated delivery role.
+
+## Daily and weekly workflows
+
+See [workflow setup](duty/SETUP.md) and [role templates](../prompts/README.md). Configure all identities and tool paths explicitly, pin the scheduler revision, preserve private persona/style settings, and verify deployment separately from local tests. Daily investigation uses two lanes followed by serial repair; the board distinguishes merged PRs from verified production delivery.

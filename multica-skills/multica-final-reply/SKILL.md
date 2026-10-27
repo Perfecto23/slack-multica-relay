@@ -7,6 +7,10 @@ description: 在 Multica 的 Slack Relay 任务需要向原线程发送已获授
 
 适用于成功、失败、阻塞和部分完成。是否回复、业务操作权限和资料披露范围遵循当前任务与 Agent Instructions。此 Skill 不授予 GitHub 写入或额外 Slack 发送权限。
 
+## 本次来源与唯一发送方
+
+每次先核对当前 Issue、触发 comment、真实 run 和交付角色。Team 的成员将结果交接给指定发送方，复用同一私有 FINAL_REPLY_CONFIG 与持久 ledger；同一来源已有回执时只补缺失附件。私有 styleGuide/emojiGuide 继续是个人表达真源。
+
 ## 回复流程
 
 1. 读取环境变量 `FINAL_REPLY_CONFIG` 指向的私有 adapter JSON。`adapterPath` 是发送脚本路径，`slackCliPath` 是当前 Runtime 已安装的 Slack Skill CLI；若有 `styleGuide`、`emojiGuide`，读取这些本地文件及其必需参考，分别作为个人语气和常用表情真源。没有指定风格时使用 [通用回复风格](references/reply-style.md)。表情选择见 [Emoji 使用](references/emoji-guide.md)；只有常用池不足时才按名称查询配置中的 `emojiCatalog`，不整份加载。

@@ -1,5 +1,7 @@
 """验证运行资料整理的归属、统计和代码证据。"""
 import importlib.util
+import sys
+import subprocess
 from pathlib import Path
 import unittest
 import tempfile
@@ -11,6 +13,79 @@ spec.loader.exec_module(final)
 
 
 class FinalReplyTests(unittest.TestCase):
+    def test_statistics_omits_unknown_tier_and_tier_without_model(self):
+        for fields in ({"model": "gpt-6-astra", "service_tier": "fast"},
+                       {"service_tier": "priority"}, {"model": "<!here>", "service_tier": "priority"}):
+            with self.subTest(fields=fields):
+                stats = final.statistics({**self.data, "run": {**self.run, **fields}})
+                self.assertNotIn("service_tier", stats)
+                self.assertNotIn("service_tier_source", stats)
+
+
+    def test_service_tier_requires_valid_current_agent_and_model(self):
+        self.run.update(agent_id="agent-current", service_tier="priority")
+        agent = {"id": "agent-current", "workspace_id": "ws", "model": "gpt-6-astra", "service_tier": "priority"}
+        invalid = [final.RunContextError("读取失败"), None,
+                   {**agent, "id": "other"}, {**agent, "workspace_id": "other"},
+                   {**agent, "model": None}, {**agent, "model": "<!here>"}]
+        for candidate in invalid:
+            with self.subTest(agent=candidate), patch.object(final, "query", side_effect=[[self.run], candidate, []]):
+                data = final.snapshot("issue", self.env)
+            self.assertNotIn("service_tier", data["run"])
+            self.assertNotIn("service_tier", final.statistics(data))
+            self.assertIn("duration_seconds", final.statistics(data))
+        self.run.pop("agent_id")
+        with patch.object(final, "query", side_effect=[[self.run], []]):
+            self.assertNotIn("service_tier", final.statistics(final.snapshot("issue", self.env)))
+
+
+    def test_missing_or_unknown_service_tier_keeps_model_without_fallback(self):
+        self.run.update(agent_id="agent-current", service_tier="priority")
+        for fields in ({}, *({"service_tier": value} for value in (None, "", "fast", " priority ", [], {}, True))):
+            agent = {"id": "agent-current", "workspace_id": "ws", "model": "gpt-6-astra", **fields}
+            with self.subTest(fields=fields), patch.object(final, "query", side_effect=[[self.run], agent, []]):
+                data = final.snapshot("issue", self.env)
+            stats = final.statistics(data)
+            self.assertEqual(stats["model"], "gpt-6-astra")
+            self.assertNotIn("service_tier", stats)
+            self.assertNotIn("service_tier_source", stats)
+
+
+    def test_service_tier_comes_from_same_agent_query_as_model(self):
+        self.run.update(agent_id="agent-current", service_tier="stale-run-tier")
+        for tier in ("priority", "default"):
+            for messages in ([], final.RunContextError("日志不可用")):
+                agent = {"id": "agent-current", "workspace_id": "ws", "model": "gpt-6-astra", "service_tier": tier}
+                with self.subTest(tier=tier, messages=messages), patch.object(final, "query", side_effect=[[self.run], agent, messages]) as query:
+                    data = final.snapshot("issue", self.env)
+                stats = final.summarize(data)["statistics"]
+                self.assertEqual(stats["service_tier"], tier)
+                self.assertEqual(stats["service_tier_source"], "agent_config")
+                self.assertEqual(stats["model"], "gpt-6-astra")
+                self.assertEqual(query.call_count, 3)
+
+
+    def test_query_reports_cli_failures_without_exposing_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            commands = [
+                [str(Path(directory) / "missing-cli")],
+                [sys.executable, "-c", 'raise SystemExit("private CLI error")'],
+                [sys.executable, "-c", 'print("private invalid JSON")'],
+            ]
+            for command in commands:
+                with self.subTest(command=command), self.assertRaises(final.RunContextError) as error:
+                    final.query(command)
+                self.assertNotIn("private", str(error.exception))
+
+
+    def test_query_runs_without_a_command_wrapper(self):
+        with patch.dict(final.os.environ, {"PATH": ""}):
+            self.assertEqual(final.query([sys.executable, "-c", 'print(\'{"status": "ok"}\')']),
+                             {"status": "ok"})
+            self.assertEqual(final.query([sys.executable, "-c", 'print("server_url: https://example.test")'], text=True),
+                             "server_url: https://example.test\n")
+
+
     def setUp(self):
         self.env = {"MULTICA_TASK_ID": "run", "MULTICA_WORKSPACE_ID": "ws", "MULTICA_SERVER_URL": "https://multica.example"}
         self.run = {"id": "run", "issue_id": "issue", "workspace_id": "ws", "started_at": "2026-09-09T00:00:00Z"}
