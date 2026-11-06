@@ -21,7 +21,7 @@ describe('tree Slack context', () => {
     const c=await readContext(e,'test',f);
     expect(c.timeline.messages.map(m=>m.ts)).toEqual(['100.000001','89000.000001']);
     expect(c.timeline.messages[1]!.replies!.messages.map(m=>m.ts)).toEqual(['89600.000001']);
-    const envelope=JSON.parse(buildEnvelope(e,c));expect(envelope.schemaVersion).toBe(5);
+    const envelope=JSON.parse(buildEnvelope(e,c));expect(envelope.schemaVersion).toBe(6);
     expect(envelope.context.timeline.messages[0].replies.messages.at(-1).currentRequest).toBe(true);
     expect(envelope.context.timeline.messages[0].replies.messages.at(-1).text).toBe('');
     expect(f).toHaveBeenCalledTimes(3);
@@ -30,7 +30,8 @@ describe('tree Slack context', () => {
     const e={...event,messageTs:event.threadTs};
     const f=vi.fn<typeof fetch>().mockResolvedValue(Response.json({ok:true,messages:Array.from({length:45},(_,i)=>msg(`${2000-i}.000001`))}));
     const c=await readContext(e,'test',f);expect(c.timeline.messages).toHaveLength(13);
-    expect(c.timeline.messages.filter(m=>m.ts===e.threadTs)).toHaveLength(1);expect(c.timeline.status).toBe('truncated');
+    expect(c.timeline.messages.filter(m=>m.ts===e.threadTs)).toHaveLength(1);expect(c.timeline.status).toBe('selected');
+    const covered=JSON.parse(buildEnvelope(e,c)).coverage;expect(covered.currentThread.status).toBe('complete');expect(covered.nearby).toMatchObject({status:'selected',reasons:['timeline_root_limit']});
   });
   it('does not widen the 30-minute window in a sparse conversation',async()=>{
     const e={...event,threadTs:'100000.000001',messageTs:'100000.000001'};
@@ -47,7 +48,7 @@ describe('tree Slack context', () => {
   it('marks inaccessible sibling replies without losing current conversation',async()=>{
     const e={...event,messageTs:event.threadTs};
     const f:typeof fetch=async input=>String(input).includes('history')?Response.json({ok:true,messages:[{...msg('1999.000001'),reply_count:1}]}):Response.json({ok:false,error:'missing_scope'});
-    const c=await readContext(e,'test',f);expect(c.timeline.messages[0]!.replies!.status).toBe('unavailable');expect(c.timeline.messages.at(-1)!.ts).toBe(e.threadTs);
+    const c=await readContext(e,'test',f);expect(c.timeline.messages[0]!.replies!.status).toBe('missing');expect(c.timeline.messages.at(-1)!.ts).toBe(e.threadTs);
   });
   it('expands two recently active side branches with five replies each',async()=>{
     const e={...event,messageTs:event.threadTs};
@@ -57,7 +58,7 @@ describe('tree Slack context', () => {
     };
     const c=await readContext(e,'test',f);const sides=c.timeline.messages.filter(m=>m.ts!==e.threadTs&&m.replies);
     expect(sides).toHaveLength(2);expect(sides.flatMap(m=>m.replies?.messages??[])).toHaveLength(10);
-    expect(sides[0]!.replies!.reason).toBe('thread_message_limit');
+    expect(sides[0]!.replies!.reasons).toEqual(['thread_message_limit']);expect(sides[0]!.replies!.status).toBe('selected');
   });
   it('prioritizes a recently active older root before a newer inactive root',async()=>{
     const e={...event,messageTs:event.threadTs};const readRoots:string[]=[];
@@ -74,7 +75,7 @@ describe('tree Slack context', () => {
   it('marks optional rate limits and does not leak attachment URLs',async()=>{
     const e={...event,messageTs:event.threadTs};
     const f:typeof fetch=async input=>String(input).includes('history')?Response.json({ok:true,messages:[{...msg('1999.000001'),reply_count:1,files:[{id:'F1',name:'photo.png',mimetype:'image/png',url_private:'https://private.test'}]}]}):new Response('',{status:429});
-    const c=await readContext(e,'test',f);expect(c.timeline.messages[0]!.replies!.reason).toBe('rate_limited');
+    const c=await readContext(e,'test',f);expect(c.timeline.messages[0]!.replies!.reasons).toContain('rate_limited');expect(c.timeline.messages[0]!.replies!.status).toBe('missing');
     expect(c.timeline.messages[0]!.files[0]!.contentStatus).toBe('not_loaded');expect(JSON.stringify(c)).not.toContain('private.test');
   });
   it('detects edits beyond the displayed text and attachment limits without exposing the internal hash',async()=>{
@@ -112,7 +113,7 @@ describe('tree Slack context', () => {
     };
     const c=await readContext(event,'test',f);
     expect(page).toBe(6);
-    expect(c.timeline.messages[0]!.replies!.reason).toBeUndefined();
+    expect(c.timeline.messages[0]!.replies!.reasons).toBeUndefined();
     expect(c.timeline.messages[0]!.replies!.messages.some(m=>m.ts==='2006.000001')).toBe(true);
   });
   it('rejects repeated cursors',async()=>{
@@ -121,7 +122,7 @@ describe('tree Slack context', () => {
   it('preserves current request and root while clipping the oldest optional trees',()=>{
     const c=empty();c.timeline.messages=Array.from({length:40},(_,i)=>({ts:`${1900+i}.000001`,authorId:'U1',origin:'unknown',text:'狗'.repeat(1300),files:[]}));
     c.timeline.messages.push({ts:event.threadTs,authorId:'U1',origin:'unknown',text:'root',files:[]});
-    const e=JSON.parse(buildEnvelope(event,c));expect(e.context.timeline.messages.at(-1).text).toBe('root');expect(e.context.timeline.status).toBe('truncated');
+    const e=JSON.parse(buildEnvelope(event,c));expect(e.context.timeline.messages.at(-1).text).toBe('root');expect(e.context.timeline.status).toBe('selected');expect(e.coverage.currentThread.status).toBe('complete');
     expect(Buffer.byteLength(buildEnvelope(event,c))).toBeLessThanOrEqual(48*1024);
     expect(()=>buildEnvelope({...event,text:'x'.repeat(50*1024)},empty())).toThrow('context_request_too_large');
   });

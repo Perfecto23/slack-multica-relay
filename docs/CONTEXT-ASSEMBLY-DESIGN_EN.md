@@ -25,7 +25,7 @@ Required replies use `oldest=A`, `latest=B`, `inclusive=true` and cursor paginat
 
 Keep the original marker on the first line, followed by the request quote, one source line, scope explanation, and JSON data. Paired `relay-payload:v1` markers and dynamically sized fences remain unchanged.
 
-`schemaVersion: 5` renders each ordinary message on one line. Presentation omits default `origin=unknown`, empty `files`, and the empty text of a currentRequest node. Actual bot origins, attachments, and missing-content flags remain. Timestamps, author IDs, participant names, original text, thread relationships, and routing coordinates are preserved.
+`schemaVersion: 6` (as v5 before it) renders each ordinary message on one line. Presentation omits default `origin=unknown`, empty `files`, and the empty text of a currentRequest node. Actual bot origins, attachments, and missing-content flags remain. Timestamps, author IDs, participant names, original text, thread relationships, and routing coordinates are preserved.
 
 ```json
 {
@@ -46,7 +46,9 @@ Keep the original marker on the first line, followed by the request quote, one s
 
 This example omits fixed task instructions and some routing fields. Complete request text and attachments remain in eventPayload; currentRequest references them. The readable quote is limited to 4 KiB, while the data preserves the complete request. The TS reader restores omitted defaults. The Python reply adapter continues reading the same eventPayload/replyContext. Legacy bare JSON, v4 fenced payloads, and old markers remain readable. Duplicate or corrupt payload blocks are rejected. Historical Issues/comments are not rewritten.
 
-`complete` describes only that collection's read scope. Coverage timestamps describe retained content, not unseen history. Optional branches independently carry truncated/unavailable markers; `initialStatus/initialReason` can carry initial-background gaps forward. Attachment references remain `not_loaded` and never prove content was inspected.
+A section `status` is one of three values: `complete` means its read scope was read in full; `selected` means the Relay kept only part of it by policy (nearby root cap, expanding only 2 side branches, side-branch reply cap, link window, optional-background byte budget), which is not a gap; `missing` means content it should hold was not obtained (page or call budget, rate limit, permission, missing root, linked messages dropped by the byte budget). `reasons` lists every cause and is only appended to. Coverage timestamps describe retained content, not unseen history.
+
+v6 adds a top-level `coverage`, computed by `src/context-coverage.ts` from the delivered tree: `currentThread` (whether the current thread is complete; in follow-ups, replies before the last mention only arrive through links, so byte-budget drops of them are recorded under `references`), `nearby` (including the first background's `initialStatus/initialReasons`), `references`, and `unloadedFiles`. `task.instructions` is generated from `coverage`, so the two cannot disagree. Attachment references remain `not_loaded` and never prove content was inspected. v5 and older `truncated/unavailable` + `reason` are converted to the same vocabulary on recovery; old envelopes kept only the last reason, so the conversion may under-report earlier gaps.
 
 ## Agent footer cleanup
 
@@ -83,7 +85,7 @@ Initial background is independent of A. A late B earlier than the first persiste
 
 If A is missing from the current Slack result, restore its text, author, and attachment references from persisted eventPayload and mark it `restoredFrom: persisted_request`. Preserve any legacy attachment-truncation flag. This is not text fetched from Slack in this read. Missing saved text rejects delivery; a missing thread root remains a separate rejection. Time filtering uses Slack message ts.
 
-`schemaVersion: 5` versions task bodies, while v3 `:sent-context-index` versions the internal Relay cache. Deploying the new Relay enables the policy without adding environment variables, changing Agent Instructions, or rebinding the final-reply Skill.
+`schemaVersion: 6` versions task bodies (the Relay still reads v5 and older), while v3 `:sent-context-index` versions the internal Relay cache. Deploying the new Relay enables the policy without adding environment variables, changing Agent Instructions, or rebinding the final-reply Skill.
 
 New mentions use the new rules. An event reuses its frozen envelope while the 24-hour cache is valid, including legacy formats. After expiry, reconcile persisted delivery first; fetch context again only if preparation remains necessary. Recovered first-message backgrounds are selected under the current scope for new comments; original Issues/comments are not rewritten. Do not clear event snapshots, thread mappings, or delivery ledgers to force a format change: they own idempotency and recovery.
 

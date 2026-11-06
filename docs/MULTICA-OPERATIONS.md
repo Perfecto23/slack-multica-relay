@@ -33,7 +33,7 @@ Issue 是任务卡，run 是一次执行；`run-messages` 接收该次执行的 
 ## 核对 Relay 上下文
 
 1. 首次请求读取 Issue description；后续请求先定位 `relay-message` 根评论，再回读该评论完整内容。Agent 的答复和触发评论是不同记录。
-2. 核对 `eventPayload` 的 team、channel、thread 和 message 时间戳与目标 Slack 请求一致。新事件使用 `schemaVersion: 5`；已冻结事件的重试可以保留旧版本。
+2. 核对 `eventPayload` 的 team、channel、thread 和 message 时间戳与目标 Slack 请求一致。新事件使用 `schemaVersion: 6`；已冻结事件的重试可以保留旧版本。
 3. 首次检查完整当前线程，以及 30 分钟 / 12 根 / 2 线程 / 5 回复的附近范围。有更早已交付 mention 时，检查 `sinceTs`、根、该 mention 和此后全部对话；必要恢复读取成功但没有更早 mention 时，省略 `sinceTs` 并从根全读。迟到请求仍保留原 `initialCutoffTs`，背景根及回复不得晚于本次请求。
 4. 每条消息的紧凑排版不改变原文、作者或线程归属；`currentRequest` 引用 eventPayload，不重复正文。`restoredFrom: persisted_request` 表示从历史请求补入，并非本次 Slack 读取。`not_loaded` 附件不能作为已读内容，背景缺失标记不能当成完整历史。
 5. 通过 `relay_context` 核对读取范围，通过 `relay_dispatch` 核对写入结果，再独立查看 run 和原线程回复。不要因 Issue 已存在就声称本次请求已经送达。

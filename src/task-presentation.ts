@@ -7,7 +7,7 @@ const PAYLOAD_END='<!-- /relay-payload -->';
 function object(value:unknown):value is Record<string,unknown>{return !!value&&typeof value==='object'&&!Array.isArray(value);}
 
 // Keep valid JSON and exact routing data, but give each conversation message one line.
-// Defaults are restored by the reader; only schema 5 uses this wire presentation.
+// Defaults are restored by the reader; schema 5 and later use this wire presentation.
 export function compactTaskPayload(payload: Record<string,unknown>): string {
   const visit=(value:unknown,depth=0):string=>{
     if(Array.isArray(value))return value.length?'[\n'+value.map(item=>'  '.repeat(depth+1)+visit(item,depth+1)).join(',\n')+'\n'+'  '.repeat(depth)+']':'[]';
@@ -78,13 +78,13 @@ export function formatTaskDescription(envelope:string, marker:string, followup=f
   const date=new Date(Number(event.messageTs)*1000);
   const time=Number.isFinite(date.getTime())?new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Singapore',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(date)+'（Asia/Singapore）':'未知';
   const link='https://slack.com/app_redirect?'+new URLSearchParams({team:event.teamId,channel:event.channelId});
-  const summary=payload.schemaVersion!==5?'历史事件快照；本次重试沿用已冻结的上下文范围。':followup?(payload.context?.sinceTs?'当前线程保留根消息、上次已交付的 mention 及其后的全部对话；附近讨论沿用首次背景。':'当前线程保留从根到本次请求的全部对话；尚无更早的已交付 mention 边界。'):'附近讨论：前 30 分钟最近 12 条主消息，其中最近活跃的 2 个线程各保留末尾 5 条回复。';
+  const summary=!(Number(payload.schemaVersion)>=5)?'历史事件快照；本次重试沿用已冻结的上下文范围。':followup?(payload.context?.sinceTs?'当前线程保留根消息、上次已交付的 mention 及其后的全部对话；附近讨论沿用首次背景。':'当前线程保留从根到本次请求的全部对话；尚无更早的已交付 mention 边界。'):'附近讨论：前 30 分钟最近 12 条主消息，其中最近活跃的 2 个线程各保留末尾 5 条回复。';
   const render=(json:string)=>{
     const fence='`'.repeat((json.match(/`+/g)??[]).reduce((n,run)=>Math.max(n,run.length+1),3));
     const fileCount=Array.isArray(event.files)?event.files.length:0;
     return [marker,followup?'## Slack thread 后续消息':'## Slack 原始消息',quote,`[原会话](${link}) · ${time}${fileCount?` · ${fileCount} 个附件`:''}`,summary,'## 对话上下文',PAYLOAD_START,`${fence}json\n${json}\n${fence}`,PAYLOAD_END].join('\n\n').replace(marker+'\n\n',marker+'\n');
   };
-  let body=render(payload.schemaVersion===5?compactTaskPayload(payload):serializeEnvelope(payload,2));
+  let body=render(Number(payload.schemaVersion)>=5?compactTaskPayload(payload):serializeEnvelope(payload,2));
   if(Buffer.byteLength(body)>64*1024)body=render(envelope);
   if(Buffer.byteLength(body)>64*1024)throw new Error('task_presentation_too_large');
   return body;
@@ -133,7 +133,7 @@ export function readTaskEnvelope(description: string): { eventPayload: SlackThre
     !/^\d+\.\d+$/.test(event.messageTs as string)
   )
     throw new Error("invalid_thread_state");
-  if(object(parsed)&&parsed.schemaVersion===5){
+  if(object(parsed)&&Number(parsed.schemaVersion)>=5){
     const restore=(value:unknown):void=>{
       if(Array.isArray(value)){value.forEach(restore);return;}
       if(!object(value))return;

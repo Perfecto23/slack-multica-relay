@@ -338,7 +338,7 @@ it.each([false,true])('preserves initial background for an earlier late mention 
   expect(late.initialCutoffTs).toBe('102.000001');expect(late.sinceTs).toBeUndefined();
   expect(late.timeline.messages.map(m=>m.text)).toEqual(['initial background','root']);
   expect(late.timeline.messages[0]!.replies!.messages.map(m=>m.text)).toEqual(['past reply']);
-  expect(late.timeline.messages[0]!.replies!.reason).toBe('request_cutoff');
+  expect(late.timeline.messages[0]!.replies!.reasons).toEqual(['request_cutoff']);
   expect(reader.mock.calls[1]![1]).toMatchObject({includeNearby:false,sinceTs:undefined});
   const count=reader.mock.calls.length;
   await routeSlackThreadEvent({...root,messageTs:'101.000001'},f.config,f.fetcher);

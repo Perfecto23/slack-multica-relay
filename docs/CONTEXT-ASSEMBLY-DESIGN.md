@@ -25,7 +25,7 @@ B 为本次 mention；A 为同一 workspace/project/agent/thread 中，时间早
 
 第一行保持原 marker，之后是请求引用、单行来源、范围说明和 JSON 数据区。`relay-payload:v1` 成对标记及动态长度的数据围栏保持不变。
 
-`schemaVersion: 5` 每条普通消息独占一行；`origin=unknown`、空 `files` 和 currentRequest 的空正文在展示中省略。有附件、bot 来源或缺失标记时保留实际字段。时间戳、作者 ID、姓名映射、原文、回复父子关系和回复路由均保留，不把旁支回复摊平成主消息。
+`schemaVersion: 6`（v5 起）每条普通消息独占一行；`origin=unknown`、空 `files` 和 currentRequest 的空正文在展示中省略。有附件、bot 来源或缺失标记时保留实际字段。时间戳、作者 ID、姓名映射、原文、回复父子关系和回复路由均保留，不把旁支回复摊平成主消息。
 
 ```json
 {
@@ -46,7 +46,9 @@ B 为本次 mention；A 为同一 workspace/project/agent/thread 中，时间早
 
 示例省略固定任务解释和部分路由字段。完整请求及附件在 `eventPayload` 中，`currentRequest` 节点只引用它；首屏原文引用最多 4 KiB，数据区保留完整请求。TS 恢复解析器补回省略的默认字段。Python reply adapter 继续读取同一个 eventPayload/replyContext。历史裸 JSON、v4 围栏和旧 marker 仍可恢复；重复或损坏的数据区拒绝恢复。旧 Issue/comment 不回写。
 
-`complete` 仅描述对应读取范围。`coveredFromTs/coveredThroughTs` 是实际保留范围，不证明区间之外没有消息；可选旁支独立标记 truncated/unavailable，首次背景的缺失可通过 `initialStatus/initialReason` 延续。附件始终 `not_loaded`，不把附件引用当成已读取内容。
+每个区段的 `status` 只有三种：`complete` 是该读取范围读全了；`selected` 是按策略只取了一部分（附近根消息上限、只展开 2 个旁支、旁支回复上限、链接窗口、可选背景的字节预算等），不算缺失；`missing` 是本该有却没拿到（分页或调用预算、限流、权限、根消息缺失、被字节预算挤掉的链接引用等）。`reasons` 记录全部原因，只追加不覆盖。`coveredFromTs/coveredThroughTs` 是实际保留范围，不证明区间之外没有消息。
+
+v6 在顶层加 `coverage`，由 `src/context-coverage.ts` 根据最终交付的树计算：`currentThread`（当前线程是否完整；追问时上次 mention 之前的回复只会经链接进入，被字节预算挤掉时记在 `references`）、`nearby`（附近讨论，含首次背景的 `initialStatus/initialReasons`）、`references`（链接引用）和 `unloadedFiles`。`task.instructions` 由 `coverage` 生成，与数据不会矛盾。附件始终 `not_loaded`，不把附件引用当成已读取内容。v5 及更早的 `truncated/unavailable` + `reason` 在恢复时按同一词汇转换；旧版只保留最后一个原因，转换结果可能低估当时的缺失。
 
 ## Agent Footer 降噪
 
@@ -83,7 +85,7 @@ B 为本次 mention；A 为同一 workspace/project/agent/thread 中，时间早
 
 A 在本次 Slack 结果中缺失时，使用已持久化 eventPayload 的正文、作者和附件引用补入，并标记 `restoredFrom: persisted_request`；旧附件截断标记也保留。这不是本次 Slack 读取的正文。无法取得已保存正文时拒绝交付；线程根读取失败仍单独拒绝。时间边界按 Slack 消息 `ts` 判断。
 
-`schemaVersion: 5` 是任务正文版本，`:sent-context-index` v3 是 Relay 内部缓存版本，两者独立。部署新版 Relay 即可启用，无需新增变量、修改 Agent Instructions 或重新绑定最终回复 Skill。
+`schemaVersion: 6` 是任务正文版本（Relay 仍能读取 v5 及更早的正文），`:sent-context-index` v3 是 Relay 内部缓存版本，两者独立。部署新版 Relay 即可启用，无需新增变量、修改 Agent Instructions 或重新绑定最终回复 Skill。
 
 新 mention 使用新规则；同一事件的冻结 envelope 在 24 小时缓存有效期内复用，即使它是旧格式。缓存过期后先核对持久化记录，确需重新准备时才读取上下文。旧版首次背景在恢复后按当前范围重新选取，再写入新的 comment，原 Issue/comment 不回写。不要为强制切换格式清理事件快照、线程映射或 delivery ledger；这些记录承担幂等与恢复职责。
 

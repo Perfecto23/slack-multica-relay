@@ -33,7 +33,7 @@ Lists may be arrays or paginated objects containing `issues`, `has_more`, and `o
 ## Verify Relay context
 
 1. Read the Issue description for a first request. For a follow-up, locate the `relay-message` root comment and read its complete content. An Agent response is separate from the triggering comment.
-2. Match the eventPayload team, channel, thread, and message timestamp to the Slack request. New events use `schemaVersion: 5`; retries of already frozen events may retain an older version.
+2. Match the eventPayload team, channel, thread, and message timestamp to the Slack request. New events use `schemaVersion: 6`; retries of already frozen events may retain an older version.
 3. For first mentions, check the complete current thread and the 30-minute / 12-root / 2-thread / 5-reply nearby scope. When an earlier persisted mention exists, check sinceTs, root, that mention, and every intervening message. Successful required recovery with no earlier mention omits sinceTs and reads from root. Late requests retain the original initialCutoffTs and exclude background roots/replies later than the current request.
 4. Compact lines preserve text, author, and thread relationships. currentRequest references eventPayload without repeating its body. `restoredFrom: persisted_request` identifies a historical request restored rather than fetched from Slack in this read. A not_loaded attachment is not read content, and a missing-background marker is not complete history.
 5. Verify read scope in relay_context and persistence in relay_dispatch, then inspect the run and original Slack reply independently. An existing Issue does not prove delivery of the current request.

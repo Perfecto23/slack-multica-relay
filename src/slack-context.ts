@@ -1,7 +1,8 @@
 import { Buffer } from 'node:buffer';
-import { clip, compareTs, markTruncated, projectFiles, sourceMessageFingerprint, timestampValid, updateCoverage, type ContextSection, type ContextMessage, type ThreadContext } from './context-envelope.js';
+import { clip, compareTs, projectFiles, sourceMessageFingerprint, timestampValid, updateCoverage, type ContextSection, type ContextMessage, type ThreadContext } from './context-envelope.js';
 import type { SlackThreadEvent } from './thread-router.js';
 import { agentBody } from './slack-message-text.js';
+import { missingSection, noteOmission } from './context-coverage.js';
 
 type RawMessage = Record<string, unknown>;
 const permissionErrors = new Set(['missing_scope', 'not_in_channel', 'channel_not_found', 'access_denied', 'token_revoked', 'invalid_auth', 'account_inactive', 'thread_not_found']);
@@ -38,7 +39,7 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
       const pageLimit = method === 'history' ? 5 : optional ? 3 : 10;
       let reachedEnd = false;
       for (let page=0;page<pageLimit;page++) {
-        if (requests>=MAX_CONTEXT_CALLS || (optional && (sideStopped || deadline.aborted))) { markTruncated(section,'read_budget'); break; }
+        if (requests>=MAX_CONTEXT_CALLS || (optional && (sideStopped || deadline.aborted))) { noteOmission(section,'read_budget'); break; }
         deadline.throwIfAborted(); requests++;
         const params = new URLSearchParams({channel:event.channelId,limit:referenceTs&&method==='history'?'1':optional?'100':'200',latest:referenceTs&&method==='history'?referenceTs:event.messageTs,inclusive:'true',
           ...(method==='history'?{oldest:referenceTs??oldest}:{ts:rootTs,...(!optional&&options.sinceTs?{oldest:options.sinceTs}:{})}),...(cursor?{cursor}:{})});
@@ -50,7 +51,7 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
         try { for (;;) {const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>2*1024*1024)throw new Error('context_response_too_large');chunks.push(part.value);} }
         finally {await reader.cancel().catch(()=>{});}
         const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        if(body.ok!==true) {if(permissionErrors.has(body.error))return {status:'unavailable',reason:body.error,messages:[]};throw new Error('context_upstream_failed');}
+        if(body.ok!==true) {if(permissionErrors.has(body.error))return missingSection(body.error);throw new Error('context_upstream_failed');}
         if(!Array.isArray(body.messages))throw new Error('context_invalid_response');
         rawMessages += body.messages.length;
         for(const raw of body.messages as RawMessage[]) {
@@ -72,23 +73,23 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
         if(!cursor&&body.has_more===true)throw new Error('context_invalid_cursor');
         if(!cursor||method==='history'&&referenceTs){reachedEnd=true;break;}
         if(cursors.has(cursor))throw new Error('context_invalid_cursor');cursors.add(cursor);
-        if(method==='history'&&section.messages.length>=12){markTruncated(section,'timeline_root_limit');break;}
-        if(page===pageLimit-1)markTruncated(section,'page_limit');
+        if(method==='history'&&section.messages.length>=12){noteOmission(section,'timeline_root_limit');break;}
+        if(page===pageLimit-1)noteOmission(section,'page_limit');
       }
       if(method==='replies'&&!reachedEnd){
         if(!optional)throw new Error('context_required_page_limit');
         section.messages=section.messages.filter(m=>m.ts===rootTs);
-        markTruncated(section,'latest_suffix_unavailable');
+        noteOmission(section,'latest_suffix_unavailable');
       }
     } catch(error) {
       if(!optional || (error instanceof Error && error.message==='invalid_context_scope'))throw error;
       sideStopped=true;
       if(method==='replies')section.messages=section.messages.filter(m=>m.ts===rootTs);
-      markTruncated(section,error instanceof Error&&error.message==='context_rate_limited'?'rate_limited':'read_failed');
+      noteOmission(section,error instanceof Error&&error.message==='context_rate_limited'?'rate_limited':'read_failed');
     }
     if (method==='replies' && section.status==='complete' && !section.messages.some(m=>m.ts===rootTs)&&!(options.sinceTs&&!optional)) {
       if(!optional)throw new Error('context_required_unavailable');
-      return {status:'unavailable',reason:'thread_root_missing',messages:[]};
+      return missingSection('thread_root_missing');
     }
     section.messages.sort((a,b)=>compareTs(a.ts,b.ts));
     if(referenceTs&&method==='replies'){
@@ -97,16 +98,16 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
       const chosen=index>=0?replies.slice(Math.max(0,index-2),index+3):referenceTs===rootTs?replies.slice(0,2):[];
       section.messages=[...section.messages.filter(m=>m.ts===rootTs),...chosen];
       for(const message of section.messages)message.change=message.ts===referenceTs?'referenced':'context';
-      if(chosen.length<replies.length)markTruncated(section,'reference_window');
-      if(index<0&&referenceTs!==rootTs)markTruncated(section,'reference_target_missing');
+      if(chosen.length<replies.length)noteOmission(section,'reference_window');
+      if(index<0&&referenceTs!==rootTs)noteOmission(section,'reference_target_missing');
     }
     const limit=method==='history'?12:optional?6:Number.MAX_SAFE_INTEGER;
     if(section.messages.length>limit){
       const root=method==='replies'?section.messages.find(m=>m.ts===rootTs):undefined;
       section.messages=[...(root?[root]:[]),...section.messages.filter(m=>!root||m.ts!==root.ts).slice(-(limit-(root?1:0)))];
-      markTruncated(section,method==='history'?'timeline_root_limit':'thread_message_limit');
+      noteOmission(section,method==='history'?'timeline_root_limit':'thread_message_limit');
     }
-    if(section.messages.some(m=>m.textTruncated||m.filesTruncated))markTruncated(section,section.reason||'message_projection_limit');
+    if(section.messages.some(m=>m.textTruncated||m.filesTruncated))noteOmission(section,'message_projection_limit');
     updateCoverage(section); return section;
   };
   // Reserve the first reads for the current thread before expanding optional branches.
@@ -126,6 +127,7 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
   timeline.messages=timeline.messages.filter(m=>m.ts!==event.threadTs);
   const optionalRoots=timeline.messages.filter(m=>threadRoots.has(m.ts))
     .sort((a,b)=>compareTs(threadRoots.get(b.ts)!,threadRoots.get(a.ts)!)).slice(0,MAX_OPTIONAL_ROOTS);
+  if(timeline.messages.filter(m=>threadRoots.has(m.ts)).length>optionalRoots.length)noteOmission(timeline,'thread_reply_selection');
   let next=0;
   await Promise.all(Array.from({length:Math.min(4,optionalRoots.length)},async()=>{
     while(next<optionalRoots.length){const root=optionalRoots[next++]!;const section=await read('replies',root.ts,true);section.messages=section.messages.filter(m=>m.ts!==root.ts);updateCoverage(section);root.replies=section;}
@@ -153,8 +155,10 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
     }
     const section=await read('replies',rootTs,true,ts);
     const root=section.messages.find(m=>m.ts===rootTs);
-    if(!root){markTruncated(timeline,'reference_unavailable');continue;}
+    if(!root){noteOmission(timeline,'reference_unavailable');continue;}
     if(rootTs===event.threadTs){
+      // The current thread itself is complete; a failed link read into it is a reference gap.
+      if(section.status==='missing')noteOmission(timeline,'reference_unavailable');
       currentReplies.messages=[...new Map([...section.messages.filter(m=>m.ts!==rootTs),...currentReplies.messages].map(m=>[m.ts,m])).values()].sort((a,b)=>compareTs(a.ts,b.ts));
       updateCoverage(currentReplies);
     }else{
@@ -164,7 +168,7 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
       else timeline.messages.push(root);
     }
   }
-  if(references.size>3)markTruncated(timeline,'reference_limit');
+  if(references.size>3)noteOmission(timeline,'reference_limit');
   timeline.messages.push(currentRoot);timeline.messages.sort((a,b)=>compareTs(a.ts,b.ts));updateCoverage(timeline);
   return {anchorTs:event.threadTs,cutoffTs:event.messageTs,capturedAt:new Date().toISOString(),timeline,...(options.sinceTs?{sinceTs:options.sinceTs}:{}),
     readStats:{slackCalls:requests,rawMessages,messageReadMs:Date.now()-readStartedAt}};

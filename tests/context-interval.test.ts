@@ -89,7 +89,7 @@ describe('complete mention intervals',()=>{
     await expect(readContext(event,'test',async()=>Response.json({ok:false,error:'missing_scope'}))).rejects.toThrow('context_required_unavailable');
     const first={...event,messageTs:event.threadTs};
     const c=await readContext(first,'test',async()=>Response.json({ok:false,error:'missing_scope'}));
-    expect(c.timeline.status).toBe('unavailable');expect(c.timeline.messages[0]!.ts).toBe(first.threadTs);
+    expect(c.timeline.status).toBe('missing');expect(c.timeline.messages[0]!.ts).toBe(first.threadTs);
   });
 
   it('shows one compact line per message and roundtrips whitespace, attachments and hostile markup',()=>{
@@ -130,7 +130,7 @@ describe('explicit same-conversation references',()=>{
       ?Response.json({ok:true,messages:[raw(event.threadTs,'required root'),raw('1800.000001','required gap')]})
       :Response.json({ok:false,error:'missing_scope'});
     const context=await readContext(e,'test',f,{includeNearby:false});
-    expect(context.timeline.reason).toBe('reference_unavailable');
+    expect(context.timeline.reasons).toContain('reference_unavailable');
     expect(context.timeline.messages[0]!.text).toBe('required root');
     expect(context.timeline.messages[0]!.replies!.messages[0]!.text).toBe('required gap');
   });

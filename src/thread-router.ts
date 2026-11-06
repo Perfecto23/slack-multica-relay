@@ -23,7 +23,8 @@ import {
   type CancellationState,
 } from "./cancellation.js";
 import { type ThreadStore } from "./thread-store.js";
-import { buildEnvelope, compactInitialContext, projectFiles, compareTs, timestampValid, markTruncated, updateCoverage, type ThreadContext } from './context-envelope.js';
+import { buildEnvelope, compactInitialContext, mergeParticipants, projectFiles, compareTs, timestampValid, updateCoverage, type ThreadContext } from './context-envelope.js';
+import { missingSection, normalizeContext, noteOmission } from './context-coverage.js';
 import type { ContextReadOptions } from './slack-context.js';
 
 export interface SlackThreadEvent {
@@ -187,6 +188,8 @@ export async function routeSlackThreadEvent(
       }
       const savedIndex=await config.store.get(selectionKey);
       let index:SelectionIndex|undefined=savedIndex?JSON.parse(savedIndex):undefined;
+      // Indexes written before schema 6 carry legacy section statuses.
+      if(index?.version===3&&index.initialContext?.timeline)normalizeContext(index.initialContext);
       if(index?.version===3&&(!index.request||threadKey(index.request)!==threadKey(event)||!timestampValid(index.cutoffTs)||index.request.messageTs!==index.cutoffTs||index.initialContext?.anchorTs!==event.threadTs||!Array.isArray(index.initialContext.timeline?.messages)))throw new Error('invalid_thread_state');
       const followup=!!state.issueId&&messageKey(event)!==state.rootMessageKey;
       // Initial background belongs to the Issue, independently of whether A exists before B.
@@ -208,8 +211,8 @@ export async function routeSlackThreadEvent(
           .sort((a,b)=>compareTs(b.eventPayload.messageTs,a.eventPayload.messageTs))[0];
         const original=first.context as ThreadContext|undefined;
         // Legacy envelopes may not have a tree. Their request still bounds A.
-        initialContext=original?.timeline?(first.schemaVersion===5?structuredClone(original):compactInitialContext(original)):{
-          anchorTs:event.threadTs,cutoffTs:first.eventPayload.messageTs,capturedAt:'',timeline:{status:'unavailable',reason:'legacy_background_unavailable',messages:[]},
+        initialContext=original?.timeline?(Number(first.schemaVersion)>=5?normalizeContext(structuredClone(original)):compactInitialContext(normalizeContext(structuredClone(original)))):{
+          anchorTs:event.threadTs,cutoffTs:first.eventPayload.messageTs,capturedAt:'',timeline:missingSection('legacy_background_unavailable'),
         };
         initialContext.timeline.messages=initialContext.timeline.messages.filter(m=>m.ts!==event.threadTs);
         const latest=history.sort((a,b)=>compareTs(b.eventPayload.messageTs,a.eventPayload.messageTs))[0]!;
@@ -226,7 +229,7 @@ export async function routeSlackThreadEvent(
           if(!root.replies)continue;
           const before=root.replies.messages.length;
           root.replies.messages=root.replies.messages.filter(m=>compareTs(m.ts,event.messageTs)<=0);
-          if(root.replies.messages.length<before)markTruncated(root.replies,'request_cutoff');
+          if(root.replies.messages.length<before)noteOmission(root.replies,'request_cutoff');
           updateCoverage(root.replies);
         }
         const fresh=source.timeline.messages;
@@ -241,9 +244,10 @@ export async function routeSlackThreadEvent(
         source.timeline.messages=[...combined.values()].sort((a,b)=>compareTs(a.ts,b.ts));
         source.initialCutoffTs=initialContext.cutoffTs;
         if(initialContext.timeline.status!=='complete'){
-          source.initialStatus=initialContext.timeline.status;source.initialReason=initialContext.timeline.reason;
+          source.initialStatus=initialContext.timeline.status;
+          if(initialContext.timeline.reasons?.length)source.initialReasons=[...initialContext.timeline.reasons];
         }
-        source.participants=[...new Map([...(source.participants??[]),...(initialContext.participants??[])].map(p=>[p.id,p])).values()];
+        source.participants=mergeParticipants(initialContext.participants,source.participants);
       }else source.initialCutoffTs=event.messageTs;
       const anchor=source.timeline.messages.find(m=>m.ts===event.threadTs);
       if(baseline&&baseline.cutoffTs!==event.threadTs&&anchor?.replies&&!anchor.replies.messages.some(m=>m.ts===baseline.cutoffTs)){
@@ -268,9 +272,9 @@ export async function routeSlackThreadEvent(
       const count=(roots:ThreadContext['timeline']['messages'])=>roots.length+roots.reduce((n,m)=>n+(m.replies?.messages.length??0),0);
       const reasons:Record<string,number>={};
       const readReasons:Record<string,number>={};
-      for(const section of [source.timeline,...source.timeline.messages.flatMap(m=>m.replies?[m.replies]:[])])if(section.reason)readReasons[section.reason]=(readReasons[section.reason]??0)+1;
+      for(const section of [source.timeline,...source.timeline.messages.flatMap(m=>m.replies?[m.replies]:[])])for(const reason of section.reasons??[])readReasons[reason]=(readReasons[reason]??0)+1;
       const sections=[output.timeline,...delivered.flatMap(m=>m.replies?[m.replies]:[])];
-      for(const section of sections)if(section.reason)reasons[section.reason]=(reasons[section.reason]??0)+1;
+      for(const section of sections)for(const reason of section.reasons??[])reasons[reason]=(reasons[reason]??0)+1;
       console.info('relay_context',{
         eventId:digest(messageKey(event)),snapshot:'prepared',mode:followup?'focused':'full',baseline:baseline?'available':'unavailable',
         slackCalls:source.readStats?.slackCalls,rawMessages:source.readStats?.rawMessages,
