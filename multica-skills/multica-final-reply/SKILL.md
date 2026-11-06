@@ -9,7 +9,7 @@ description: 在 Multica 的 Slack Relay 任务需要向原线程发送已获授
 
 ## 发送
 
-1. 读取 `FINAL_REPLY_CONFIG` 指向的私有 JSON，取 `adapterPath`。有 `styleGuide`、`emojiGuide` 时按它们写正文和挑表情；没有时用 [通用回复风格](references/reply-style.md) 和 [Emoji 使用](references/emoji-guide.md)。`emojiCatalog` 只在常用池不够时按名称查。
+1. 读取 `FINAL_REPLY_CONFIG` 指向的私有 JSON，取 `adapterPath`。正文语气以 Agent Instructions 为准；日常接话不必读 `styleGuide`，写正式的长消息或英文消息时再读。Agent Instructions 没有写语气时，用 `styleGuide`，没有 `styleGuide` 再用 [通用回复风格](references/reply-style.md)。表情从 `emojiGuide` 挑，没有时用 [Emoji 使用](references/emoji-guide.md)；`emojiCatalog` 只在常用池不够时按名称查。
 2. 把完整正文写进任务私有目录的 UTF-8 文件。正文只写给读者看的内容，不写工具参数、本地路径或 Skill 名。
 3. 本轮实际处理并已核验 PR 或分支时（来自本轮自己的 `gh` 结果或 PR 回读），写 `github-context.json`（格式见下），最多五项；只讨论过的链接、示例和失败操作不算。PR Review/复审另读 [PR 回执](references/pr-review-receipt.md)。
 4. 本轮明确要求交付文件时，先按 [附件交付](references/attachment-delivery.md) 把文件附到本轮 task 的 Multica 评论。
