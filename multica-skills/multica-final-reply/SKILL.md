@@ -11,6 +11,10 @@ description: 在 Multica 的 Slack Relay 任务需要向原线程发送已获授
 
 每次先核对当前 Issue、触发 comment、真实 run 和交付角色。Team 的成员将结果交接给指定发送方，复用同一私有 FINAL_REPLY_CONFIG 与持久 ledger；同一来源已有回执时只补缺失附件。私有 styleGuide/emojiGuide 继续是个人表达真源。
 
+## Owner 在 Multica 中的评论
+
+Relay Issue 上由 owner 本人在 Multica 写的评论（没有 relay 标记）同样是有效请求，包括“回 Slack 说……”“把结果发到原线程”。处理完后照常走回复流程，并加本轮触发的 `--comment-id`。adapter 只在评论作者等于配置的 `ownerMulticaUserId` 时接受这种来源，目的地是该 Issue 的原 Slack 线程，每条评论单独交付。不要回答“只能从 Slack 进”；adapter 返回 `invalid_relay_source` 时如实说明评论作者或 Issue 来源不符合条件。
+
 ## 定时唤醒的独立交付
 
 当前 run 来自 Multica 时间 wakeup 时，在同一个 adapter 命令加 `--wakeup-run`。adapter 使用 `MULTICA_TASK_ID` 回读真实 running run、wakeup 规则和原授权来源，生成独立交付标识，目的地仍来自原来源 envelope。同一 run 的重试复用回执；新 run 单独交付。普通 mention、人工重跑、已结束 run 和事件型 wakeup 保持原协议。周期任务的业务去重（例如每天一次）另外按已批准周期核对结果记录，不通过新 run 绕过同周期约束。

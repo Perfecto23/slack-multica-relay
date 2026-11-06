@@ -186,7 +186,15 @@ def reply_assignee(config):
     return kind, target
 
 
+UUID_PATTERN = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+
+
 def read_source(config, issue_id, comment_id, runner=subprocess.run):
+    return read_reply_source(config, issue_id, comment_id, runner)[0]
+
+
+def read_reply_source(config, issue_id, comment_id, runner=subprocess.run):
+    """Return (envelope, kind); kind is 'relay' or 'owner_comment'."""
     issue = multica_json(config, ['issue', 'get', issue_id], runner)
     kind, target = reply_assignee(config)
     assigned = (issue.get('assignee_type'), issue.get('assignee_id'))
@@ -198,13 +206,33 @@ def read_source(config, issue_id, comment_id, runner=subprocess.run):
     if comment_id:
         rows = multica_json(config, ['issue', 'comment', 'list', issue_id,
                                      '--thread', comment_id, '--tail', '0'], runner)
-        row = next((row for row in rows if row.get('id') == comment_id), None)
+        if not isinstance(rows, list):
+            raise ValueError('multica_read_failed')
+        row = next((row for row in rows if isinstance(row, dict) and row.get('id') == comment_id), None)
+        if not row:
+            # `--tail 0` returns only the thread root; an owner reply nested in a thread needs the full thread.
+            rows = multica_json(config, ['issue', 'comment', 'list', issue_id,
+                                         '--thread', comment_id, '--full'], runner)
+            if not isinstance(rows, list):
+                raise ValueError('multica_read_failed')
+            row = next((row for row in rows if isinstance(row, dict) and row.get('id') == comment_id), None)
         if not row:
             raise ValueError('source_comment_missing')
-        source = row.get('content', '')
-    if not source.startswith('<!-- relay-message:' if comment_id else '<!-- relay-thread:'):
+        content = row.get('content', '')
+        if isinstance(content, str) and content.startswith('<!-- relay-message:'):
+            return envelope_from_text(content), 'relay'
+        # The Relay may also post as the owner, so markers are checked first. An owner's own
+        # Multica comment carries no Slack envelope; it replies to the Issue's original thread.
+        owner = config.get('ownerMulticaUserId')
+        if (isinstance(owner, str) and re.fullmatch(UUID_PATTERN, owner)
+                and row.get('author_type') == 'member' and row.get('author_id') == owner
+                and row.get('issue_id') == issue_id
+                and isinstance(source, str) and source.startswith('<!-- relay-thread:')):
+            return envelope_from_text(source), 'owner_comment'
         raise ValueError('invalid_relay_source')
-    return envelope_from_text(source)
+    if not source.startswith('<!-- relay-thread:'):
+        raise ValueError('invalid_relay_source')
+    return envelope_from_text(source), 'relay'
 
 
 def read_wakeup_source(config, issue_id, comment_id, task_id, runner=subprocess.run):
@@ -230,7 +258,10 @@ def read_wakeup_source(config, issue_id, comment_id, task_id, runner=subprocess.
     source_comment_id = wakeup.get('parent_comment_id')
     if comment_id is not None and comment_id != source_comment_id:
         raise ValueError('wakeup_comment_mismatch')
-    envelope = read_source(config, issue_id, source_comment_id, runner)
+    envelope, kind = read_reply_source(config, issue_id, source_comment_id, runner)
+    if kind != 'relay':
+        # A wakeup must descend from a Slack-authorized source; an Agent can schedule one off any comment.
+        raise ValueError('invalid_wakeup_source')
     return envelope, source_comment_id, 'wakeup:' + wakeup['id'] + ':run:' + task_id
 
 
@@ -709,12 +740,14 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     args = parser.parse_args(argv)
     config_path = Path(args.config)
     config = json.loads(config_path.read_text())
-    occurrence = None
+    occurrence, source_kind = None, 'relay'
     if args.wakeup_run:
         if args.clear_start_reaction:
             raise ValueError('invalid_cleanup_arguments')
         envelope, args.comment_id, occurrence = read_wakeup_source(
             config, args.issue_id, args.comment_id, os.environ.get('MULTICA_TASK_ID'), runner)
+    elif args.clear_start_reaction and args.comment_id:
+        envelope, source_kind = read_reply_source(config, args.issue_id, args.comment_id, runner)
     else:
         envelope = read_source(config, args.issue_id, args.comment_id, runner)
     if args.session_status:
@@ -727,7 +760,11 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     if args.clear_start_reaction:
         if args.run_context_file or args.github_context_file or args.deliver_task_attachments:
             raise ValueError('invalid_cleanup_arguments')
-        result = clear_start_reaction(config, envelope, args.dry_run, opener)
+        if source_kind == 'owner_comment':
+            # Owner comments never get a Relay start reaction; the root message's belongs to its own run.
+            result = {'ok': True, 'action': 'not_applicable'}
+        else:
+            result = clear_start_reaction(config, envelope, args.dry_run, opener)
         if not args.dry_run:
             result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
         print(json.dumps(result))

@@ -156,6 +156,8 @@ footer appearance 每次发送时都从私有配置读取。`displayName` 是完
 
 这些是附加字段，保留原 JSON 的 `displayName`、`agentId`、`workspaceId`、`projectId`、`teamId`、`serverUrl`。图标可使用当前 workspace 已确认存在的 shortcode。未指定个人风格时使用通用回复风格；表情库不全量进入每次模型输入。
 
+可选的 `ownerMulticaUserId` 填 owner 的 Multica user UUID（评论的 `author_id`）。配置后，owner 在 Relay Issue 上直接写的 Multica 评论可以作为 `--comment-id` 来源：回复发到 Issue 描述记录的原 Slack 线程，每条评论单独去重。其他作者、Agent 评论和非 Relay Issue 仍返回 `invalid_relay_source`；这类评论没有启动表情，`--clear-start-reaction` 返回 `not_applicable`。
+
 Agent 环境的 `FINAL_REPLY_APP_URL` 为 Multica 网页 HTTPS 根地址，`FINAL_REPLY_WORKSPACE_SLUG` 为工作区 slug。采集器支持等价的 `--app-url`、`--workspace-slug` 及 `--issue-identifier` 显式参数，优先于环境；未提供时只读补查，缺失则省略链接。隔离运行应显式配置环境值，不依赖宿主个人 CLI 配置。
 
 `--run-context-file` 除统计外携带当前任务的编号与链接；adapter 核对 Issue 和当前 run 后在统计行末尾渲染任务入口。`--github-context-file` 使用 `version: 1`、`pullRequests` 数组及可选 `branches` 数组；分支项包含 `repository`（owner/repo）与 `branch`，PR 项另含 `number` 和对应的完整 GitHub `url`，合计最多五项。每项单独一个 context block，fallback 保留同样的信息。有效本轮统计不再叠加旧 envelope 的模型行，attribution 和 delivery marker 仍保留。

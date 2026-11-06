@@ -85,7 +85,7 @@ class WakeupDeliveryTests(unittest.TestCase):
                'agent_id': 'A1', 'wakeup_id': 'WUP1', 'trigger_comment_id': 'C1', **(run_changes or {})}
         rule = {'id': 'WUP1', 'issue_id': 'I1', 'workspace_id': 'W1', 'agent_id': 'A1',
                 'kind': 'cron', 'parent_comment_id': 'C1', **(rule_changes or {})}
-        with patch.object(reply, 'multica_json', side_effect=[[run], rule]), patch.object(reply, 'read_source', return_value={'eventPayload': EVENT}) as read:
+        with patch.object(reply, 'multica_json', side_effect=[[run], rule]), patch.object(reply, 'read_reply_source', return_value=({'eventPayload': EVENT}, 'relay')) as read:
             result = reply.read_wakeup_source(self.config, 'I1', comment_id, self.run_id)
             read.assert_called_once_with(self.config, 'I1', 'C1', reply.subprocess.run)
             return result
@@ -783,6 +783,148 @@ class ReplyTests(unittest.TestCase):
             reply.read_source(config, 'I1', None, runner)
 
 
+OWNER = '244bf422-d836-43a3-96cf-36533e64d17d'
+
+
+class OwnerCommentSourceTests(unittest.TestCase):
+    config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test',
+              'ownerMulticaUserId': OWNER}
+    thread = {'eventPayload': {**EVENT, 'messageTs': '100.000001'}}
+
+    def runner(self, comment, nested=False, description=None):
+        commands = []
+        def run(command, **_kwargs):
+            commands.append(command)
+            if command[5:8] == ['issue', 'get', 'I1']:
+                body = {'workspace_id': 'W1', 'project_id': 'P1', 'assignee_id': 'A1', 'assignee_type': 'agent',
+                        'description': description if description is not None
+                        else '<!-- relay-thread:x -->\n' + json.dumps(self.thread)}
+            elif '--tail' in command:
+                body = [{'id': 'ROOT', 'author_type': 'agent', 'content': 'agent result'}] if nested else [comment]
+            else:
+                body = [{'id': 'ROOT', 'author_type': 'agent', 'content': 'agent result'}, comment]
+            return subprocess.CompletedProcess(command, 0, json.dumps(body), '')
+        return run, commands
+
+    def comment(self, **fields):
+        return {'id': 'C9', 'issue_id': 'I1', 'author_type': 'member', 'author_id': OWNER,
+                'content': '回 Slack 说已经处理好了', **fields}
+
+    def test_owner_comment_replies_to_issue_thread_with_its_own_delivery_identity(self):
+        run, _ = self.runner(self.comment())
+        envelope, kind = reply.read_reply_source(self.config, 'I1', 'C9', run)
+        self.assertEqual((envelope['eventPayload'], kind), (self.thread['eventPayload'], 'owner_comment'))
+        self.assertNotEqual(reply.delivery_identity(self.config, 'I1', 'C9'),
+                            reply.delivery_identity(self.config, 'I1', None))
+
+    def test_nested_owner_reply_is_found_in_the_full_thread(self):
+        run, commands = self.runner(self.comment(), nested=True)
+        self.assertEqual(reply.read_reply_source(self.config, 'I1', 'C9', run)[1], 'owner_comment')
+        self.assertIn('--full', commands[-1])
+
+    def test_other_authors_agents_and_unconfigured_owner_are_rejected(self):
+        cases = [(self.config, self.comment(author_id='11111111-1111-1111-1111-111111111111')),
+                 (self.config, self.comment(author_type='agent')),
+                 (self.config, self.comment(issue_id='I2')),
+                 ({**self.config, 'ownerMulticaUserId': None}, self.comment()),
+                 ({**self.config, 'ownerMulticaUserId': 'Perfecto'}, self.comment())]
+        for config, comment in cases:
+            run, _ = self.runner(comment)
+            with self.subTest(config=config.get('ownerMulticaUserId'), comment=comment), \
+                    self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
+                reply.read_reply_source(config, 'I1', 'C9', run)
+
+    def test_owner_comment_requires_a_relay_issue(self):
+        run, _ = self.runner(self.comment(), description='manual issue')
+        with self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
+            reply.read_reply_source(self.config, 'I1', 'C9', run)
+
+    def test_relay_marker_wins_even_when_posted_as_owner(self):
+        marked = self.comment(content='<!-- relay-message:x -->\n' + json.dumps(
+            {'eventPayload': {**EVENT, 'messageTs': '105.000001'}}))
+        run, _ = self.runner(marked)
+        envelope, kind = reply.read_reply_source(self.config, 'I1', 'C9', run)
+        self.assertEqual((envelope['eventPayload']['messageTs'], kind), ('105.000001', 'relay'))
+
+    def test_start_reaction_cleanup_is_not_applicable_and_touches_no_slack(self):
+        run, _ = self.runner(self.comment())
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps(self.config))
+            output = io.StringIO()
+            with patch.object(reply, 'slack_call') as call, redirect_stdout(output):
+                reply.main(['--config', str(config_path), '--issue-id', 'I1', '--comment-id', 'C9',
+                            '--clear-start-reaction'], runner=run)
+        call.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue()),
+                         {'ok': True, 'action': 'not_applicable', 'session_status': 'disabled'})
+
+    def test_cleanup_still_resets_session_and_rejects_extra_arguments(self):
+        run, _ = self.runner(self.comment())
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps(self.config))
+            base = ['--config', str(config_path), '--issue-id', 'I1', '--comment-id', 'C9', '--clear-start-reaction']
+            with self.assertRaisesRegex(ValueError, 'invalid_cleanup_arguments'):
+                reply.main(base + ['--run-context-file', 'x'], runner=run)
+            with patch.object(reply, 'update_session_status', return_value='active') as status, \
+                    redirect_stdout(io.StringIO()):
+                reply.main(base, runner=run)
+        status.assert_called_once()
+        self.assertEqual(status.call_args.args[3], 'active')
+
+    def test_both_lookups_missing_is_source_comment_missing(self):
+        run, _ = self.runner(self.comment(id='OTHER'), nested=True)
+        with self.assertRaisesRegex(ValueError, 'source_comment_missing'):
+            reply.read_reply_source(self.config, 'I1', 'C9', run)
+
+    def test_found_root_does_not_read_the_full_thread(self):
+        run, commands = self.runner(self.comment())
+        reply.read_reply_source(self.config, 'I1', 'C9', run)
+        self.assertFalse(any('--full' in command for command in commands))
+
+    def test_missing_comment_issue_id_is_rejected(self):
+        comment = self.comment()
+        del comment['issue_id']
+        run, _ = self.runner(comment)
+        with self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
+            reply.read_reply_source(self.config, 'I1', 'C9', run)
+
+    def test_scheduled_wakeup_cannot_descend_from_an_owner_comment(self):
+        with patch.object(reply, 'multica_json', side_effect=[
+                [{'id': '11111111-1111-4111-8111-111111111111', 'issue_id': 'I1', 'workspace_id': 'W1', 'status': 'running',
+                  'wakeup_id': 'WK', 'agent_id': 'A1', 'trigger_comment_id': 'C9'}],
+                {'id': 'WK', 'workspace_id': 'W1', 'issue_id': 'I1', 'agent_id': 'A1',
+                 'parent_comment_id': 'C9', 'kind': 'at'}]), \
+                patch.object(reply, 'read_reply_source', return_value=(self.thread, 'owner_comment')):
+            with self.assertRaisesRegex(ValueError, 'invalid_wakeup_source'):
+                reply.read_wakeup_source(self.config, 'I1', None, '11111111-1111-4111-8111-111111111111')
+
+    def test_owner_comment_retry_returns_the_persisted_send(self):
+        run, _ = self.runner(self.comment())
+        posted = []
+        def opener(request, timeout=0):
+            if request.full_url.endswith('/chat.postMessage'):
+                posted.append(json.loads(request.data))
+                body = {'ok': True, 'channel': 'C1', 'ts': '102.000001'}
+            else:
+                messages = ([{'ts': '102.000001', 'blocks': posted[0]['blocks']}] if posted
+                            else [{'ts': '100.000001', 'blocks': []}])
+                body = {'ok': True, 'messages': messages, 'response_metadata': {'next_cursor': ''}}
+            return io.BytesIO(json.dumps(body).encode())
+        with tempfile.TemporaryDirectory() as directory:
+            config_path, text_path = Path(directory) / 'config.json', Path(directory) / 'body.txt'
+            config_path.write_text(json.dumps(self.config)); text_path.write_text('answer')
+            args = ['--config', str(config_path), '--issue-id', 'I1', '--comment-id', 'C9', '--text-file', str(text_path)]
+            results = []
+            for _ in range(2):
+                output = io.StringIO()
+                with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'xoxp-test'}), redirect_stdout(output):
+                    reply.main(args, opener=opener, runner=run)
+                results.append(json.loads(output.getvalue()))
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0]['thread_ts'], EVENT['threadTs'])
+        self.assertEqual([r['duplicate'] for r in results], [False, True])
 
 
 
