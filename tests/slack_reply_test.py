@@ -77,6 +77,27 @@ class StartReactionTests(unittest.TestCase):
             call.assert_not_called()
 
 
+class QueuedReactionTests(unittest.TestCase):
+    config = {'teamId': 'T1', 'queuedReaction': {'name': 'hourglass_flowing_sand', 'userId': 'U1', 'tokenEnv': 'SLACK_USER_TOKEN'}}
+    envelope = {'eventPayload': {'teamId': 'T1', 'channelId': 'C1', 'messageTs': '2.000001', 'threadTs': '1.000001'}}
+
+    def message(self, present):
+        reactions = [{'name': 'hourglass_flowing_sand', 'users': ['U1'], 'count': 1}] if present else []
+        return {'ok': True, 'channel': 'C1', 'message': {'ts': '2.000001', 'reactions': reactions}}
+
+    def test_removes_the_queued_marker_from_the_trigger_message(self):
+        replies = [{'ok': True, 'user_id': 'U1', 'team_id': 'T1'}, self.message(True), {'ok': True}, self.message(False)]
+        with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'test'}), patch.object(reply, 'slack_call', side_effect=replies) as call:
+            self.assertEqual(reply.clear_queued_reaction(self.config, self.envelope), 'removed')
+        self.assertEqual(call.call_args_list[2].args[1], 'reactions.remove')
+        self.assertEqual(call.call_args_list[2].kwargs['payload']['name'], 'hourglass_flowing_sand')
+
+    def test_unconfigured_or_failing_cleanup_never_raises(self):
+        self.assertEqual(reply.clear_queued_reaction({'teamId': 'T1'}, self.envelope), 'disabled')
+        with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'test'}), patch.object(reply, 'slack_call', side_effect=ValueError('slack_lookup_failed')):
+            self.assertEqual(reply.clear_queued_reaction(self.config, self.envelope), 'unavailable')
+
+
 class WakeupDeliveryTests(unittest.TestCase):
     config = {'workspaceId': 'W1', 'projectId': 'P1', 'agentId': 'A1'}
     run_id = '11111111-1111-4111-8111-111111111111'

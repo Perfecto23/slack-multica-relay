@@ -39,3 +39,18 @@ describe("deployment assignment", () => {
     expect(() => loadRelayConfig({ ...env, ...change })).toThrow();
   });
 });
+
+describe("queued marker configuration", () => {
+  it("defaults the queue agent to the assignee in agent mode and needs it explicitly for a squad", () => {
+    expect(loadRelayConfig({ ...env, SLACK_QUEUED_REACTION_NAME: ":hourglass_flowing_sand:" }))
+      .toMatchObject({ slackQueuedReactionName: "hourglass_flowing_sand", multicaQueueAgentId: "old-agent" });
+    const squad = loadRelayConfig({ ...env, MULTICA_ASSIGNEE_TYPE: "squad", MULTICA_ASSIGNEE_ID: "team" });
+    expect(squad.multicaQueueAgentId).toBeUndefined();
+    expect(loadRelayConfig({ ...env, MULTICA_ASSIGNEE_TYPE: "squad", MULTICA_ASSIGNEE_ID: "team", MULTICA_QUEUE_AGENT_ID: " leader " })
+      .multicaQueueAgentId).toBe("leader");
+  });
+  it("turns the marker off for an empty or malformed emoji name", () => {
+    for (const value of [undefined, "", "  ", "Hour Glass", "⏳"])
+      expect(loadRelayConfig({ ...env, SLACK_QUEUED_REACTION_NAME: value as string }).slackQueuedReactionName).toBeUndefined();
+  });
+});

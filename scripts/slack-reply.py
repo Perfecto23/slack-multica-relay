@@ -471,7 +471,21 @@ def update_session_status(config, envelope, issue_id, status, runner=subprocess.
 
 
 def clear_start_reaction(config, envelope, dry_run=False, opener=urllib.request.urlopen):
-    setting = config.get('startReaction')
+    return clear_configured_reaction(config, envelope, 'startReaction', dry_run, opener)
+
+
+def clear_queued_reaction(config, envelope, opener=urllib.request.urlopen):
+    """Best effort: the queued marker is presentation only and must never fail a delivered reply."""
+    if config.get('queuedReaction') is None:
+        return 'disabled'
+    try:
+        return clear_configured_reaction(config, envelope, 'queuedReaction', False, opener)['action']
+    except Exception:
+        return 'unavailable'
+
+
+def clear_configured_reaction(config, envelope, key, dry_run=False, opener=urllib.request.urlopen):
+    setting = config.get(key)
     if (not isinstance(setting, dict)
             or not isinstance(setting.get('name'), str)
             or not re.fullmatch(r'[a-z0-9_+\-]+', setting['name'])
@@ -838,7 +852,10 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
             # Only Relay messages get a start reaction; the root message's belongs to its own run.
             result = {'ok': True, 'action': 'not_applicable'}
         else:
+            queued = 'dry_run' if args.dry_run else clear_queued_reaction(config, envelope, opener)
             result = clear_start_reaction(config, envelope, args.dry_run, opener)
+            if not args.dry_run:
+                result['queued_reaction'] = queued
         if not args.dry_run:
             result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
         print(json.dumps(result))
@@ -875,6 +892,7 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
                 config_path, config, envelope, identity, attachments, runner, token, opener)
         if config.get('sessionStatus') is not None:
             result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
+        result['queued_reaction'] = clear_queued_reaction(config, envelope, opener)
         print(json.dumps(result, ensure_ascii=False))
 
     with delivery_lock(lock_path):

@@ -410,6 +410,44 @@ describe("Team migration", () => {
 });
 
 
+describe("排队提示", () => {
+  const run = (agent: string, status: string) => ({ id: "R-" + agent + status, issue_id: "", workspace_id: "", agent_id: agent, status });
+  const setup = (runs: (issueId: string, workspaceId: string) => unknown) => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "eyes";
+    f.config.slackQueuedReactionName = "hourglass_flowing_sand";
+    f.config.multicaQueueAgentId = "leader";
+    const added: string[] = [];
+    const fetcher: typeof fetch = (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/reactions.add")) { added.push(JSON.parse(String(init?.body)).name); return Promise.resolve(Response.json({ ok: true })); }
+      const match = url.match(/\/api\/issues\/([^/]+)\/task-runs$/);
+      if (match) return Promise.resolve(Response.json(runs(decodeURIComponent(match[1]!), f.config.multicaWorkspaceId)));
+      return f.fetcher(input, init);
+    };
+    return { f, added, fetcher };
+  };
+  const fill = (rows: ReturnType<typeof run>[]) => (issueId: string, workspaceId: string) =>
+    rows.map((r) => ({ ...r, issue_id: issueId, workspace_id: workspaceId }));
+
+  it("follow-up behind the queue agent's active run gets both reactions", async () => {
+    const { f, added, fetcher } = setup(fill([run("leader", "running")]));
+    await routeSlackThreadEvent(root, f.config, fetcher);
+    await routeSlackThreadEvent({ ...root, messageTs: "102.000001" }, f.config, fetcher);
+    expect(added).toEqual(["eyes", "eyes", "hourglass_flowing_sand"]);
+  });
+
+  it("only the queue agent's active runs count, and a failed lookup stays silent", async () => {
+    for (const runs of [fill([run("member", "running"), run("leader", "completed")]), () => { throw new Error("down"); }]) {
+      const { f, added, fetcher } = setup(runs as never);
+      await routeSlackThreadEvent(root, f.config, fetcher);
+      await routeSlackThreadEvent({ ...root, messageTs: "102.000001" }, f.config, fetcher);
+      expect(added).toEqual(["eyes", "eyes"]);
+    }
+  });
+});
+
 describe("投递成功后的 reaction 诊断", () => {
   it("重复投递不会重新添加已被静默收尾清理的 reaction", async () => {
     const f = fixture();

@@ -25,6 +25,7 @@ Slack IDs are comma-separated uppercase identifiers. `SLACK_TARGET_USER_IDS` and
 | `SLACK_CANCEL_KEYWORDS` | No | Comma-separated whole-command words; defaults to cancel,取消. |
 | `SLACK_CONTEXT_TOKEN` | Yes | User token with history scopes for the selected conversation types. The consumer uses it for bounded history/reply reads; `users:read` enables optional participant names through `users.info`. It may contain the same authorized token as the reaction credential, but configure it explicitly. |
 | `SLACK_REACTION_NAME` | Yes | Slack emoji shortcode without colons, such as `eyes`. The reaction confirms Relay persistence, not Agent completion. |
+| `SLACK_QUEUED_REACTION_NAME` | No | Queued marker such as `hourglass_flowing_sand`. When a follow-up arrives while `MULTICA_QUEUE_AGENT_ID` has an active run on the same Issue (Multica runs one task per agent per Issue), the Relay adds this reaction too; it means "received, not answered yet", and the adapter's `queuedReaction` setting (same name) removes it when the agent replies or cleans up after silence. |
 
 The Slack App Request URL is `https://<deployment-host>/api/slack/events`. Subscribe only to message events required by the selected conversation types. Install the App in private channels when needed.
 
@@ -39,6 +40,7 @@ The Slack App Request URL is `https://<deployment-host>/api/slack/events`. Subsc
 | `MULTICA_ASSIGNEE_ID` | Conditional | Target Agent/Team UUID; required for squad. |
 | `MULTICA_THREAD_SCOPE_ID` | No | Stable original Agent ID when migrating existing threads. |
 | `MULTICA_LEGACY_AGENT_ID` | No | Temporary old Agent allowance; squad only, matching THREAD_SCOPE_ID. |
+| `MULTICA_QUEUE_AGENT_ID` | No | Agent whose active runs mean a follow-up waits. Defaults to the agent in agent mode; for a squad set the leader's agent ID, otherwise no queued marker is added. |
 
 The Relay calls ordinary Issue and Comment APIs. It does not require a Multica Autopilot or webhook URL.
 

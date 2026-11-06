@@ -25,6 +25,7 @@ Slack ID 使用逗号分隔的大写标识符。`SLACK_TARGET_USER_IDS` 与 `SLA
 | `SLACK_CANCEL_KEYWORDS` | 否 | 逗号分隔的完整取消关键词，默认 cancel,取消。 |
 | `SLACK_CONTEXT_TOKEN` | 是 | 带目标会话 history scopes 的 user token。consumer 用它读取有界 history/replies；如需通过 `users.info` 补充参与者姓名，还需 `users:read`。可以与 reaction 使用同一个已授权 token，但必须显式配置。 |
 | `SLACK_REACTION_NAME` | 是 | 不带冒号的 Slack emoji shortcode，例如 `eyes`。reaction 只确认 Relay 已持久化，不证明 Agent 已完成。 |
+| `SLACK_QUEUED_REACTION_NAME` | 否 | 排队提示表情，例如 `hourglass_flowing_sand`。后续消息进来时，若 `MULTICA_QUEUE_AGENT_ID` 在同一 Issue 上有进行中的任务（Multica 对同一 Agent 同一 Issue 只跑一个任务），再加这个表情，含义是“收到了，还没回复”；Agent 回复或静默收尾时由 adapter 的 `queuedReaction` 配置移除，名字须与这里一致。 |
 
 Slack App Request URL 为 `https://<deployment-host>/api/slack/events`。只订阅目标频道类型需要的 message events；读取私有频道时必须把 App 安装到对应频道。
 
@@ -39,6 +40,7 @@ Slack App Request URL 为 `https://<deployment-host>/api/slack/events`。只订�
 | `MULTICA_ASSIGNEE_ID` | 条件必填 | 目标 Agent/Team UUID；squad 必填。 |
 | `MULTICA_THREAD_SCOPE_ID` | 否 | 迁移已有线程时保留的旧 Agent ID。 |
 | `MULTICA_LEGACY_AGENT_ID` | 否 | 过渡期旧 Agent 允许值；仅 squad 且等于 THREAD_SCOPE_ID 时有效。 |
+| `MULTICA_QUEUE_AGENT_ID` | 否 | 判断排队时看哪个 Agent 的进行中任务。单 Agent 默认就是它；squad 填 Leader 的 Agent ID，不填则不加排队提示。 |
 
 Relay 调用普通 Issue 和 Comment API，不需要 Multica Autopilot 或 webhook URL。
 

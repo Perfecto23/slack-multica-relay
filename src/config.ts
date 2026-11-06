@@ -16,6 +16,10 @@ export interface RelayConfig extends ApiConfig {
   slackReactionToken: string;
   slackContextToken: string;
   slackReactionName: string;
+  /** Optional second reaction marking a message that waits behind an active run. */
+  slackQueuedReactionName?: string;
+  /** Agent whose active runs make a new message wait: the assignee itself, or a squad's leader. */
+  multicaQueueAgentId?: string;
   kvRestApiUrl: string;
   kvRestApiToken: string;
   queueUrl: string;
@@ -71,6 +75,8 @@ export function loadRelayConfig(
       /^:+|:+$/gu,
       "",
     ),
+    slackQueuedReactionName: emojiName(env.SLACK_QUEUED_REACTION_NAME),
+    multicaQueueAgentId: env.MULTICA_QUEUE_AGENT_ID?.trim() || (type === "agent" ? targetId : undefined),
     kvRestApiUrl: https(required(env, "KV_REST_API_URL")),
     kvRestApiToken: required(env, "KV_REST_API_TOKEN"),
     queueUrl: https(env.QSTASH_URL?.trim() || "https://qstash.upstash.io"),
@@ -112,6 +118,11 @@ function https(value: string): string {
   )
     throw new Error("invalid_service_url");
   return value.replace(/\/+$/u, "");
+}
+
+function emojiName(value: string | undefined): string | undefined {
+  const name = value?.trim().replace(/^:+|:+$/gu, "");
+  return name && /^[a-z0-9_+-]+$/u.test(name) ? name : undefined;
 }
 
 function cancelKeywords(value: string | undefined): Set<string> {

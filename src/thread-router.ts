@@ -13,6 +13,8 @@ import {
   getSlackReplyContext,
   getIssue,
   listRelayMessageContents,
+  listIssueRuns,
+  isActiveRun,
   type ApiConfig,
 } from "./multica-api.js";
 import type { MentionMatch } from "./mentions.js";
@@ -46,6 +48,8 @@ export interface ThreadRouterConfig extends ApiConfig {
   readContext: (event: SlackThreadEvent, options?: ContextReadOptions) => Promise<ThreadContext>;
   slackReactionToken?: string;
   slackReactionName?: string;
+  slackQueuedReactionName?: string;
+  multicaQueueAgentId?: string;
   slackStatusToken?: string;
 }
 export interface ThreadState {
@@ -145,6 +149,7 @@ export async function routeSlackThreadEvent(
     if (!state.reactionMessages.includes(event.messageTs))
       state.reactionMessages.push(event.messageTs);
     await save();
+    let queued = false;
     const finish = async (
       action: "created" | "comment_persisted" | "duplicate",
     ): Promise<ThreadRouteResult> => {
@@ -158,6 +163,8 @@ export async function routeSlackThreadEvent(
             config.slackReactionName,
             fetchImpl,
           );
+          if (queued && config.slackQueuedReactionName)
+            await addSlackReaction(config.slackReactionToken, event.channelId, event.messageTs, config.slackQueuedReactionName, fetchImpl);
         } catch (error) {
           console.warn("relay_reaction", {
             eventId: digest(messageKey(event)),
@@ -375,6 +382,16 @@ export async function routeSlackThreadEvent(
       )
         throw new Error("ambiguous_comment_create");
       const envelope = await prepare();
+      // Multica runs one task per agent per Issue; a follow-up behind an active run waits its turn.
+      // A redelivery that finds the comment already written skips this check; the marker is cosmetic.
+      if (config.slackQueuedReactionName && config.multicaQueueAgentId) {
+        try {
+          queued = (await listIssueRuns(config, state.issueId, fetchImpl))
+            .some((run) => run.agent_id === config.multicaQueueAgentId && isActiveRun(run));
+        } catch {
+          queued = false;
+        }
+      }
       await config.store.set(
         msgKey,
         JSON.stringify({ phase: "writing" }),
