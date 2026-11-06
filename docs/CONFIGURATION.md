@@ -20,8 +20,8 @@ Slack ID 使用逗号分隔的大写标识符。`SLACK_TARGET_USER_IDS` 与 `SLA
 | `SLACK_BLOCKED_CHANNEL_IDS` | 否 | 永不触发的 Channel ID；即使 allowlist 为 `all` 也优先阻止。 |
 | `SLACK_ALLOWED_SENDER_IDS` | 否 | 允许触发的 User ID。缺失或留空等同 `all`；owner-only 部署应填写 owner 的准确 ID。 |
 | `SLACK_BLOCKED_SENDER_IDS` | 否 | 永不允许触发的 User ID。 |
-| `SLACK_BOT_TOKEN` | 条件必填 | reaction 添加、查询和清理优先使用的 Bot 身份，需 reactions:read/write。 |
-| `SLACK_USER_TOKEN` | 条件必填 | 未配置 Bot 时用于 reaction 的 User 身份。 |
+| `SLACK_BOT_TOKEN` | 条件必填 | 作者身份查询及 reaction 添加、查询和清理优先使用的 Bot 身份，需 users:read 和 reactions:read/write。 |
+| `SLACK_USER_TOKEN` | 条件必填 | 未配置 Bot 时用于作者身份查询及 reaction 的 User 身份。 |
 | `SLACK_CANCEL_KEYWORDS` | 否 | 逗号分隔的完整取消关键词，默认 cancel,取消。 |
 | `SLACK_CONTEXT_TOKEN` | 是 | 带目标会话 history scopes 的 user token。consumer 用它读取有界 history/replies；如需通过 `users.info` 补充参与者姓名，还需 `users:read`。可以与 reaction 使用同一个已授权 token，但必须显式配置。 |
 | `SLACK_REACTION_NAME` | 是 | 不带冒号的 Slack emoji shortcode，例如 `eyes`。reaction 只确认 Relay 已持久化，不证明 Agent 已完成。 |
@@ -66,7 +66,7 @@ Relay 在发布到 QStash 前，把每个 Slack file object 投影为 `id`、`na
 
 取消意图、run ID 集合和清理进度与原线程映射一起保存在 Redis；重试只处理原 run 集合。取消期间收到的普通消息被忽略；结束后新 mention 可继续原 Issue。回读 run 终态后仅清理所选身份自己的 reaction，其他人的表情保留。`cancelled` 证明 Multica 状态及中断请求，不是独立的 daemon 停止确认，也不会撤销已完成的外部写入。
 
-reaction 添加、查询和清理统一使用非空 `SLACK_BOT_TOKEN`，未配置时使用 `SLACK_USER_TOKEN`。所选身份需要 `reactions:read`、`reactions:write` 和目标频道访问权；调用失败不会换身份。上下文仍用 `SLACK_CONTEXT_TOKEN`，Agent 最终回复仍使用 Runtime 自己的 user token。
+作者身份查询及 reaction 添加、查询和清理统一使用非空 `SLACK_BOT_TOKEN`，未配置时使用 `SLACK_USER_TOKEN`。所选身份需要 `users:read`、`reactions:read`、`reactions:write` 和目标频道访问权；调用失败不会换身份。上下文仍用 `SLACK_CONTEXT_TOKEN`，Agent 最终回复仍使用 Runtime 自己的 user token。
 
 旧 `SLACK_REACTION_TOKEN` / `SLACK_REACTION_READ_TOKEN` 不再读取。升级前将现有凭据按原身份配置到新变量，确认后再切换代码；旧变量可保留给旧部署回滚使用。若从 User 切到 Bot，历史 User reaction 保留。回滚取消功能前应先处理队列内 `operation=cancel` 的消息，避免旧消费者将其当普通请求。QStash 重试耗尽时保留 DLQ 责任，不删除 Redis 状态来强行重发。
 
@@ -194,3 +194,27 @@ Cloudflare 沿用现有 QStash 和 Upstash Redis，不使用 Cloudflare Queues�
 ## 每日 / 周度工作流
 
 值守脚本与角色模板见 [配置与发布](duty/SETUP.md) 和 [角色入口](../prompts/README.md)。固定本仓脚本版本，显式配置工作区、Agent、工具路径与通知目标。每轮两调查工位、全局串行修复、失败有界跳过和独立只读看板由各自协议负责。
+
+## 作者身份与静默清理
+
+mention 通过准入策略后，入口调用 `users.info`，以 `user.is_bot` 判断作者。真人使用 User token 发言时附带的 `bot_id`、`app_id` 或 `bot_message` 元数据不再单独导致拒绝。查询失败在入队前返回可重试 503；身份查询预算 700 ms，入站与队列发布共享 2750 ms 时间预算。部署前核对所选身份具有 `users:read`。
+
+静默任务的私有 adapter JSON 可配置：
+
+```json
+{"startReaction":{"name":"eyes","userId":"U_OWNER","tokenEnv":"SLACK_USER_TOKEN"}}
+```
+
+使用真实核验的 ID 和原添加身份。执行 `scripts/slack-reply.py --config <配置> --issue-id <Issue> --clear-start-reaction`，后续请求附本轮 `--comment-id`；`--dry-run` 只读。adapter 回读来源、认证指定身份，只移除当前触发消息上该身份的指定表情，并独立回读确认。配置缺失时保持停用。此功能只负责清理，reaction 触发的拟议方案见 [触发与授权设计](TRIGGER-AUTHORIZATION.md)。
+
+入口在作者查询前忽略符合本仓确定性回复布局的 Relay 消息，避免 User token 回复中 mention 本人时再次启动任务。
+
+## 原生运行状态与停止
+
+`SLACK_STATUS_TOKEN` 使用同一 Slack App 的 granular Bot token，需要 `chat:write`；它与 reaction、最终正文的身份分开。订阅 `agent_session_stopped`，并确保 Bot 已加入目标频道。`SLACK_CONTROL_USER_IDS` 指定取消控制人；未配置时沿用 mention target，空值关闭控制入口。原生停止独立于 mention sender allowlist，继续遵守频道策略和全局 blocklist，队列消费时再次校验。
+
+Relay 在新任务投递前设置 processing，重复事件保持当前状态；核验取消完成后设置 active。私有 adapter 配置 `sessionStatus: {"userId":"U_BOT","tokenEnv":"SLACK_BOT_TOKEN"}` 后，最终回复及静默清理尝试结束状态，同一 Issue 有其他活动 run 时保留 processing。`--session-status processing|suspended|active` 支持定时任务和等待用户决定。状态 API 失败只报告展示缺口，保持已有交付回执；硬中断的 run 可能留下状态，需显式清理或等待 Slack 超时。
+
+## 定时交付
+
+时间 wakeup 使用原 adapter 命令并加 `--wakeup-run`。adapter 从 `MULTICA_TASK_ID` 核对真实 running run、实际规则及原 Relay 来源，以 wakeup + run 作为独立交付标识；原频道和 thread 保持固定。普通事件沿用现有 ledger key。同一次 run 重试复用回执，新 run 是新交付；业务周期去重仍由工作流按实际回执维护。既有禁用规则保持禁用。

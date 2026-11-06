@@ -19,6 +19,123 @@ CONFIG = {'displayName': '🤖 Example', 'agentId': 'A1', 'teamId': 'T1'}
 EVENT = {'teamId': 'T1', 'channelId': 'C1', 'threadTs': '100.000001'}
 
 
+class StartReactionTests(unittest.TestCase):
+    config = {'teamId': 'T1', 'startReaction': {'name': 'eyes', 'userId': 'U1', 'tokenEnv': 'SLACK_USER_TOKEN'}}
+    envelope = {'eventPayload': {'teamId': 'T1', 'channelId': 'C1', 'messageTs': '2.000001', 'threadTs': '1.000001'}}
+
+    def message(self, users):
+        return {'ok': True, 'type': 'message', 'channel': 'C1', 'message': {
+            'ts': '2.000001', 'reactions': [{'name': 'eyes', 'users': users, 'count': len(users)},
+                                         {'name': 'heart', 'users': ['U1'], 'count': 1}]}}
+
+    def run_cleanup(self, replies, dry_run=False):
+        with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'test'}), patch.object(reply, 'slack_call', side_effect=replies) as call:
+            result = reply.clear_start_reaction(self.config, self.envelope, dry_run)
+        return result, call
+
+    def test_removes_only_configured_actor_emoji_on_current_message_and_verifies(self):
+        result, call = self.run_cleanup([{'user_id': 'U1', 'team_id': 'T1'}, self.message(['U1', 'U2']), {'ok': True}, self.message(['U2'])])
+        self.assertEqual(result, {'ok': True, 'action': 'removed'})
+        self.assertEqual([c.args[1] for c in call.call_args_list], ['auth.test', 'reactions.get', 'reactions.remove', 'reactions.get'])
+        self.assertEqual(call.call_args_list[2].kwargs['payload'], {'channel': 'C1', 'timestamp': '2.000001', 'name': 'eyes'})
+
+    def test_wrong_actor_prevents_read_and_remove(self):
+        with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'test'}), patch.object(reply, 'slack_call', return_value={'user_id': 'U2', 'team_id': 'T1'}) as call:
+            with self.assertRaisesRegex(ValueError, 'reaction_actor_mismatch'):
+                reply.clear_start_reaction(self.config, self.envelope)
+            self.assertEqual(call.call_count, 1)
+
+    def test_already_absent_and_dry_run_make_no_writes(self):
+        for users, dry_run, action in [(['U2'], False, 'already_absent'), (['U1'], True, 'would_remove')]:
+            result, call = self.run_cleanup([{'user_id': 'U1', 'team_id': 'T1'}, self.message(users)], dry_run)
+            self.assertEqual(result['action'], action)
+            self.assertEqual(call.call_count, 2)
+
+    def test_uncertain_remove_reads_back_without_repeating_write(self):
+        result, call = self.run_cleanup([{'user_id': 'U1', 'team_id': 'T1'}, self.message(['U1']), TimeoutError(), self.message([])])
+        self.assertEqual(result['action'], 'removed')
+        self.assertEqual(sum(c.args[1] == 'reactions.remove' for c in call.call_args_list), 1)
+
+    def test_still_present_after_remove_is_not_success(self):
+        with self.assertRaisesRegex(ValueError, 'reaction_cleanup_unverified'):
+            self.run_cleanup([{'user_id': 'U1', 'team_id': 'T1'}, self.message(['U1']), {'ok': True}, self.message(['U1'])])
+
+    def test_other_message_or_channel_cannot_be_cleaned(self):
+        for key in ['ts', 'channel']:
+            data = self.message(['U1'])
+            if key == 'ts': data['message']['ts'] = '1.000001'
+            else: data['channel'] = 'C2'
+            with self.assertRaisesRegex(ValueError, 'reaction_message_mismatch'):
+                self.run_cleanup([{'user_id': 'U1', 'team_id': 'T1'}, data])
+
+    def test_missing_config_or_cross_team_source_never_calls_slack(self):
+        for config, envelope, code in [({}, self.envelope, 'invalid_start_reaction_config'),
+                (self.config, {'eventPayload': {**self.envelope['eventPayload'], 'teamId': 'T2'}}, 'invalid_reaction_source')]:
+            with patch.object(reply, 'slack_call') as call, self.assertRaisesRegex(ValueError, code):
+                reply.clear_start_reaction(config, envelope)
+            call.assert_not_called()
+
+
+class WakeupDeliveryTests(unittest.TestCase):
+    config = {'workspaceId': 'W1', 'projectId': 'P1', 'agentId': 'A1'}
+    run_id = '11111111-1111-4111-8111-111111111111'
+
+    def source(self, run_changes=None, rule_changes=None, comment_id='C1'):
+        run = {'id': self.run_id, 'issue_id': 'I1', 'workspace_id': 'W1', 'status': 'running',
+               'agent_id': 'A1', 'wakeup_id': 'WUP1', 'trigger_comment_id': 'C1', **(run_changes or {})}
+        rule = {'id': 'WUP1', 'issue_id': 'I1', 'workspace_id': 'W1', 'agent_id': 'A1',
+                'kind': 'cron', 'parent_comment_id': 'C1', **(rule_changes or {})}
+        with patch.object(reply, 'multica_json', side_effect=[[run], rule]), patch.object(reply, 'read_source', return_value={'eventPayload': EVENT}) as read:
+            result = reply.read_wakeup_source(self.config, 'I1', comment_id, self.run_id)
+            read.assert_called_once_with(self.config, 'I1', 'C1', reply.subprocess.run)
+            return result
+
+    def test_scheduled_occurrence_keeps_route_but_has_its_own_stable_delivery_identity(self):
+        envelope, comment_id, occurrence = self.source()
+        self.assertEqual(envelope['eventPayload'], EVENT)
+        self.assertEqual(comment_id, 'C1')
+        original = reply.delivery_identity(self.config, 'I1', 'C1')
+        scheduled = reply.delivery_identity(self.config, 'I1', 'C1', occurrence)
+        self.assertNotEqual(original, scheduled)
+        self.assertEqual(scheduled, reply.delivery_identity(self.config, 'I1', 'C1', occurrence))
+        self.assertNotEqual(scheduled, reply.delivery_identity(self.config, 'I1', 'C1', occurrence + '-next'))
+
+    def test_manual_or_completed_or_foreign_run_cannot_get_a_new_delivery_identity(self):
+        for changes in [{'wakeup_id': None}, {'status': 'completed'}, {'issue_id': 'I2'}, {'workspace_id': 'W2'}]:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'invalid_wakeup_run'):
+                self.source(run_changes=changes)
+
+    def test_rule_and_source_must_match_the_actual_run(self):
+        for changes in [{'agent_id': 'A2'}, {'parent_comment_id': 'OTHER'}, {'kind': 'event'}, {'issue_id': 'I2'}]:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'invalid_wakeup_source'):
+                self.source(rule_changes=changes)
+        with self.assertRaisesRegex(ValueError, 'wakeup_comment_mismatch'):
+            self.source(comment_id='OTHER')
+
+
+class SessionStatusTests(unittest.TestCase):
+    config = {'teamId': 'T1', 'sessionStatus': {'userId': 'U1', 'tokenEnv': 'SLACK_BOT_TOKEN'}}
+    envelope = {'eventPayload': EVENT}
+
+    def test_completed_reply_clears_own_session_using_bot_identity(self):
+        with patch.dict(os.environ, {'SLACK_BOT_TOKEN': 'test', 'MULTICA_TASK_ID': 'R1'}), \
+                patch.object(reply, 'multica_json', return_value=[{'id': 'R1', 'status': 'running'}]), \
+                patch.object(reply, 'slack_call', side_effect=[{'team_id': 'T1', 'user_id': 'U1'}, {'ok': True}]) as call:
+            self.assertEqual(reply.update_session_status(self.config, self.envelope, 'I1', 'active'), 'active')
+            self.assertEqual(call.call_args_list[-1].kwargs['payload'], {'channel_id': 'C1', 'thread_ts': '100.000001', 'status': 'active'})
+
+    def test_older_run_does_not_clear_a_newer_active_run(self):
+        with patch.dict(os.environ, {'SLACK_BOT_TOKEN': 'test', 'MULTICA_TASK_ID': 'R1'}), \
+                patch.object(reply, 'multica_json', return_value=[{'id': 'R1', 'status': 'running'}, {'id': 'R2', 'status': 'queued'}]), \
+                patch.object(reply, 'slack_call') as call:
+            self.assertEqual(reply.update_session_status(self.config, self.envelope, 'I1', 'active'), 'other_run_active')
+            call.assert_not_called()
+
+    def test_presentation_failure_does_not_turn_sent_reply_into_a_send_retry(self):
+        with patch.dict(os.environ, {'SLACK_BOT_TOKEN': 'test'}), patch.object(reply, 'slack_call', side_effect=TimeoutError()):
+            self.assertEqual(reply.update_session_status(self.config, self.envelope, 'I1', 'processing'), 'unavailable')
+
+
 class ReplyTests(unittest.TestCase):
     def test_renders_verified_run_statistics_and_github_association(self):
         context = {'version': 1, 'issue_id': 'I1', 'run_id': 'R1', 'issue_identifier': 'DEMO-12', 'issue_url': 'https://multica.example/demo/issues/I1', 'statistics': {

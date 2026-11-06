@@ -1,3 +1,4 @@
+import { setSlackSessionStatus } from "./slack-session.js";
 import { Buffer } from 'node:buffer';
 import {formatTaskTitle,formatTaskDescription,readTaskEnvelope} from './task-presentation.js';
 import { createHash, randomUUID } from "node:crypto";
@@ -37,12 +38,14 @@ export interface SlackThreadEvent {
   filesTruncated?: boolean;
   sourceFingerprint?: string;
   operation?: "dispatch" | "cancel";
+  trigger?: "native_stop";
 }
 export interface ThreadRouterConfig extends ApiConfig {
   store: ThreadStore;
   readContext: (event: SlackThreadEvent, options?: ContextReadOptions) => Promise<ThreadContext>;
   slackReactionToken?: string;
   slackReactionName?: string;
+  slackStatusToken?: string;
 }
 export interface ThreadState {
   version: 2;
@@ -145,7 +148,7 @@ export async function routeSlackThreadEvent(
       action: "created" | "comment_persisted" | "duplicate",
     ): Promise<ThreadRouteResult> => {
       // 添加和取消清理共用线程锁，避免迟到的启动 reaction 出现在已取消任务上。
-      if (config.slackReactionToken && config.slackReactionName) {
+      if (action !== "duplicate" && config.slackReactionToken && config.slackReactionName) {
         try {
           await addSlackReaction(
             config.slackReactionToken,
@@ -310,6 +313,7 @@ export async function routeSlackThreadEvent(
         state.rootMessageKey = messageKey(event);
         state.creating = true;
         await config.store.set(key, JSON.stringify(state), STATE_TTL_SECONDS);
+        await setSlackSessionStatus(config.slackStatusToken, event, "processing", fetchImpl);
         try {
           const created = await createIssue(
             config,
@@ -327,6 +331,7 @@ export async function routeSlackThreadEvent(
             error.status >= 400 &&
             error.status < 500
           ) {
+            await setSlackSessionStatus(config.slackStatusToken, event, "active", fetchImpl);
             state.creating = false;
             await config.store.set(
               key,
@@ -371,6 +376,7 @@ export async function routeSlackThreadEvent(
         JSON.stringify({ phase: "writing" }),
         STATE_TTL_SECONDS,
       );
+      await setSlackSessionStatus(config.slackStatusToken, event, "processing", fetchImpl);
       try {
         await createComment(
           config,

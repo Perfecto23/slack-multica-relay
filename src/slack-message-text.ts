@@ -3,8 +3,9 @@ function object(value:unknown):value is Record<string,unknown>{
 }
 
 /** Recognize the Relay adapter's complete block layout, never prose keywords. */
-export function agentBody(raw:Record<string,unknown>):string|undefined {
-  if(!raw.bot_id&&!raw.app_id)return;
+export function agentBody(raw:Record<string,unknown>, allowUserToken = false):string|undefined {
+  // User-token events can omit app metadata; admission still recognizes our output layout.
+  if(!allowUserToken&&!raw.bot_id&&!raw.app_id)return;
   const blocks=raw.blocks;
   if(!Array.isArray(blocks)||blocks.length<2||!blocks.every(object))return;
   const last=blocks.at(-1)!;

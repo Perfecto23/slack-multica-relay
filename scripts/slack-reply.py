@@ -207,6 +207,33 @@ def read_source(config, issue_id, comment_id, runner=subprocess.run):
     return envelope_from_text(source)
 
 
+def read_wakeup_source(config, issue_id, comment_id, task_id, runner=subprocess.run):
+    if not isinstance(task_id, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', task_id):
+        raise ValueError('invalid_wakeup_run')
+    runs = multica_json(config, ['issue', 'runs', issue_id], runner)
+    if not isinstance(runs, list):
+        raise ValueError('invalid_wakeup_run')
+    run = next((item for item in runs if isinstance(item, dict) and item.get('id') == task_id), None)
+    if (not run or run.get('issue_id') != issue_id or run.get('workspace_id') != config['workspaceId']
+            or run.get('status') != 'running' or not isinstance(run.get('wakeup_id'), str)):
+        raise ValueError('invalid_wakeup_run')
+    kind, target = reply_assignee(config)
+    if kind == 'agent' and run.get('agent_id') != target:
+        raise ValueError('invalid_wakeup_run')
+    wakeup = multica_json(config, ['issue', 'wakeup', 'get', issue_id, run['wakeup_id']], runner)
+    if (not isinstance(wakeup, dict) or wakeup.get('id') != run['wakeup_id']
+            or wakeup.get('workspace_id') != config['workspaceId'] or wakeup.get('issue_id') != issue_id
+            or wakeup.get('agent_id') != run.get('agent_id')
+            or wakeup.get('parent_comment_id') != run.get('trigger_comment_id')
+            or wakeup.get('kind') not in ('cron', 'every', 'at')):
+        raise ValueError('invalid_wakeup_source')
+    source_comment_id = wakeup.get('parent_comment_id')
+    if comment_id is not None and comment_id != source_comment_id:
+        raise ValueError('wakeup_comment_mismatch')
+    envelope = read_source(config, issue_id, source_comment_id, runner)
+    return envelope, source_comment_id, 'wakeup:' + wakeup['id'] + ':run:' + task_id
+
+
 def multica_json(config, args, runner=subprocess.run, timeout=15):
     command = ['multica', '--server-url', config['serverUrl'],
                '--workspace-id', config['workspaceId'], *args, '--output', 'json']
@@ -256,10 +283,12 @@ def task_attachments(config, issue_id, task_id, runner=subprocess.run):
     return attachments
 
 
-def delivery_identity(config, issue_id, comment_id):
+def delivery_identity(config, issue_id, comment_id, occurrence=None):
     kind, target = reply_assignee(config)
     scope = config.get('threadScopeId') or (target if kind == 'agent' else 'squad:' + target)
     fields = [config['workspaceId'], config['projectId'], scope, issue_id, comment_id or '']
+    if occurrence is not None:
+        fields.append(occurrence)
     return hashlib.sha256('\0'.join(fields).encode()).hexdigest()
 
 
@@ -321,6 +350,100 @@ def slack_call(token, method, payload=None, query=None, opener=urllib.request.ur
             raise ValueError('slack_send_rejected')
         raise ValueError('slack_delivery_unknown')
     return data
+
+
+def update_session_status(config, envelope, issue_id, status, runner=subprocess.run, opener=urllib.request.urlopen):
+    setting = config.get('sessionStatus')
+    if setting is None:
+        return 'disabled'
+    try:
+        if (not isinstance(setting, dict) or setting.get('tokenEnv') != 'SLACK_BOT_TOKEN'
+                or not isinstance(setting.get('userId'), str)):
+            return 'invalid_config'
+        token = os.environ.get(setting['tokenEnv'])
+        if not token:
+            return 'unavailable'
+        if status != 'processing':
+            runs = multica_json(config, ['issue', 'runs', issue_id], runner)
+            current = os.environ.get('MULTICA_TASK_ID')
+            if (not isinstance(runs, list) or not current
+                    or not any(isinstance(r, dict) and r.get('id') == current for r in runs)):
+                return 'unavailable'
+            if any(r.get('id') != current and r.get('status') in
+                   ('running', 'queued', 'dispatched', 'waiting_local_directory') for r in runs):
+                return 'other_run_active'
+        identity = slack_call(token, 'auth.test', opener=opener)
+        if identity.get('user_id') != setting['userId'] or identity.get('team_id') != config['teamId']:
+            return 'actor_mismatch'
+        event = envelope['eventPayload']
+        if event.get('teamId') != config['teamId']:
+            return 'source_mismatch'
+        slack_call(token, 'agents.sessions.setStatus', payload={
+            'channel_id': event['channelId'], 'thread_ts': event['threadTs'], 'status': status}, opener=opener)
+        return status
+    except Exception:
+        return 'unavailable'
+
+
+def clear_start_reaction(config, envelope, dry_run=False, opener=urllib.request.urlopen):
+    setting = config.get('startReaction')
+    if (not isinstance(setting, dict)
+            or not isinstance(setting.get('name'), str)
+            or not re.fullmatch(r'[a-z0-9_+\-]+', setting['name'])
+            or not isinstance(setting.get('userId'), str)
+            or not re.fullmatch(r'[UW][A-Z0-9]+', setting['userId'])
+            or setting.get('tokenEnv') not in ('SLACK_USER_TOKEN', 'SLACK_BOT_TOKEN')):
+        raise ValueError('invalid_start_reaction_config')
+    event = envelope['eventPayload']
+    channel, timestamp = event.get('channelId'), event.get('messageTs')
+    if (not isinstance(channel, str) or not re.fullmatch(r'[CGD][A-Z0-9]+', channel)
+            or not isinstance(timestamp, str) or not re.fullmatch(r'\d+\.\d{1,6}', timestamp)
+            or event.get('teamId') != config.get('teamId')):
+        raise ValueError('invalid_reaction_source')
+    token = os.environ.get(setting['tokenEnv'])
+    if not token:
+        raise ValueError('reaction_token_missing')
+    actor = slack_call(token, 'auth.test', opener=opener)
+    if actor.get('user_id') != setting['userId'] or actor.get('team_id') != config['teamId']:
+        raise ValueError('reaction_actor_mismatch')
+
+    def present():
+        result = slack_call(token, 'reactions.get', query={
+            'channel': channel, 'timestamp': timestamp, 'full': 'true'}, opener=opener)
+        message = result.get('message')
+        if (not isinstance(message, dict) or message.get('ts') != timestamp
+                or result.get('channel') != channel):
+            raise ValueError('reaction_message_mismatch')
+        reactions = message.get('reactions', [])
+        if not isinstance(reactions, list):
+            raise ValueError('invalid_reaction_response')
+        found = False
+        for reaction in reactions:
+            if (not isinstance(reaction, dict) or not isinstance(reaction.get('name'), str)
+                    or not isinstance(reaction.get('users'), list)
+                    or any(not isinstance(user, str) for user in reaction['users'])):
+                raise ValueError('invalid_reaction_response')
+            if reaction['name'] == setting['name'] and setting['userId'] in reaction['users']:
+                found = True
+        return found
+
+    exists = present()
+    if dry_run:
+        return {'ok': True, 'action': 'would_remove' if exists else 'already_absent',
+                'channel': channel, 'ts': timestamp, 'reaction': setting['name'], 'user_id': setting['userId']}
+    if not exists:
+        return {'ok': True, 'action': 'already_absent'}
+    try:
+        slack_call(token, 'reactions.remove', payload={
+            'channel': channel, 'timestamp': timestamp, 'name': setting['name']}, opener=opener)
+    except Exception:
+        # A timeout or no_reaction can follow a successful removal; read back before deciding.
+        if not present():
+            return {'ok': True, 'action': 'removed'}
+        raise ValueError('reaction_cleanup_unverified') from None
+    if present():
+        raise ValueError('reaction_cleanup_unverified')
+    return {'ok': True, 'action': 'removed'}
 
 
 def verify_reply_root(token, envelope, opener=urllib.request.urlopen):
@@ -574,16 +697,42 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     parser.add_argument('--config', required=True)
     parser.add_argument('--issue-id', required=True)
     parser.add_argument('--comment-id')
-    parser.add_argument('--text-file', required=True)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument('--text-file')
+    action.add_argument('--clear-start-reaction', action='store_true')
+    action.add_argument('--session-status', choices=['processing', 'active', 'suspended'])
     parser.add_argument('--run-context-file')
     parser.add_argument('--github-context-file')
     parser.add_argument('--deliver-task-attachments', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--wakeup-run', action='store_true', help='Use the current verified scheduled run as a distinct delivery occurrence')
     args = parser.parse_args(argv)
     config_path = Path(args.config)
     config = json.loads(config_path.read_text())
-    envelope = read_source(config, args.issue_id, args.comment_id, runner)
-    identity = delivery_identity(config, args.issue_id, args.comment_id)
+    occurrence = None
+    if args.wakeup_run:
+        if args.clear_start_reaction:
+            raise ValueError('invalid_cleanup_arguments')
+        envelope, args.comment_id, occurrence = read_wakeup_source(
+            config, args.issue_id, args.comment_id, os.environ.get('MULTICA_TASK_ID'), runner)
+    else:
+        envelope = read_source(config, args.issue_id, args.comment_id, runner)
+    if args.session_status:
+        if args.dry_run:
+            print(json.dumps({'ok': True, 'session_status': args.session_status, 'dry_run': True}))
+        else:
+            status = update_session_status(config, envelope, args.issue_id, args.session_status, runner, opener)
+            print(json.dumps({'ok': status == args.session_status, 'session_status': status}))
+        return
+    if args.clear_start_reaction:
+        if args.run_context_file or args.github_context_file or args.deliver_task_attachments:
+            raise ValueError('invalid_cleanup_arguments')
+        result = clear_start_reaction(config, envelope, args.dry_run, opener)
+        if not args.dry_run:
+            result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
+        print(json.dumps(result))
+        return
+    identity = delivery_identity(config, args.issue_id, args.comment_id, occurrence)
     block_id = 'relay-delivery-' + identity
     stats = run_statistics(args.run_context_file, args.issue_id, os.environ.get('MULTICA_TASK_ID'), config)
     github_rows = github_footers(args.github_context_file, config)
@@ -605,6 +754,8 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         if attachments is not None:
             result['attachments'] = upload_task_attachments(
                 config_path, config, envelope, identity, attachments, runner, token, opener)
+        if config.get('sessionStatus') is not None:
+            result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
         print(json.dumps(result, ensure_ascii=False))
 
     with delivery_lock(lock_path):

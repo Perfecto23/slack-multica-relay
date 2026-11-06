@@ -20,8 +20,8 @@ Slack IDs are comma-separated uppercase identifiers. `SLACK_TARGET_USER_IDS` and
 | `SLACK_BLOCKED_CHANNEL_IDS` | No | Channel IDs that must never trigger, including when the allowlist is `all`. |
 | `SLACK_ALLOWED_SENDER_IDS` | No | User IDs allowed to trigger. Missing or empty values mean `all`; an owner-only deployment should set the exact owner ID. |
 | `SLACK_BLOCKED_SENDER_IDS` | No | User IDs that must never trigger. |
-| `SLACK_BOT_TOKEN` | Conditional | Preferred identity for reaction add/read/remove; requires reactions:read and reactions:write. |
-| `SLACK_USER_TOKEN` | Conditional | Used for reactions when Bot is not configured. |
+| `SLACK_BOT_TOKEN` | Conditional | Preferred identity for author lookup and reaction add/read/remove; requires users:read, reactions:read and reactions:write. |
+| `SLACK_USER_TOKEN` | Conditional | Used for author lookup and reactions when Bot is not configured. |
 | `SLACK_CANCEL_KEYWORDS` | No | Comma-separated whole-command words; defaults to cancel,取消. |
 | `SLACK_CONTEXT_TOKEN` | Yes | User token with history scopes for the selected conversation types. The consumer uses it for bounded history/reply reads; `users:read` enables optional participant names through `users.info`. It may contain the same authorized token as the reaction credential, but configure it explicitly. |
 | `SLACK_REACTION_NAME` | Yes | Slack emoji shortcode without colons, such as `eyes`. The reaction confirms Relay persistence, not Agent completion. |
@@ -66,7 +66,7 @@ A target mention followed by the complete `cancel` or `取消` keyword in the or
 
 Redis persists cancellation intent, the fixed run-ID set, and remaining reaction cleanup with the thread mapping. Retries keep the original targets. Ordinary messages received during cancellation are ignored; later mentions can continue the same Issue. Terminal-state readback precedes cleanup of only the selected identity's own reactions. Multica's cancelled state and interruption request do not independently confirm daemon termination or undo completed external writes.
 
-Reaction add/read/remove consistently select a non-empty `SLACK_BOT_TOKEN`, otherwise `SLACK_USER_TOKEN`. The chosen identity needs `reactions:read`, `reactions:write`, and channel access; API failure never switches identity. Context uses `SLACK_CONTEXT_TOKEN`, while the Agent reply uses its separate Runtime user token.
+Author lookup and reaction add/read/remove consistently select a non-empty `SLACK_BOT_TOKEN`, otherwise `SLACK_USER_TOKEN`. The chosen identity needs `users:read`, `reactions:read`, `reactions:write`, and channel access; API failure never switches identity. Context uses `SLACK_CONTEXT_TOKEN`, while the Agent reply uses its separate Runtime user token.
 
 The old `SLACK_REACTION_TOKEN` and `SLACK_REACTION_READ_TOKEN` are no longer read. Configure the new variable for the existing identity before switching code; retain old variables for rollback if needed. Switching from User to Bot leaves historical User reactions intact. Drain or isolate queued `operation=cancel` events before rolling back, because an old consumer would dispatch them as ordinary tasks. Exhausted retries remain in QStash's DLQ; do not delete Redis state to force a resend.
 
@@ -192,3 +192,27 @@ The designated reply adapter uses private assigneeType="squad" and assigneeId fi
 ## Daily and weekly workflows
 
 See [workflow setup](duty/SETUP.md) and [role templates](../prompts/README.md). Configure all identities and tool paths explicitly, pin the scheduler revision, preserve private persona/style settings, and verify deployment separately from local tests. Daily investigation uses two lanes followed by serial repair; the board distinguishes merged PRs from verified production delivery.
+
+## Author identity and silent cleanup
+
+Ingress calls `users.info` for admitted mention authors. `user.is_bot` determines Bot identity; `bot_id`, `app_id`, and `bot_message` source metadata alone do not exclude a human using a User token. Lookup failure returns retryable 503 before queue publication. The lookup budget is 700 ms; admission shares a 2750 ms budget with the queue publish. Verify `users:read` on the selected identity before deploying.
+
+For silent tasks, the private adapter configuration may include:
+
+```json
+{"startReaction":{"name":"eyes","userId":"U_OWNER","tokenEnv":"SLACK_USER_TOKEN"}}
+```
+
+Use real verified IDs and the original reaction actor. Invoke `scripts/slack-reply.py --config <config> --issue-id <issue> --clear-start-reaction`, adding this event's `--comment-id` for a follow-up. `--dry-run` reads without writing. The adapter resolves the source, authenticates the configured actor, removes only its configured emoji on the triggering message, and independently verifies absence. Missing configuration disables this operation. This cleanup does not subscribe to reaction events. See [trigger and authorization design](TRIGGER-AUTHORIZATION.md) for the proposed event workflow.
+
+Messages matching the existing Relay reply block layout are ignored before author lookup, so a User-token reply that mentions its owner cannot start a reply loop.
+
+## Native status and stop
+
+Set `SLACK_STATUS_TOKEN` to the same Slack App's granular Bot token with `chat:write`. It is separate from reaction and final-reply identities. Subscribe to `agent_session_stopped`; the Bot must be a member of the target channel. `SLACK_CONTROL_USER_IDS` selects stop/cancel users; absent inherits mention targets, an empty value disables controls. Native stops bypass the mention sender allowlist, retain channel and global blocklists, and are checked again after queue delivery.
+
+Relay sets `processing` before dispatching new work; duplicates do not reset it. The verified cancellation path sets `active` after stopping runs. Configure private adapter `sessionStatus` with `{"userId":"U_BOT","tokenEnv":"SLACK_BOT_TOKEN"}`. Final replies and silent cleanup attempt to clear status; another active run on the same Issue preserves processing. `--session-status processing|suspended|active` supports scheduled work and waiting for user input. Status errors report a presentation failure without replaying successful delivery. A crashed run may retain the indicator until explicit cleanup or Slack's timeout.
+
+## Scheduled delivery
+
+For a time wakeup, add `--wakeup-run` to the existing adapter command. The adapter reads `MULTICA_TASK_ID`, verifies the running task, its actual wakeup rule and original Relay source, and uses wakeup + run identity for the receipt. The original channel/thread remain fixed. Normal events retain their existing receipt keys. Duplicate sends in one run reuse its receipt; distinct runs are separate occurrences. Business-period deduplication remains the scheduled workflow's responsibility. Existing disabled rules remain disabled.

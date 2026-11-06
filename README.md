@@ -207,3 +207,7 @@ pnpm lint   # TypeScript typecheck
 ## 许可证
 
 本仓库当前尚未声明开源许可证。源码公开可见不等同于自动授予使用、修改或分发权；在维护者选择并提交 `LICENSE` 前，请勿假定存在这些授权。
+
+## 触发与授权
+
+mention 准入按 Slack 用户身份区分真人与 Bot。静默任务通过配置的原添加身份清理启动表情。Reaction 确认与发布后 Jira 处理见 [设计方案](docs/TRIGGER-AUTHORIZATION.md)，当前尚未接入 reaction 事件触发。

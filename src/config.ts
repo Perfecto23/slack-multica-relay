@@ -5,6 +5,8 @@ export interface RelayConfig extends ApiConfig {
   targetUserIds: Set<string>;
   targetSubteamIds: Set<string>;
   cancelKeywords: Set<string>;
+  controlUserIds: Set<string>;
+  slackStatusToken?: string;
   allowedChannelIds: Set<string>;
   allowAllChannels: boolean;
   blockedChannelIds: Set<string>;
@@ -52,6 +54,8 @@ export function loadRelayConfig(
     targetUserIds,
     targetSubteamIds,
     cancelKeywords: cancelKeywords(env.SLACK_CANCEL_KEYWORDS),
+    controlUserIds: env.SLACK_CONTROL_USER_IDS === undefined ? targetUserIds : ids(env.SLACK_CONTROL_USER_IDS),
+    slackStatusToken: env.SLACK_STATUS_TOKEN?.trim() || undefined,
     multicaApiBaseUrl: https(required(env, "MULTICA_API_BASE_URL")),
     multicaApiToken: required(env, "MULTICA_API_TOKEN"),
     multicaWorkspaceId: required(env, "MULTICA_WORKSPACE_ID"),

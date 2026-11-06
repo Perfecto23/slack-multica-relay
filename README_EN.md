@@ -204,3 +204,7 @@ Role templates keep private persona, style, tool bindings and authorization sepa
 ## License
 
 This repository does not currently declare an open-source license. Public source visibility does not automatically grant permission to use, modify, or distribute the code. Do not assume those rights until the maintainer selects and commits a `LICENSE`.
+
+## Trigger authorization
+
+Mention author admission checks Slack user identity. Silent cleanup uses the configured original reaction actor. Reaction confirmation and post-deploy Jira actions are described in the [proposed design](docs/TRIGGER-AUTHORIZATION.md); event-triggered confirmation is not implemented yet.

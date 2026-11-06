@@ -20,6 +20,13 @@ import {
 import { UpstashThreadStore } from "./thread-store.js";
 import { projectFiles, sourceMessageFingerprint } from "./context-envelope.js";
 
+import { setSlackSessionStatus } from "./slack-session.js";
+import { agentBody } from "./slack-message-text.js";
+import { lookupSlackAuthor, SlackAuthorLookupError } from "./slack-author.js";
+
+export const ADMISSION_BUDGET_MS = 2750;
+export const QUEUE_PUBLISH_BUDGET_MS = 2000;
+
 export function json(value: unknown, status = 200): Response {
   return Response.json(value, { status });
 }
@@ -45,6 +52,12 @@ function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 function admitted(event: SlackThreadEvent, config: RelayConfig): boolean {
+  if (event.trigger === "native_stop")
+    return !!config.slackStatusToken && event.teamId === config.teamId
+      && (config.allowAllChannels || config.allowedChannelIds.has(event.channelId))
+      && !config.blockedChannelIds.has(event.channelId)
+      && config.controlUserIds.has(event.senderUserId)
+      && !config.blockedSenderIds.has(event.senderUserId);
   return (
     event.teamId === config.teamId &&
     (config.allowAllChannels ||
@@ -78,6 +91,7 @@ function parsedEvent(value: unknown): SlackThreadEvent {
     (value.operation !== undefined &&
       value.operation !== "dispatch" &&
       value.operation !== "cancel") ||
+    (value.trigger !== undefined && (value.trigger !== "native_stop" || value.operation !== "cancel" || value.text !== "")) ||
     !record(value.mention) ||
     !["user", "subteam"].includes(String(value.mention.type)) ||
     typeof value.mention.id !== "string"
@@ -186,6 +200,16 @@ export async function acceptSlack(
   if (!record(body)) return json({ error: "invalid_envelope" }, 400);
   if (body.type === "url_verification" && typeof body.challenge === "string")
     return json({ challenge: body.challenge });
+  if (body.type === "event_callback" && record(body.event) && body.event.type === "agent_session_stopped") {
+    let stop: SlackThreadEvent;
+    try {
+      stop = parsedEvent({ teamId: body.team_id, channelId: body.event.channel,
+        messageTs: body.event.event_ts, threadTs: body.event.thread_ts, senderUserId: body.event.user,
+        text: "", mention: { type: "user", id: body.event.user }, operation: "cancel", trigger: "native_stop" });
+    } catch { return json({ error: "invalid_event" }, 400); }
+    if (!admitted(stop, config)) return json({ action: "ignored", reason: "cancel_not_allowed" });
+    return publishSlackEvent(stop, config, start, fetchImpl);
+  }
   if (
     body.type !== "event_callback" ||
     !record(body.event) ||
@@ -193,6 +217,8 @@ export async function acceptSlack(
   )
     return json({ action: "ignored" });
   const event = body.event;
+  if (agentBody(event, true) !== undefined)
+    return json({ action: "ignored", reason: "relay_reply" });
   const mention = findTargetMention(
     event.text as string,
     config.targetUserIds,
@@ -227,9 +253,33 @@ export async function acceptSlack(
     : "dispatch";
   if (
     payload.operation === "cancel" &&
-    !canCancelTask(payload.senderUserId, config.targetUserIds)
+    !canCancelTask(payload.senderUserId, config.controlUserIds)
   )
     return json({ action: "ignored", reason: "cancel_not_allowed" });
+  const authorBudgetMs = ADMISSION_BUDGET_MS - (Date.now() - start);
+  if (authorBudgetMs <= 0)
+    return json({ error: "author_unavailable", retryable: true }, 503);
+  try {
+    const author = await lookupSlackAuthor(payload.senderUserId, config.slackReactionToken, fetchImpl, authorBudgetMs);
+    if (author.isBot) return json({ action: "ignored", reason: "bot_author" });
+  } catch (error) {
+    console.warn("relay_author", {
+      eventId: digest(messageKey(payload)),
+      reason: error instanceof SlackAuthorLookupError ? error.code : "request_failed",
+      durationMs: Date.now() - start,
+    });
+    return json({ error: "author_unavailable", retryable: true }, 503);
+  }
+  // 作者查询与发布共用入站预算，避免独立超时累加超过 Slack 确认窗口。
+  const remainingBudgetMs = ADMISSION_BUDGET_MS - (Date.now() - start);
+  if (remainingBudgetMs <= 0)
+    return json({ error: "queue_unavailable", retryable: true }, 503);
+  return publishSlackEvent(payload, config, start, fetchImpl);
+}
+
+async function publishSlackEvent(payload: SlackThreadEvent, config: RelayConfig, start: number, fetchImpl: typeof fetch): Promise<Response> {
+  const remainingBudgetMs = ADMISSION_BUDGET_MS - (Date.now() - start);
+  if (remainingBudgetMs <= 0) return json({ error: "queue_unavailable", retryable: true }, 503);
   try {
     const response = await fetchImpl(
       config.queueUrl + "/v2/publish/" + config.consumerUrl,
@@ -249,7 +299,7 @@ export async function acceptSlack(
           "Upstash-Flow-Control-Value": "parallelism=1",
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(2000),
+        signal: AbortSignal.timeout(Math.min(QUEUE_PUBLISH_BUDGET_MS, remainingBudgetMs)),
       },
     );
     if (!response.ok) throw new Error("queue_publish_failed");
@@ -323,7 +373,7 @@ export async function consumeQueue(
     : "dispatch";
   if (
     event.operation === "cancel" &&
-    !canCancelTask(event.senderUserId, config.targetUserIds)
+    !canCancelTask(event.senderUserId, config.controlUserIds)
   )
     return json({ action: "ignored", reason: "cancel_not_allowed" });
   const start = Date.now(),
@@ -351,6 +401,8 @@ export async function consumeQueue(
       },
       boundedFetch,
     );
+    if (event.operation === "cancel" && ["cancelled", "no_active_run"].includes(result.action))
+      await setSlackSessionStatus(config.slackStatusToken, event, "active", boundedFetch);
     console.info("relay_dispatch", {
       ...result,
       eventId: digest(messageKey(event)),

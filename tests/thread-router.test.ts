@@ -411,6 +411,19 @@ describe("Team migration", () => {
 
 
 describe("投递成功后的 reaction 诊断", () => {
+  it("重复投递不会重新添加已被静默收尾清理的 reaction", async () => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "eyes";
+    let additions = 0;
+    const fetcher: typeof fetch = (input, init) => {
+      if (String(input).endsWith("/reactions.add")) { additions++; return Promise.resolve(Response.json({ ok: true })); }
+      return f.fetcher(input, init);
+    };
+    await routeSlackThreadEvent(root, f.config, fetcher);
+    await routeSlackThreadEvent(root, f.config, fetcher);
+    expect(additions).toBe(1);
+  });
   it("表情失败不影响建卡，并只记录允许的诊断字段", async () => {
     const f = fixture();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});

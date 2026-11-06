@@ -11,6 +11,14 @@ description: 在 Multica 的 Slack Relay 任务需要向原线程发送已获授
 
 每次先核对当前 Issue、触发 comment、真实 run 和交付角色。Team 的成员将结果交接给指定发送方，复用同一私有 FINAL_REPLY_CONFIG 与持久 ledger；同一来源已有回执时只补缺失附件。私有 styleGuide/emojiGuide 继续是个人表达真源。
 
+## 定时唤醒的独立交付
+
+当前 run 来自 Multica 时间 wakeup 时，在同一个 adapter 命令加 `--wakeup-run`。adapter 使用 `MULTICA_TASK_ID` 回读真实 running run、wakeup 规则和原授权来源，生成独立交付标识，目的地仍来自原来源 envelope。同一 run 的重试复用回执；新 run 单独交付。普通 mention、人工重跑、已结束 run 和事件型 wakeup 保持原协议。周期任务的业务去重（例如每天一次）另外按已批准周期核对结果记录，不通过新 run 绕过同周期约束。
+
+## 原生状态
+
+Relay 普通请求自动展示 processing。定时任务开始时可通过 adapter 的 `--session-status processing --wakeup-run` 设置状态；等待真人决定时在询问送达后设置 suspended。最终正文及附件送达后，adapter 尝试设置 active，并避开同一 Issue 的其他活动 run。状态返回 unavailable 表示展示失败，正文回执仍有效。保持同一配置与来源，不用状态错误重发正文。
+
 ## 回复流程
 
 1. 读取环境变量 `FINAL_REPLY_CONFIG` 指向的私有 adapter JSON。`adapterPath` 是发送脚本路径，`slackCliPath` 是当前 Runtime 已安装的 Slack Skill CLI；若有 `styleGuide`、`emojiGuide`，读取这些本地文件及其必需参考，分别作为个人语气和常用表情真源。没有指定风格时使用 [通用回复风格](references/reply-style.md)。表情选择见 [Emoji 使用](references/emoji-guide.md)；只有常用池不足时才按名称查询配置中的 `emojiCatalog`，不整份加载。

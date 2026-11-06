@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { acceptSlack, consumeQueue, consumerFailure } from "../src/http.js";
+import { acceptSlack, consumeQueue, consumerFailure, ADMISSION_BUDGET_MS } from "../src/http.js";
 import { readContext } from "../src/slack-context.js";
 import { messageFingerprint } from "../src/context-envelope.js";
 vi.mock("@upstash/qstash", () => ({
@@ -55,7 +55,144 @@ const event = {
   ts: "100.000001",
   text: "<@U1> test",
 };
+// Existing routing cases use a human author; dedicated admission cases below exercise identity failures.
+function acceptHumanMessage(req: Request, config: NodeJS.ProcessEnv, fetcher: typeof fetch) {
+  return acceptSlack(req, config, async (input, init) => {
+    if (String(input).startsWith("https://slack.com/api/users.info?")) {
+      const id = new URL(String(input)).searchParams.get("user");
+      return Response.json({ ok: true, user: { id, is_bot: false } });
+    }
+    return fetcher(input, init);
+  });
+}
 afterEach(() => vi.restoreAllMocks());
+describe("native stop admission", () => {
+  const stop = { type: "agent_session_stopped", channel: "C1", thread_ts: "100.000001", event_ts: "101.000001", user: "U1", streaming_message_ts: [] };
+  const statusEnv = { ...env, SLACK_STATUS_TOKEN: "status-token", SLACK_CONTROL_USER_IDS: "U1", SLACK_ALLOWED_SENDER_IDS: "U2" };
+  it("queues owner stop independently from mention allowlist and never looks up message text", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "stop" }));
+    const response = await acceptSlack(request(stop), statusEnv, fetcher);
+    expect(response.status).toBe(200);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetcher.mock.calls[0]?.[1]?.body))).toMatchObject({ operation: "cancel", trigger: "native_stop", senderUserId: "U1", messageTs: "101.000001", threadTs: "100.000001", text: "" });
+  });
+  it.each([{ user: "U2" }, { channel: "C2" }])("ignores unauthorized native stop %j", async change => {
+    const fetcher = vi.fn<typeof fetch>();
+    expect(await (await acceptSlack(request({ ...stop, ...change }), statusEnv, fetcher)).json()).toEqual({ action: "ignored", reason: "cancel_not_allowed" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it("keeps disabled and blocked native controls side-effect free", async () => {
+    for (const config of [env, { ...statusEnv, SLACK_BLOCKED_SENDER_IDS: "U1" }]) {
+      const fetcher = vi.fn<typeof fetch>();
+      await acceptSlack(request(stop), config, fetcher);
+      expect(fetcher).not.toHaveBeenCalled();
+    }
+  });
+  it("rechecks control policy after queue delivery", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const body = JSON.stringify({ teamId: "T1", channelId: "C1", senderUserId: "U2", messageTs: "101.000001", threadTs: "100.000001", text: "", mention: { type: "user", id: "U2" }, operation: "cancel", trigger: "native_stop" });
+    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body }), statusEnv, fetcher);
+    expect(await response.json()).toEqual({ action: "ignored", reason: "policy_changed" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it("rejects a queued native stop relabeled as dispatch", async () => {
+    const body = JSON.stringify({ teamId: "T1", channelId: "C1", senderUserId: "U1", messageTs: "101.000001", threadTs: "100.000001", text: "", mention: { type: "user", id: "U1" }, operation: "dispatch", trigger: "native_stop" });
+    const response = await consumeQueue(new Request(env.RELAY_CONSUMER_URL, { method: "POST", body }), statusEnv, vi.fn<typeof fetch>());
+    expect(await response.json()).toMatchObject({ action: "rejected", error: "invalid_event" });
+  });
+});
+describe("author-based admission", () => {
+  it.each([{}, { bot_id: "B1", app_id: "A1" }])("does not turn its own User-token reply into another task with metadata %j", async (metadata) => {
+    const fetcher = vi.fn<typeof fetch>();
+    const response = await acceptSlack(request({ ...event, user: "U1", ...metadata,
+      blocks: [
+        { type: "section", text: { type: "mrkdwn", text: "<@U1> result" } },
+        { type: "context", block_id: "relay-delivery-" + "a".repeat(64), elements: [{ type: "mrkdwn", text: "Assistant" }] },
+      ],
+    }), env, fetcher);
+    expect(await response.json()).toEqual({ action: "ignored", reason: "relay_reply" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+  it.each([2300, ADMISSION_BUDGET_MS])("bounds author lookup after %i ms already spent reading and admitting", async (elapsed) => {
+    const req = request(event);
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValueOnce(now).mockReturnValue(now + elapsed);
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetcher = vi.fn<typeof fetch>(async (input) => String(input).includes("/users.info?")
+      ? Response.json({ ok: true, user: { id: "U2", is_bot: false } })
+      : Response.json({ messageId: "msg" }));
+    const response = await acceptSlack(req, env, fetcher);
+    if (elapsed === ADMISSION_BUDGET_MS) {
+      expect(response.status).toBe(503);
+      expect(fetcher).not.toHaveBeenCalled();
+    } else {
+      expect(response.status).toBe(200);
+      expect(timeout).toHaveBeenNthCalledWith(1, ADMISSION_BUDGET_MS - elapsed);
+    }
+  });
+  const sourceMetadata = [{}, { bot_id: "B1" }, { app_id: "A1" }, { subtype: "bot_message" },
+    { bot_id: "B1", app_id: "A1", subtype: "bot_message" }];
+  it.each(sourceMetadata)("admits human messages regardless of source metadata %j", async (metadata) => {
+    const fetcher = vi.fn<typeof fetch>(async (input) =>
+      String(input).includes("/users.info?")
+        ? Response.json({ ok: true, user: { id: "U2", is_bot: false } })
+        : Response.json({ messageId: "msg" }));
+    const response = await acceptSlack(request({ ...event, ...metadata }), env, fetcher);
+    expect(await response.json()).toEqual({ action: "accepted", queueMessageId: "msg" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(fetcher.mock.calls[1]?.[1]?.body))).toMatchObject({ senderUserId: "U2", operation: "dispatch" });
+  });
+  it.each(sourceMetadata)("rejects bot authors regardless of source metadata %j", async (metadata) => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ ok: true, user: { id: "U2", is_bot: true } }));
+    const response = await acceptSlack(request({ ...event, ...metadata }), env, fetcher);
+    expect(await response.json()).toEqual({ action: "ignored", reason: "bot_author" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0]?.[0])).toContain("/users.info?user=U2");
+  });
+  it.each([
+    { ok: false, error: "missing_scope" },
+    { ok: true, user: { id: "U2" } },
+    { ok: true, user: { id: "UOTHER", is_bot: false } },
+  ])("returns retryable 503 without publishing an unknown author %j", async (body) => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(body));
+    const response = await acceptSlack(request(event), env, fetcher);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: "author_unavailable", retryable: true });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it("does not publish after a network failure or leak its details", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fetcher = vi.fn<typeof fetch>().mockRejectedValue(new Error("private upstream data"));
+    expect((await acceptSlack(request(event), env, fetcher)).status).toBe(503);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("private upstream data");
+  });
+  it("uses the configured Bot token for lookup when present", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ ok: true, user: { id: "U2", is_bot: true } }));
+    await acceptSlack(request(event), { ...env, SLACK_BOT_TOKEN: "bot-test" }, fetcher);
+    expect(fetcher.mock.calls[0]?.[1]?.headers).toMatchObject({ authorization: "Bearer bot-test" });
+  });
+  it.each([1000, ADMISSION_BUDGET_MS])("limits queue work after %i ms spent before publishing", async (elapsed) => {
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).includes("/users.info?")) {
+        now += elapsed;
+        return Response.json({ ok: true, user: { id: "U2", is_bot: false } });
+      }
+      return Response.json({ messageId: "msg" });
+    });
+    const response = await acceptSlack(request(event), env, fetcher);
+    if (elapsed === ADMISSION_BUDGET_MS) {
+      expect(response.status).toBe(503);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    } else {
+      expect(response.status).toBe(200);
+      expect(timeout).toHaveBeenLastCalledWith(ADMISSION_BUDGET_MS - elapsed);
+    }
+  });
+});
 describe("durable admission", () => {
   it.each(["invalid_event","invalid_thread_state","ambiguous_issue_mapping","invalid_issue_scope","invalid_context_scope",
     "context_request_too_large","task_presentation_too_large","comment_lookup_limit"])("acknowledges permanent consumer rejection %s",async(code)=>{
@@ -75,7 +212,7 @@ describe("durable admission", () => {
     const fetcher = vi
       .fn<typeof fetch>()
       .mockResolvedValue(Response.json({ messageId: "msg" }));
-    const response = await acceptSlack(request(event), env, fetcher);
+    const response = await acceptHumanMessage(request(event), env, fetcher);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
       action: "accepted",
@@ -92,7 +229,7 @@ describe("durable admission", () => {
     const files=[{id:"F1",name:"photo.png",mimetype:"image/png",size:12,
       url_private:"https://private.test/file",thumb_360:"https://private.test/thumb",shares:{private:{}}},
       ...Array.from({length:5},(_,i)=>({id:`F${i+2}`,name:`${i+2}.png`,mimetype:"image/png"}))];
-    await acceptSlack(request({...event,files}),env,fetcher);
+    await acceptHumanMessage(request({...event,files}),env,fetcher);
     const queued=JSON.parse(String(fetcher.mock.calls[0]![1]?.body));
     expect(queued.files).toHaveLength(6);expect(queued.files[0]).toEqual({id:"F1",name:"photo.png",mime:"image/png",size:12,contentStatus:"not_loaded"});
     expect(queued.filesTruncated).toBeUndefined();
@@ -112,23 +249,22 @@ describe("durable admission", () => {
     { channel: "C2" },
     { user: undefined },
     { text: "ordinary", thread_ts: "1.000001" },
-    { bot_id: "B1" },
     { subtype: "message_changed" },
   ])("no queue side effects for %j", async (change) => {
     const fetcher = vi.fn<typeof fetch>();
-    await acceptSlack(request({ ...event, ...change }), env, fetcher);
+    await acceptHumanMessage(request({ ...event, ...change }), env, fetcher);
     expect(fetcher).not.toHaveBeenCalled();
   });
   it("rejects another Slack team", async () => {
     const f = vi.fn<typeof fetch>();
-    await acceptSlack(request(event, "T2"), env, f);
+    await acceptHumanMessage(request(event, "T2"), env, f);
     expect(f).not.toHaveBeenCalled();
   });
   it("accepts all as an explicit channel allowlist", async () => {
     const f = vi
       .fn<typeof fetch>()
       .mockResolvedValue(Response.json({ messageId: "msg" }));
-    const response = await acceptSlack(
+    const response = await acceptHumanMessage(
       request({ ...event, channel: "C2" }),
       { ...env, SLACK_ALLOWED_CHANNEL_IDS: "all" },
       f,
@@ -141,13 +277,13 @@ describe("durable admission", () => {
     async (value) => {
       const f = vi.fn<typeof fetch>();
       const candidate = { ...env, SLACK_ALLOWED_CHANNEL_IDS: value };
-      expect((await acceptSlack(request(event), candidate, f)).status).toBe(500);
+      expect((await acceptHumanMessage(request(event), candidate, f)).status).toBe(500);
       expect(f).not.toHaveBeenCalled();
     },
   );
   it("blocks a channel even when the allowlist is all", async () => {
     const f = vi.fn<typeof fetch>();
-    const response = await acceptSlack(
+    const response = await acceptHumanMessage(
       request({ ...event, channel: "C2" }),
       {
         ...env,
@@ -164,7 +300,7 @@ describe("durable admission", () => {
   });
   it("applies sender policy", async () => {
     const f = vi.fn<typeof fetch>();
-    await acceptSlack(
+    await acceptHumanMessage(
       request(event),
       { ...env, SLACK_ALLOWED_SENDER_IDS: "U3" },
       f,
@@ -173,7 +309,7 @@ describe("durable admission", () => {
   });
   it("blocks a sender even when the sender allowlist is all", async () => {
     const f = vi.fn<typeof fetch>();
-    const response = await acceptSlack(
+    const response = await acceptHumanMessage(
       request(event),
       {
         ...env,
@@ -191,7 +327,7 @@ describe("durable admission", () => {
   it("keeps Slack retry ownership when queue publish fails", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const f = vi.fn<typeof fetch>().mockRejectedValue(new Error("secret body"));
-    const response = await acceptSlack(request(event), env, f);
+    const response = await acceptHumanMessage(request(event), env, f);
     expect(response.status).toBe(503);
     expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain(
       "secret body",
@@ -201,7 +337,7 @@ describe("durable admission", () => {
     const f = vi.fn<typeof fetch>();
     expect(
       (
-        await acceptSlack(
+        await acceptHumanMessage(
           new Request("https://relay.test", { method: "POST", body: "{}" }),
           env,
           f,
@@ -240,20 +376,20 @@ describe("durable admission", () => {
 describe("取消指令的事件路由", () => {
   it("授权取消入队并保存指令类型", async () => {
     const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "cancel-msg" }));
-    const response = await acceptSlack(request({ ...event, user: "U1", text: "<@U1> CANCEL", thread_ts: event.ts }), env, f);
+    const response = await acceptHumanMessage(request({ ...event, user: "U1", text: "<@U1> CANCEL", thread_ts: event.ts }), env, f);
     expect(response.status).toBe(200);
     expect(JSON.parse(String(f.mock.calls[0]![1]!.body))).toMatchObject({ operation: "cancel", senderUserId: "U1" });
   });
   it("非目标用户的取消指令不会入队或作为新任务处理", async () => {
     const f = vi.fn<typeof fetch>();
-    const response = await acceptSlack(request({ ...event, text: "<@U1> 取消" }), env, f);
+    const response = await acceptHumanMessage(request({ ...event, text: "<@U1> 取消" }), env, f);
     expect(await response.json()).toEqual({ action: "ignored", reason: "cancel_not_allowed" });
     expect(f).not.toHaveBeenCalled();
   });
   it("自定义关键词替换默认值，普通讨论仍入队为 dispatch", async () => {
     for (const [text, operation] of [["<@U1> stop", "cancel"], ["<@U1> cancel", "dispatch"], ["<@U1> 帮我取消", "dispatch"]]) {
       const f = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ messageId: "msg" }));
-      await acceptSlack(request({ ...event, user: "U1", text }), { ...env, SLACK_CANCEL_KEYWORDS: "stop,停止" }, f);
+      await acceptHumanMessage(request({ ...event, user: "U1", text }), { ...env, SLACK_CANCEL_KEYWORDS: "stop,停止" }, f);
       expect(JSON.parse(String(f.mock.calls[0]![1]!.body)).operation).toBe(operation);
     }
   });
