@@ -195,7 +195,7 @@ def read_source(config, issue_id, comment_id, runner=subprocess.run):
 
 
 def read_reply_source(config, issue_id, comment_id, runner=subprocess.run):
-    """Return (envelope, kind); kind is 'relay' or 'owner_comment'."""
+    """Return (envelope, kind); kind is 'relay', 'owner_comment' or 'handoff'."""
     issue = multica_json(config, ['issue', 'get', issue_id], runner)
     kind, target = reply_assignee(config)
     assigned = (issue.get('assignee_type'), issue.get('assignee_id'))
@@ -230,6 +230,15 @@ def read_reply_source(config, issue_id, comment_id, runner=subprocess.run):
                 and row.get('issue_id') == issue_id
                 and isinstance(source, str) and source.startswith('<!-- relay-thread:')):
             return envelope_from_text(source), 'owner_comment'
+        # A squad member hands its result back to the leader with its own comment. The reply still
+        # answers the Slack request that started the comment thread, or the Issue's first request.
+        if kind == 'squad' and row.get('author_type') == 'agent' and row.get('issue_id') == issue_id:
+            root = next((r for r in rows if isinstance(r, dict) and not r.get('parent_id')), None)
+            root_content = root.get('content', '') if root else ''
+            if isinstance(root_content, str) and root_content.startswith('<!-- relay-message:'):
+                return envelope_from_text(root_content), 'handoff'
+            if isinstance(source, str) and source.startswith('<!-- relay-thread:'):
+                return envelope_from_text(source), 'handoff'
         raise ValueError('invalid_relay_source')
     if not source.startswith('<!-- relay-thread:'):
         raise ValueError('invalid_relay_source')
@@ -825,8 +834,8 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     if args.clear_start_reaction:
         if args.run_context_file or args.github_context_file or args.deliver_task_attachments:
             raise ValueError('invalid_cleanup_arguments')
-        if source_kind == 'owner_comment':
-            # Owner comments never get a Relay start reaction; the root message's belongs to its own run.
+        if source_kind in ('owner_comment', 'handoff'):
+            # Only Relay messages get a start reaction; the root message's belongs to its own run.
             result = {'ok': True, 'action': 'not_applicable'}
         else:
             result = clear_start_reaction(config, envelope, args.dry_run, opener)

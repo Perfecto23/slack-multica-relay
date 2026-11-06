@@ -929,6 +929,46 @@ class OwnerCommentSourceTests(unittest.TestCase):
 
 
 
+class SquadHandoffTests(unittest.TestCase):
+    config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test',
+              'assigneeType': 'squad', 'assigneeId': 'S1'}
+    first = {'eventPayload': {**EVENT, 'messageTs': '100.000001'}}
+    follow = {'eventPayload': {**EVENT, 'messageTs': '150.000001'}}
+
+    def runner(self, rows, assignee=('squad', 'S1')):
+        def run(command, **_kwargs):
+            if command[5:8] == ['issue', 'get', 'I1']:
+                body = {'workspace_id': 'W1', 'project_id': 'P1', 'assignee_type': assignee[0], 'assignee_id': assignee[1],
+                        'description': '<!-- relay-thread:x -->\n' + json.dumps(self.first)}
+            elif '--tail' in command:
+                body = [r for r in rows if not r.get('parent_id')]
+            else:
+                body = rows
+            return subprocess.CompletedProcess(command, 0, json.dumps(body), '')
+        return run
+
+    def handoff(self, **fields):
+        return {'id': 'H1', 'issue_id': 'I1', 'author_type': 'agent', 'author_id': 'A2', 'parent_id': 'R1', 'content': 'review done', **fields}
+
+    def test_member_handoff_under_a_slack_follow_up_answers_that_follow_up(self):
+        root = {'id': 'R1', 'issue_id': 'I1', 'author_type': 'member', 'content': '<!-- relay-message:x -->\n' + json.dumps(self.follow)}
+        envelope, kind = reply.read_reply_source(self.config, 'I1', 'H1', self.runner([root, self.handoff()]))
+        self.assertEqual((envelope['eventPayload']['messageTs'], kind), ('150.000001', 'handoff'))
+
+    def test_member_handoff_in_an_agent_thread_answers_the_first_request(self):
+        root = {'id': 'R1', 'issue_id': 'I1', 'author_type': 'agent', 'content': 'dispatching'}
+        envelope, kind = reply.read_reply_source(self.config, 'I1', 'H1', self.runner([root, self.handoff()]))
+        self.assertEqual((envelope['eventPayload']['messageTs'], kind), ('100.000001', 'handoff'))
+        self.assertNotEqual(reply.delivery_identity(self.config, 'I1', 'H1'), reply.delivery_identity(self.config, 'I1', None))
+
+    def test_agent_comments_only_count_as_handoffs_for_a_squad(self):
+        root = {'id': 'R1', 'issue_id': 'I1', 'author_type': 'agent', 'content': 'dispatching'}
+        agent_config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test'}
+        with self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
+            reply.read_reply_source(agent_config, 'I1', 'H1', self.runner([root, self.handoff()], ('agent', 'A1')))
+        with self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
+            reply.read_reply_source(self.config, 'I1', 'H1', self.runner([root, self.handoff(author_type='member', author_id='someone')]))
+
 class CurrentRunTests(unittest.TestCase):
     config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test'}
     task = '22222222-2222-4222-8222-222222222222'

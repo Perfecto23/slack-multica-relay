@@ -191,7 +191,7 @@ Cloudflare 沿用现有 QStash 和 Upstash Redis，不使用 Cloudflare Queues�
 
 每次使用缓存映射前回读当前 Issue 的项目、assignee 和 marker。取消只绑定该 Issue、该工作区的活动 run；Team 内多个 Agent 的运行可一起取消，结果不明重试沿原 run ID 集合，新出现的 run 保留并报告。Team 快照 agentId=null、status=unavailable，最终统计来自本次实际 run。
 
-唯一交付角色的私有 adapter JSON 使用 assigneeType="squad"、assigneeId="<Team ID>"。迁移时同步 threadScopeId="<旧Agent ID>" 和必要的 legacyAgentId，保持旧回复的 delivery identity。旧 agentId 配置在单 Agent 模式继续兼容；Team 的 agentId 不作为成员之间的 ledger 隔离键。所有交付角色共享同一 FINAL_REPLY_CONFIG 路径及持久目录；不同机器/配置目录的文件锁不构成全局去重。
+唯一交付角色的私有 adapter JSON 使用 assigneeType="squad"、assigneeId="<Team ID>"。成员把结果写成评论交回 Leader 时，Leader 本轮由该评论触发：adapter 接受同一 Team 的 Agent 评论作为来源，回复该评论线程最初的 Relay 消息，没有时回复 Issue 的首次请求；每条交接评论单独去重。迁移时同步 threadScopeId="<旧Agent ID>" 和必要的 legacyAgentId，保持旧回复的 delivery identity。旧 agentId 配置在单 Agent 模式继续兼容；Team 的 agentId 不作为成员之间的 ledger 隔离键。所有交付角色共享同一 FINAL_REPLY_CONFIG 路径及持久目录；不同机器/配置目录的文件锁不构成全局去重。
 
 此配置改变任务路由，实际上线时核对目标 Team 的 Leader、工程接续和唯一回复责任；Relay 部署、Agent 配置和真实线程验收分别记录。
 
