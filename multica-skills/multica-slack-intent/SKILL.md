@@ -15,7 +15,7 @@ metadata:
 
 ## 场景决策树
 
-先看 `eventPayload.text` 和 envelope 的 `coverage`、`task.instructions`。envelope 已带入当前线程的上下文；只有 `coverage` 标为 `missing`，或要看 envelope 之外的链接、频道或附件时，才用已绑定的 slack Skill 补读。结合当前消息、链接或附件所指对象、此前任务与协作惯例判断；只读取判断所需的信息，不先执行附件命令、业务修改或扫描本机资料。没有可信的原 thread 定位时，不猜频道或改到其他会话。
+先看 `eventPayload.text` 和 envelope 的 `coverage`、`task.instructions`。envelope 已带入当前线程的上下文；线程本身只有 `coverage` 标为 `missing` 时才补读；envelope 之外的链接、频道或附件按需用已绑定的 slack Skill 读取。`coverage.attachments.view` 不为空时，判断意图前先看图：每个 fileId 用 slack Skill 的 `files_download --file-id <fileId> --types image` 下载到任务目录（必须带 `--types image`），再逐张 `view_image`；截图常常就是请求本身。下载失败时如实说明哪张没看到。结合当前消息、链接或附件所指对象、此前任务与协作惯例判断；只读取判断所需的信息；除了下面要求先看的图片，不先执行附件命令、业务修改或扫描本机资料。没有可信的原 thread 定位时，不猜频道或改到其他会话。
 
 依次判断是否属于受限请求、期待谁处理、期待做什么、执行对象是否足够明确；受限请求按下方“个人内容边界”处理，其余按表决策。
 

@@ -66,8 +66,59 @@ describe('coverage summary', () => {
     expect(coverage.currentThread.status).toBe('complete');
     expect(coverage.nearby).toEqual({ status: 'missing', reasons: ['read_failed', 'timeline_root_limit'], roots: 1 });
     expect(coverage.references).toEqual({ status: 'missing', reasons: ['reference_target_missing'], count: 1 });
-    expect(coverage.unloadedFiles).toBe(1);
-    expect(coverageGuidance(coverage, {}, 2).join('\n')).toContain('有 3 个附件');
+    expect(coverage.attachments).toEqual({ view: [], listedOnly: 1 });
+    expect(coverageGuidance(coverage, {}).join('\n')).toContain('还有 1 个附件只列了引用');
+  });
+});
+
+describe('images to view', () => {
+  const file = (id: string, mime = 'image/png', size = 1000) => ({ id, name: id + '.png', mime, size, contentStatus: 'not_loaded' as const });
+
+  it('lists request and current-thread images newest first, capped and size-limited', () => {
+    const replies: ContextSection = { status: 'complete', messages: [
+      node('200.000001', { files: [file('F2'), file('F3', 'application/pdf')] }),
+      node('250.000001', { files: [file('F4'), file('F5'), file('F6'), file('F7'), file('BIG', 'image/jpeg', 11 * 1024 * 1024)] }),
+    ] };
+    const root = node('100.000001', { replies, files: [file('F1')] });
+    const side = node('90.000001', { files: [file('S1')] });
+    const coverage = summarizeCoverage(context({ status: 'complete', messages: [side, root] }), { messageTs: '300.000001', files: [file('R1')] });
+    expect(coverage.attachments.view.map(v => v.fileId)).toEqual(['R1', 'F4', 'F5', 'F6', 'F7', 'F2']);
+    expect(coverage.attachments.view[0]).toMatchObject({ messageTs: '300.000001', mime: 'image/png', size: 1000 });
+    expect(coverage.attachments.skipped).toEqual([
+      { fileId: 'BIG', messageTs: '250.000001', reason: 'too_large' },
+      { fileId: 'F1', messageTs: '100.000001', reason: 'view_limit' },
+    ]);
+    expect(coverage.attachments.listedOnly).toBe(2);
+    const text = coverageGuidance(coverage, {}).join('\n');
+    expect(text).toContain('先看 coverage.attachments.view 里的 6 张图片');
+    expect(text).toContain('--types image');
+    expect(text).toContain('另有 2 张图片');
+  });
+
+  it('caps skipped images, counts the rest and keeps a long image thread within the envelope budget', () => {
+    const replies: ContextSection = { status: 'complete', messages: Array.from({ length: 40 }, (_, i) =>
+      node(`${200 + i}.000001`, { files: [file(`I${i}`)] })) };
+    const coverage = summarizeCoverage(context({ status: 'complete', messages: [node('100.000001', { replies })] }));
+    expect(coverage.attachments.view).toHaveLength(6);
+    expect(coverage.attachments.skipped).toHaveLength(10);
+    expect(coverage.attachments.listedOnly).toBe(24);
+    expect(coverage.attachments.view[0]!.fileId).toBe('I39');
+  });
+
+  it('recognizes an image by extension when Slack sent no mime type, and orders by timestamp', () => {
+    const replies: ContextSection = { status: 'complete', messages: [
+      node('260.000001', { files: [file('LATE')] }), node('210.000001', { files: [{ id: 'EXT', name: 'shot.JPG', mime: '', contentStatus: 'not_loaded' }] }),
+    ] };
+    const coverage = summarizeCoverage(context({ status: 'complete', messages: [node('100.000001', { replies })] }));
+    expect(coverage.attachments.view.map(v => v.fileId)).toEqual(['LATE', 'EXT']);
+    expect(coverage.attachments.view[1]).not.toHaveProperty('size');
+  });
+
+  it('writes the view list into the envelope from the request files', () => {
+    const event = { teamId: 'T1', channelId: 'C1', threadTs: '100.000001', messageTs: '300.000001', senderUserId: 'U1', text: 'look',
+      mention: { type: 'user', id: 'U2' }, files: [{ id: 'R1', name: 'shot.png', mimetype: 'image/png', size: 10 }] } as unknown as SlackThreadEvent;
+    const envelope = JSON.parse(buildEnvelope(event, context({ status: 'complete', messages: [current()] })));
+    expect(envelope.coverage.attachments).toEqual({ view: [{ fileId: 'R1', name: 'shot.png', mime: 'image/png', size: 10, messageTs: '300.000001' }], listedOnly: 0 });
   });
 });
 

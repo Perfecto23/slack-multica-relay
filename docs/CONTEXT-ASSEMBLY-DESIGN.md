@@ -48,7 +48,7 @@ B 为本次 mention；A 为同一 workspace/project/agent/thread 中，时间早
 
 每个区段的 `status` 只有三种：`complete` 是该读取范围读全了；`selected` 是按策略只取了一部分（附近根消息上限、只展开 2 个旁支、旁支回复上限、链接窗口、可选背景的字节预算等），不算缺失；`missing` 是本该有却没拿到（分页或调用预算、限流、权限、根消息缺失、被字节预算挤掉的链接引用等）。`reasons` 记录全部原因，只追加不覆盖。`coveredFromTs/coveredThroughTs` 是实际保留范围，不证明区间之外没有消息。
 
-v6 在顶层加 `coverage`，由 `src/context-coverage.ts` 根据最终交付的树计算：`currentThread`（当前线程是否完整；追问时上次 mention 之前的回复只会经链接进入，被字节预算挤掉时记在 `references`）、`nearby`（附近讨论，含首次背景的 `initialStatus/initialReasons`）、`references`（链接引用）和 `unloadedFiles`。`task.instructions` 由 `coverage` 生成，与数据不会矛盾。附件始终 `not_loaded`，不把附件引用当成已读取内容。v5 及更早的 `truncated/unavailable` + `reason` 在恢复时按同一词汇转换；旧版只保留最后一个原因，转换结果可能低估当时的缺失。
+v6 在顶层加 `coverage`，由 `src/context-coverage.ts` 根据最终交付的树计算：`currentThread`（当前线程是否完整；追问时上次 mention 之前的回复只会经链接进入，被字节预算挤掉时记在 `references`）、`nearby`（附近讨论，含首次背景的 `initialStatus/initialReasons`）、`references`（链接引用）和 `attachments`。`attachments.view` 列出本次请求和当前线程里要先看的图片（从新到旧最多 6 张、单张不超过 10 MB），超出的进 `skipped`（最多 10 条，再多只计数）；背景里的图片和非图片文件只计入 `listedOnly`。Relay 不下载附件：Multica 不会把附件交给模型看，Agent 用 moe-slack `files_download --types image` 下载后用 `view_image` 查看。`task.instructions` 由 `coverage` 生成，与数据不会矛盾。附件始终 `not_loaded`，不把附件引用当成已读取内容。v5 及更早的 `truncated/unavailable` + `reason` 在恢复时按同一词汇转换；旧版只保留最后一个原因，转换结果可能低估当时的缺失。
 
 ## Agent Footer 降噪
 

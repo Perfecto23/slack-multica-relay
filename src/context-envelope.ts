@@ -135,9 +135,9 @@ export function buildEnvelope(event: SlackThreadEvent, input: ThreadContext, rep
   // Coverage and its guidance are recomputed after every byte-budget cut, so they describe what is delivered.
   const result: Record<string, unknown> = { schemaVersion: 6, task: {}, coverage: {}, eventPayload, context, ...(replyContext?{replyContext}:{}) };
   const describe = (): void => {
-    const coverage = summarizeCoverage(context);
+    const coverage = summarizeCoverage(context, { messageTs: event.messageTs, files: eventPayload.files });
     result.coverage = coverage;
-    result.task = { instructions: coverageGuidance(coverage, context, eventPayload.files.length) };
+    result.task = { instructions: coverageGuidance(coverage, context) };
   };
   describe();
   const shrink = (): boolean => {
