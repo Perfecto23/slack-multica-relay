@@ -784,7 +784,7 @@ class ReplyTests(unittest.TestCase):
             reply.read_source(config, 'I1', None, runner)
 
 
-OWNER = '244bf422-d836-43a3-96cf-36533e64d17d'
+OWNER = '9c0ffee0-0000-4000-8000-000000000001'
 
 
 class OwnerCommentSourceTests(unittest.TestCase):
