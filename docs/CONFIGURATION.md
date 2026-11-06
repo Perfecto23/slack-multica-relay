@@ -119,6 +119,8 @@ consumer 在准备消息时使用现有 Multica PAT 读取一次目标 Agent 配
 
 绑定 `multica-skills/multica-final-reply` 后，Agent 在发送前用其中的只读脚本生成当前 run context，并按业务证据选择相关 PR。adapter 通过可选的 `--run-context-file` 和 `--github-context-file` 校验 Issue 归属、统计来源以及 GitHub repository/branch/PR URL 的一致性，再追加运行统计和 GitHub 关联行；没有可核验成果时省略对应行。Agent 不直接控制路由、delivery marker 或重试。
 
+推荐 Agent 只用 `--current-run`：adapter 用 `MULTICA_TASK_ID` 回读当前 running run，从中取触发评论；若是时间 wakeup（`cron`/`every`/`at`），按 `--wakeup-run` 处理；未传 `--run-context-file` 时自动运行同一 release 中的 `run_context.py` 采集统计，失败则省略统计行。手填的 `--comment-id` 必须与 run 的触发评论一致，`--current-run` 不能与 `--wakeup-run` 同用。下文的 `--comment-id`、`--wakeup-run`、`--run-context-file` 仍保留，供调试和兼容使用。
+
 adapter 根据来源 Issue/comment 生成稳定 delivery block ID，并在配置 JSON 旁的 `.slack-reply-state/` 保存私有 delivery ledger。该目录已被 Git 忽略，目录和原子 JSON 使用 owner-only 权限；文件和父目录状态都在 POST 前完成 `fsync`。正文状态依次为 `attempting`、`accepted`、`sent`：Slack 返回的 message timestamp 将发送后验证收窄到新回复，只有 thread readback 成功才进入 `sent`。后续 Runtime 重试直接返回已持久化结果，不扫描旧线程历史。
 
 请求明确要求文件时，Agent 先用本轮 task 的 Multica 评论保存最终附件，再给 adapter 增加 `--deliver-task-attachments`。adapter 只选择 `source_task_id` 等于当前 `MULTICA_TASK_ID` 的附件，下载后核对 size 与 SHA-256，并通过配置的 `slackCliPath` 调用 Slack Skill `files_upload --as user`。每个 attachment ID 使用独立 `attempting/sent` receipt，列表顺序变化或新增附件不重传成功项；未知结果保留上传阶段和已取得的 file ID，不自动重复上传。每个附件上传前重新核对精确根消息，包括正文已送达后的重试；检查后根消息仍可能被删除。Slack Skill 明确标记 `retry_safe: true` 的确定拒绝会清理 intent，修正权限或参数后可再次执行。限制为 20 个文件、单文件 25 MiB、总计 100 MiB。文件上传需要 User token 已获批的 `files:write`；申请待审批时报告权限阻塞，不切换身份。

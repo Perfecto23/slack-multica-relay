@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -926,6 +927,99 @@ class OwnerCommentSourceTests(unittest.TestCase):
         self.assertEqual(posted[0]['thread_ts'], EVENT['threadTs'])
         self.assertEqual([r['duplicate'] for r in results], [False, True])
 
+
+
+class CurrentRunTests(unittest.TestCase):
+    config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test'}
+    task = '22222222-2222-4222-8222-222222222222'
+
+    def resolve(self, run=None, wakeup=None, comment_id=None, task=None):
+        run = {'id': self.task, 'issue_id': 'I1', 'workspace_id': 'W1', 'status': 'running',
+               'trigger_comment_id': 'C7', **(run or {})}
+        replies = [[run]] + ([wakeup] if wakeup is not None else [])
+        with patch.object(reply, 'multica_json', side_effect=replies):
+            return reply.resolve_current_run(self.config, 'I1', comment_id, task or self.task)
+
+    def test_follow_up_uses_the_runs_own_trigger_comment(self):
+        self.assertEqual(self.resolve(), ('C7', False))
+        self.assertEqual(self.resolve(run={'trigger_comment_id': None}), (None, False))
+
+    def test_only_time_wakeups_become_scheduled_occurrences(self):
+        self.assertEqual(self.resolve(run={'wakeup_id': 'WK'}, wakeup={'kind': 'cron'}), ('C7', True))
+        self.assertEqual(self.resolve(run={'wakeup_id': 'WK'}, wakeup={'kind': 'event'}), ('C7', False))
+
+    def test_wrong_or_finished_run_and_mismatched_comment_are_rejected(self):
+        for changes in [{'status': 'completed'}, {'issue_id': 'I2'}, {'workspace_id': 'W2'}]:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'invalid_current_run'):
+                self.resolve(run=changes)
+        with self.assertRaisesRegex(ValueError, 'invalid_current_run'):
+            self.resolve(task='not-a-uuid')
+        with self.assertRaisesRegex(ValueError, 'current_run_comment_mismatch'):
+            self.resolve(comment_id='OTHER')
+
+    def test_main_collects_statistics_and_routes_the_trigger_comment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path, text_path = Path(directory) / 'config.json', Path(directory) / 'body.txt'
+            config_path.write_text(json.dumps(self.config)); text_path.write_text('answer')
+            with patch.object(reply, 'resolve_current_run', return_value=('C7', False)) as resolve, \
+                    patch.object(reply, 'collect_run_context', return_value=None) as collect, \
+                    patch.object(reply, 'read_source', return_value={'eventPayload': {**EVENT, 'messageTs': '101.000001'}}) as read, \
+                    redirect_stdout(io.StringIO()):
+                reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run',
+                            '--text-file', str(text_path), '--dry-run'])
+        resolve.assert_called_once()
+        collect.assert_called_once()
+        self.assertEqual(read.call_args.args[2], 'C7')
+
+    def test_scheduled_cleanup_is_not_applicable_and_wakeup_flag_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps(self.config))
+            base = ['--config', str(config_path), '--issue-id', 'I1', '--current-run']
+            output = io.StringIO()
+            with patch.object(reply, 'resolve_current_run', return_value=('C7', True)), \
+                    patch.object(reply, 'read_wakeup_source', return_value=({'eventPayload': EVENT}, 'C7', 'occ')), \
+                    patch.object(reply, 'update_session_status', return_value='active') as status, \
+                    redirect_stdout(output):
+                reply.main(base + ['--clear-start-reaction'])
+            self.assertEqual(json.loads(output.getvalue()), {'ok': True, 'action': 'not_applicable', 'session_status': 'active'})
+            self.assertEqual(status.call_args.args[3], 'active')
+            with self.assertRaisesRegex(ValueError, 'invalid_current_run_arguments'):
+                reply.main(base + ['--wakeup-run', '--text-file', 'x'])
+
+    def test_failed_statistics_collection_returns_none(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / 'run_context.py'
+            script.write_text('raise SystemExit(1)')
+            failing = lambda command, **kwargs: subprocess.CompletedProcess(command, 1, '', '')
+            self.assertIsNone(reply.collect_run_context('I1', failing, script))
+            self.assertIsNone(reply.collect_run_context('I1', failing, Path(directory) / 'missing.py'))
+
+    def test_collected_statistics_are_removed_and_a_bad_file_never_blocks_the_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path, text_path = Path(directory) / 'config.json', Path(directory) / 'body.txt'
+            config_path.write_text(json.dumps(self.config)); text_path.write_text('answer')
+            stats_dir = Path(tempfile.mkdtemp()); stats = stats_dir / 'run-context.json'
+            stats.write_text(json.dumps({'version': 1, 'issue_id': 'OTHER'}))
+            output = io.StringIO()
+            with patch.object(reply, 'resolve_current_run', return_value=(None, False)), \
+                    patch.object(reply, 'collect_run_context', return_value=str(stats)), \
+                    patch.object(reply, 'read_source', return_value={'eventPayload': {**EVENT, 'messageTs': '101.000001'}}), \
+                    redirect_stdout(output):
+                reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run',
+                            '--text-file', str(text_path), '--dry-run'])
+            self.assertFalse(stats_dir.exists())
+            self.assertEqual(json.loads(output.getvalue())['thread_ts'], EVENT['threadTs'])
+
+    def test_successful_collection_returns_the_written_file(self):
+        def runner(command, **kwargs):
+            Path(command[command.index('--output') + 1]).write_text('{}')
+            return subprocess.CompletedProcess(command, 0, '', '')
+        path = reply.collect_run_context('I1', runner)
+        try:
+            self.assertTrue(Path(path).is_file())
+        finally:
+            shutil.rmtree(Path(path).parent)
 
 
 class TeamReplyTests(unittest.TestCase):

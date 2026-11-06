@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import re
 import stat
 import subprocess
@@ -263,6 +264,50 @@ def read_wakeup_source(config, issue_id, comment_id, task_id, runner=subprocess.
         # A wakeup must descend from a Slack-authorized source; an Agent can schedule one off any comment.
         raise ValueError('invalid_wakeup_source')
     return envelope, source_comment_id, 'wakeup:' + wakeup['id'] + ':run:' + task_id
+
+
+TIME_WAKEUP_KINDS = ('cron', 'every', 'at')
+RUN_CONTEXT_SCRIPT = Path(__file__).resolve().parents[1] / 'multica-skills/multica-final-reply/scripts/run_context.py'
+
+
+def resolve_current_run(config, issue_id, comment_id, task_id, runner=subprocess.run):
+    """Return (trigger comment id, is scheduled wakeup) for the run named by MULTICA_TASK_ID."""
+    if not isinstance(task_id, str) or not re.fullmatch(UUID_PATTERN, task_id):
+        raise ValueError('invalid_current_run')
+    runs = multica_json(config, ['issue', 'runs', issue_id], runner)
+    run = next((item for item in runs if isinstance(item, dict) and item.get('id') == task_id), None) \
+        if isinstance(runs, list) else None
+    if (not run or run.get('issue_id') != issue_id or run.get('workspace_id') != config['workspaceId']
+            or run.get('status') != 'running'):
+        raise ValueError('invalid_current_run')
+    trigger = run.get('trigger_comment_id') or None
+    if comment_id is not None and comment_id != trigger:
+        raise ValueError('current_run_comment_mismatch')
+    scheduled = False
+    if isinstance(run.get('wakeup_id'), str):
+        wakeup = multica_json(config, ['issue', 'wakeup', 'get', issue_id, run['wakeup_id']], runner)
+        # Event wakeups answer their trigger comment like any follow-up; only time wakeups get a new occurrence.
+        scheduled = isinstance(wakeup, dict) and wakeup.get('kind') in TIME_WAKEUP_KINDS
+    return trigger, scheduled
+
+
+def collect_run_context(issue_id, runner=subprocess.run, script=RUN_CONTEXT_SCRIPT):
+    """Best effort: statistics are omitted when collection fails, never block the reply."""
+    if not script.is_file():
+        print(json.dumps({'warning': 'run_context_script_missing'}), file=sys.stderr)
+        return None
+    directory = tempfile.mkdtemp(prefix='relay-run-context-')
+    output = Path(directory) / 'run-context.json'
+    try:
+        # run_context.py may make three 30 s CLI reads.
+        result = runner([sys.executable, str(script), '--issue', issue_id, '--output', str(output)],
+                        capture_output=True, text=True, timeout=100)
+        if result.returncode == 0 and output.is_file():
+            return str(output)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    shutil.rmtree(directory, ignore_errors=True)
+    return None
 
 
 def multica_json(config, args, runner=subprocess.run, timeout=15):
@@ -737,10 +782,30 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     parser.add_argument('--deliver-task-attachments', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--wakeup-run', action='store_true', help='Use the current verified scheduled run as a distinct delivery occurrence')
+    parser.add_argument('--current-run', action='store_true',
+                        help='Derive the trigger comment, scheduled wakeup and run statistics from MULTICA_TASK_ID')
     args = parser.parse_args(argv)
     config_path = Path(args.config)
     config = json.loads(config_path.read_text())
-    occurrence, source_kind = None, 'relay'
+    occurrence, source_kind, collected_context = None, 'relay', None
+    if args.current_run:
+        if args.wakeup_run:
+            raise ValueError('invalid_current_run_arguments')
+        args.comment_id, args.wakeup_run = resolve_current_run(
+            config, args.issue_id, args.comment_id, os.environ.get('MULTICA_TASK_ID'), runner)
+        if args.clear_start_reaction and args.wakeup_run:
+            # A scheduled run has no start reaction of its own; it may still have set processing.
+            envelope = read_wakeup_source(config, args.issue_id, args.comment_id,
+                                          os.environ.get('MULTICA_TASK_ID'), runner)[0]
+            result = {'ok': True, 'action': 'not_applicable'}
+            if not args.dry_run:
+                result['session_status'] = update_session_status(
+                    config, envelope, args.issue_id, 'active', runner, opener)
+            print(json.dumps(result))
+            return
+        if args.text_file and not args.run_context_file:
+            collected_context = collect_run_context(args.issue_id, runner)
+            args.run_context_file = collected_context
     if args.wakeup_run:
         if args.clear_start_reaction:
             raise ValueError('invalid_cleanup_arguments')
@@ -771,7 +836,15 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         return
     identity = delivery_identity(config, args.issue_id, args.comment_id, occurrence)
     block_id = 'relay-delivery-' + identity
-    stats = run_statistics(args.run_context_file, args.issue_id, os.environ.get('MULTICA_TASK_ID'), config)
+    try:
+        stats = run_statistics(args.run_context_file, args.issue_id, os.environ.get('MULTICA_TASK_ID'), config)
+    except (ValueError, OSError):
+        if not collected_context:
+            raise
+        stats = None  # Self-collected statistics are best effort; the reply still goes out.
+    finally:
+        if collected_context:
+            shutil.rmtree(Path(collected_context).parent, ignore_errors=True)
     github_rows = github_footers(args.github_context_file, config)
     payload = render_reply(config, envelope, Path(args.text_file).read_text(), block_id, stats, github_rows)
     attachments = None
