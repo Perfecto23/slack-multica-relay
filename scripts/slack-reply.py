@@ -319,16 +319,24 @@ def collect_run_context(issue_id, runner=subprocess.run, script=RUN_CONTEXT_SCRI
     return None
 
 
-def multica_json(config, args, runner=subprocess.run, timeout=15):
+# The Multica CLI intermittently fails with "Could not reach the Multica server".
+MULTICA_READ_RETRY_DELAYS = (2, 5)
+
+
+def multica_json(config, args, runner=subprocess.run, timeout=15, sleep=time.sleep):
+    """Run a read-only Multica CLI command, retrying transient failures; writes never go through here."""
     command = ['multica', '--server-url', config['serverUrl'],
                '--workspace-id', config['workspaceId'], *args, '--output', 'json']
-    result = runner(command, capture_output=True, text=True, timeout=timeout)
-    if result.returncode:
-        raise ValueError('multica_read_failed')
-    try:
-        return json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError):
-        raise ValueError('multica_read_failed') from None
+    for delay in (*MULTICA_READ_RETRY_DELAYS, None):
+        try:
+            result = runner(command, capture_output=True, text=True, timeout=timeout)
+            if not result.returncode:
+                return json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError, OSError, subprocess.SubprocessError):
+            pass
+        if delay is None:
+            raise ValueError('multica_read_failed')
+        sleep(delay)
 
 
 def task_attachments(config, issue_id, task_id, runner=subprocess.run):

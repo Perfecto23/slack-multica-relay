@@ -990,6 +990,40 @@ class SquadHandoffTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
             reply.read_reply_source(self.config, 'I1', 'H1', self.runner([root, self.handoff(author_type='member', author_id='someone')]))
 
+class MulticaReadRetryTests(unittest.TestCase):
+    config = {'serverUrl': 'https://multica.test', 'workspaceId': 'W1'}
+
+    def read(self, outcomes):
+        calls, sleeps = [], []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            outcome = outcomes[len(calls) - 1]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return subprocess.CompletedProcess(command, outcome[0], outcome[1], '')
+        try:
+            return reply.multica_json(self.config, ['issue', 'get', 'I1'], runner, sleep=sleeps.append), calls, sleeps
+        except ValueError as error:
+            return error, calls, sleeps
+
+    def test_transient_failures_are_retried_until_a_read_succeeds(self):
+        result, calls, sleeps = self.read([(1, ''), subprocess.TimeoutExpired('multica', 15), (0, '{"id": "I1"}')])
+        self.assertEqual(result, {'id': 'I1'})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [2, 5])
+
+    def test_persistent_failure_reports_multica_read_failed(self):
+        result, calls, sleeps = self.read([(1, ''), (0, 'not json'), (1, '')])
+        self.assertEqual(str(result), 'multica_read_failed')
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleeps, [2, 5])
+
+    def test_a_successful_read_runs_once(self):
+        result, calls, sleeps = self.read([(0, '[]')])
+        self.assertEqual((result, len(calls), sleeps), ([], 1, []))
+
+
 class CurrentRunTests(unittest.TestCase):
     config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test'}
     task = '22222222-2222-4222-8222-222222222222'

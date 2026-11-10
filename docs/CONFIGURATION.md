@@ -131,6 +131,8 @@ adapter 根据来源 Issue/comment 生成稳定 delivery block ID，并在配置
 
 发送错误只对已知明确的鉴权、权限、参数或目标拒绝清理 intent。`internal_error`、`fatal_error`、其他服务端/未知错误、非 429 HTTP 错误和损坏响应保留 `attempting`，下一次先回读，不能盲目再次 POST。
 
+adapter 读取 Multica（Issue、评论、run、wakeup）时，CLI 失败、超时或输出无法解析会在 2 秒和 5 秒后各重试一次，三次都失败返回 `multica_read_failed`。这些都是只读请求，Slack 发送不经过这条重试。
+
 HTTP 429 或 JSON `rate_limited`/`ratelimited` 使发送 ledger 进入 `rate_limited`，并保存 `Retry-After` 对应的 `retryAt`。CLI 返回 `slack_rate_limited`、`retryable: true` 和 `retry_after_seconds`；调用方等待后重新执行同一发送命令，等待期内不调用 Slack，到期后允许再次发送。缺失或无效的 Retry-After 使用 60 秒冷却，CLI 不自行睡眠或循环。回读时遇到限流只延后回读，不改变原 `accepted`/`attempting` 状态。
 
 footer appearance 每次发送时都从私有配置读取。`displayName` 是完整 attribution label，可以包含 Unicode emoji 或 Slack shortcode。修改后从下一次发送生效，无需重启 Runtime 或重新部署 Relay；已有消息不会改变。修改时必须保留其他路由和身份字段。

@@ -1,56 +1,59 @@
 ---
 name: multica-final-reply
-description: 在 Multica 的 Slack Relay 任务需要向原线程发送已获授权的最终答复时使用；整理当前 run 统计、任务入口及相关 PR/分支证据，通过确定性 reply adapter 发送。
+description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖成功、失败、阻塞、部分完成和 owner 在 Multica 评论里要求的回复；通过 reply adapter 一条命令发送，附带本轮 PR/分支与附件。
 ---
 
 # Multica 最终回复
 
-适用于成功、失败、阻塞和部分完成。是否回复、业务操作权限和资料披露范围遵循当前任务与 Agent Instructions。此 Skill 不授予 GitHub 写入或额外 Slack 发送权限。Team 中只有指定发送方调用 adapter，其他成员把结果交给它。
+答复只回 Relay 来源的原线程，由 reply adapter 发送。是否回复、能做哪些业务操作、能披露什么，以 Agent Instructions 为准；本 Skill 只负责把已决定的正文送达。Squad 中由 leader 调用 adapter，成员把结果写成 Issue 评论交回 leader。
 
 ## 发送
 
-1. 读取 `FINAL_REPLY_CONFIG` 指向的私有 JSON，取 `adapterPath`。正文语气以 Agent Instructions 为准；日常接话不必读 `styleGuide`，写正式的长消息或英文消息时再读。Agent Instructions 没有写语气时，用 `styleGuide`，没有 `styleGuide` 再用 [通用回复风格](references/reply-style.md)。表情从 `emojiGuide` 挑，没有时用 [Emoji 使用](references/emoji-guide.md)；`emojiCatalog` 只在常用池不够时按名称查。
-2. 把完整正文写进任务私有目录的 UTF-8 文件。正文只写给读者看的内容，不写工具参数、本地路径或 Skill 名。
-3. 本轮实际处理并已核验 PR 或分支时（来自本轮自己的 `gh` 结果或 PR 回读），写 `github-context.json`（格式见下），最多五项；只讨论过的链接、示例和失败操作不算。PR Review/复审另读 [PR 回执](references/pr-review-receipt.md)。
-4. 本轮明确要求交付文件时，先按 [附件交付](references/attachment-delivery.md) 把文件附到本轮 task 的 Multica 评论。
-5. 执行一条命令：
+1. **读配置**：读 `FINAL_REPLY_CONFIG` 指向的私有 JSON，取 `adapterPath`。语气按 Agent Instructions；写正式长消息或英文消息时再读 `styleGuide`。表情从 `emojiGuide` 挑，常用池不够再按名称查 `emojiCatalog`。两者都没配置时，分别用 [通用回复风格](references/reply-style.md) 和 [Emoji 使用](references/emoji-guide.md)。
+2. **写正文**：把完整正文写进任务私有目录的 UTF-8 文件，只写给 Slack 读者看的内容。Footer（统计、任务链接、PR）由 adapter 生成。
+3. **写 GitHub 证据（可选）**：本轮自己用 `gh` 处理并回读过的 PR 或分支，写进 `github-context.json`，最多五项。PR Review/复审另读 [PR 回执](references/pr-review-receipt.md)。
 
-```bash
-python3 <adapterPath> --config "$FINAL_REPLY_CONFIG" --issue-id <当前 Issue UUID> --current-run --text-file <正文文件>
-```
+   ```json
+   {"version": 1,
+    "pullRequests": [{"repository": "owner/repo", "branch": "feature/name", "number": 123, "url": "https://github.com/owner/repo/pull/123"}],
+    "branches": []}
+   ```
 
-有 GitHub 结果加 `--github-context-file <文件>`，有附件加 `--deliver-task-attachments`。
+4. **挂附件（可选）**：请求明确要文件时，按 [附件交付](references/attachment-delivery.md) 先把文件挂到本轮 task 的 Multica 评论。
+5. **发送**：执行一条命令；有 GitHub 证据加 `--github-context-file <文件>`，有附件加 `--deliver-task-attachments`。
 
-`--current-run` 用 `MULTICA_TASK_ID` 回读当前 run，自动决定：回哪条触发评论（Slack 追问或 owner 在 Multica 写的评论）、是不是定时唤醒的新一次交付，并采集运行统计和任务链接。不要再手填 `--comment-id`、`--wakeup-run` 或 `--run-context-file`。统计采集失败时 adapter 省略统计行，正文照常发送。
+   ```bash
+   python3 <adapterPath> --config "$FINAL_REPLY_CONFIG" --issue-id <当前 Issue UUID> --current-run --text-file <正文文件>
+   ```
 
-```json
-{
-  "version": 1,
-  "pullRequests": [
-    {"repository": "owner/repo", "branch": "feature/name", "number": 123, "url": "https://github.com/owner/repo/pull/123"}
-  ],
-  "branches": []
-}
-```
+   `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 的 Multica 评论、成员交回的结果、定时唤醒），并采集统计和任务链接。命令只需要上面这些参数。
+
+完成标准：adapter 返回 `ok: true` 和 `message_ts`；或者按下表处理完错误，并在 Multica 任务结果里写明送达状态。
 
 ## 结果
 
-- `ok: true` 且有 `message_ts` 才算送达；`duplicate: true` 表示这条来源已经发过，不要换参数重发。
-- `slack_rate_limited`：等 `retry_after_seconds` 后用同一命令重试；一直限流就如实说明尚未送达。
-- `slack_delivery_unknown`、`slack_send_unverified`、`slack_attachment_delivery_unknown`：结果不明，先在原线程核对，不能直接重发。
-- `invalid_relay_source`：这条触发既不是 Relay 消息，也不是 owner 本人的 Multica 评论，如实说明，不改发别处。
-- Owner 在 Multica 里写的评论（例如“回 Slack 说……”）是有效请求，照常发送；不要回答“只能从 Slack 进”。
+| 返回 | 含义 | 处理 |
+| --- | --- | --- |
+| `ok: true` + `message_ts` | 已送达 | 完成 |
+| `duplicate: true` | 这条来源已经发过 | 完成，保持原消息 |
+| `multica_read_failed` | adapter 已自动重试，Multica 仍读不到 | 等 30 秒用同一命令再试一次；仍失败就在任务结果写“未送达：Multica 读取失败” |
+| `slack_rate_limited` | Slack 限流 | 等 `retry_after_seconds` 后用同一命令重试；持续限流写明未送达 |
+| `reply_delivery_busy` | 同一来源正在另一个进程发送 | 等 10 秒用同一命令重试 |
+| `reply_failed_verify_before_retry` | 中途出错，可能已经发出 | 用 `moe-slack` 读原线程：消息已在就算送达；没有就用同一命令重试一次（adapter 的发送记录会挡住重复发送） |
+| `slack_delivery_unknown`、`slack_send_unverified`、`slack_attachment_delivery_unknown` | 已发出请求，结果不明；adapter 会锁住这条来源 | 用 `moe-slack` 读原线程：消息已在就算送达；没有就在任务结果写“结果不明，原线程未见消息”，留给本人处理 |
+| `invalid_relay_source` | 触发评论不属于 Relay、owner 或 Squad 成员 | 在任务结果说明；回复只发原线程 |
+
+其他错误码照原样写进任务结果。
 
 ## 原生状态
 
-Relay 入站已自动设置 processing，送达后 adapter 自动复位。等待真人决定时，询问送达后执行 `--current-run --session-status suspended`；定时任务开始时可设 `processing`。状态返回 `unavailable` 只表示展示失败，不影响正文回执。
+Relay 入站时已设为 processing，送达后 adapter 自动复位。正文在请真人做决定时，送达后再执行同一命令，把 `--text-file <正文文件>` 换成 `--session-status suspended`。状态返回 `unavailable` 只影响展示，正文回执照常有效。
 
 ## References
 
-| 文件 | 使用时机 |
+| 文件 | 何时读 |
 | --- | --- |
-| [通用回复风格](references/reply-style.md) | 未配置个人风格真源时 |
-| [Emoji 使用](references/emoji-guide.md) | 选择正文表情时 |
-| [PR 回执](references/pr-review-receipt.md) | PR Review/复审任务，包括未完成或写回失败 |
-| [Footer 展示](references/footer-display.md) | 需要解释 footer 中统计与成果口径时 |
-| [附件交付](references/attachment-delivery.md) | 本轮请求明确要求交付文件时 |
+| [PR 回执](references/pr-review-receipt.md) | PR Review/复审，包括未完成或写回失败 |
+| [附件交付](references/attachment-delivery.md) | 请求明确要文件 |
+| [Footer 展示](references/footer-display.md) | 需要解释 footer 统计和成果口径 |
+| [通用回复风格](references/reply-style.md)、[Emoji 使用](references/emoji-guide.md) | 私有配置没有风格或表情指南 |

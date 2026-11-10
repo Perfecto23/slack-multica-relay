@@ -131,6 +131,8 @@ If the POST result is unknown, a retry searches from five minutes before the loc
 
 Only known, definite authentication, permission, validation, or destination rejections clear the send intent. Internal/fatal server errors, unknown results, non-429 HTTP errors, and malformed responses retain `attempting`; later invocations reconcile by marker before any resend.
 
+When the adapter reads Multica (Issue, comments, runs, wakeups), a CLI failure, timeout or unparsable output is retried after 2 s and again after 5 s; three failures return `multica_read_failed`. These reads are idempotent, and Slack sends never go through this retry.
+
 HTTP 429 or JSON `rate_limited`/`ratelimited` puts the send ledger in `rate_limited` with a persisted `retryAt` derived from `Retry-After`. The CLI reports `slack_rate_limited`, `retryable: true`, and `retry_after_seconds`. The caller waits before running the same source command again; no Slack call occurs during the cooldown, and a send becomes eligible after it expires. Missing or invalid Retry-After uses a 60-second cooldown. The CLI does not sleep or loop. A rate-limited readback preserves the original `accepted`/`attempting` state and only delays reconciliation.
 
 Footer appearance is read from the private configuration on every send. `displayName` is the complete attribution label and may contain Unicode emoji or Slack shortcodes. A change applies to the next send without a Runtime restart or Relay redeploy; existing messages remain unchanged. Preserve every other routing and identity field.
