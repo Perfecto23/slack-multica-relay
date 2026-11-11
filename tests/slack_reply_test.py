@@ -191,19 +191,22 @@ class ReplyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'invalid_footer_stats'):
                 reply.run_statistics(path, 'I1', 'R1', {'footerStats': ['cost']})
 
-    def test_model_labels_replace_configured_model_name(self):
+    def test_model_label_replaces_model_name_for_any_model(self):
         context = {'version': 1, 'issue_id': 'I1', 'run_id': 'R1', 'statistics': {
             'duration_seconds': 90, 'model': 'group/smart-router', 'model_source': 'agent_config',
             'service_tier': 'priority', 'service_tier_source': 'agent_config'}}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'run.json'
             path.write_text(json.dumps(context))
-            stats = reply.run_statistics(path, 'I1', 'R1', {'modelLabels': {'group/smart-router': '小 p 的脑子'}})
-            self.assertEqual(stats, '⏱️ 1m 30s · 🤖 小 p 的脑子 ⚡ Fast')
-            stats = reply.run_statistics(path, 'I1', 'R1', {'modelLabels': {'other': 'x'}})
-            self.assertEqual(stats, '⏱️ 1m 30s · 🤖 group/smart-router ⚡ Fast')
-            with self.assertRaisesRegex(ValueError, 'invalid_model_labels'):
-                reply.run_statistics(path, 'I1', 'R1', {'modelLabels': {'group/smart-router': '<!here>'}})
+            stats = reply.run_statistics(path, 'I1', 'R1', {'modelLabel': '脑子在线'})
+            self.assertEqual(stats, '⏱️ 1m 30s · 🤖 脑子在线 ⚡ Fast')
+            pool = ['甲', '乙', '丙']
+            first = reply.run_statistics(path, 'I1', 'R1', {'modelLabel': pool})
+            self.assertIn(first.split(' · ')[1].split()[1], pool)
+            self.assertEqual(first, reply.run_statistics(path, 'I1', 'R1', {'modelLabel': pool}))
+            self.assertEqual(reply.run_statistics(path, 'I1', 'R1', {}), '⏱️ 1m 30s · 🤖 group/smart-router ⚡ Fast')
+            with self.assertRaisesRegex(ValueError, 'invalid_model_label'):
+                reply.run_statistics(path, 'I1', 'R1', {'modelLabel': '<!here>'})
 
     def test_private_icons_and_verified_branch_without_pr_render_once(self):
         config = {**CONFIG, 'icons': {'github': ':custom_github:'}}

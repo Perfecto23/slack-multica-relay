@@ -87,13 +87,13 @@ def footer_stats(config):
     return set(value)
 
 
-def model_label(config, model):
-    labels = config.get('modelLabels', {})
-    if not isinstance(labels, dict):
-        raise ValueError('invalid_model_labels')
-    value = labels.get(model, model)
+def model_label(config, model, run_id):
+    value = config.get('modelLabel', model)
+    if isinstance(value, list) and value:
+        # The run id picks the label so every render of one run shows the same text.
+        value = value[int(hashlib.sha256(str(run_id).encode()).hexdigest(), 16) % len(value)]
     if not isinstance(value, str) or not 1 <= len(value) <= 80 or re.search(r'[\r\n<>`|]', value):
-        raise ValueError('invalid_model_labels')
+        raise ValueError('invalid_model_label')
     return value
 
 
@@ -117,7 +117,7 @@ def run_statistics(path, issue_id, task_id=None, config=None):
     if ('model' in shown and stats.get('model_source') == 'agent_config' and isinstance(model, str)
             and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}', model)):
         fast = ' ⚡ Fast' if stats.get('service_tier_source') == 'agent_config' and stats.get('service_tier') == 'priority' else ''
-        rendered.append(icon(config, 'model') + ' ' + model_label(config, model) + fast)
+        rendered.append(icon(config, 'model') + ' ' + model_label(config, model, data.get('run_id')) + fast)
     for key in ('tools', 'skills'):
         value = stats.get(key)
         if key in shown and isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 10000:
