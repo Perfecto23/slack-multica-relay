@@ -157,11 +157,12 @@ Publish `multica-skills/multica-final-reply` and bind it to the target Agent. Se
   "emojiGuide": "/path/to/private/emoji/favorites.md",
   "emojiCatalog": "/path/to/private/emoji/catalog.json",
   "icons": {"time": "⏱️", "model": "🤖", "tools": "🔧", "skills": "🪄", "github": "🔗", "multica": "↗️"},
-  "footerStats": ["time", "model", "tools", "skills"]
+  "footerStats": ["time", "model", "tools", "skills"],
+  "modelLabels": {"gpt-6-astra": "Astra"}
 }
 ```
 
-Retain `displayName`, `agentId`, `workspaceId`, `projectId`, `teamId`, and `serverUrl`. Icons may use verified workspace shortcodes. `footerStats` lists the statistics shown on the footer line and defaults to all four; for example, `["time", "model"]` hides tools and skills. A generic reply style applies when no private style is configured; catalogs are searched on demand rather than loaded for every reply.
+Retain `displayName`, `agentId`, `workspaceId`, `projectId`, `teamId`, and `serverUrl`. Icons may use verified workspace shortcodes. `footerStats` lists the statistics shown on the footer line and defaults to all four; for example, `["time", "model"]` hides tools and skills. `modelLabels` maps a configured model name to custom display text (up to 80 characters, shortcodes allowed); unmapped models show their original name, and the Fast marker is still appended. A generic reply style applies when no private style is configured; catalogs are searched on demand rather than loaded for every reply.
 
 Optional `ownerMulticaUserId` is the owner's Multica user UUID (a comment's `author_id`). When set, a Multica comment the owner writes directly on a Relay Issue is a valid `--comment-id` source: the reply goes to the original Slack thread recorded in the Issue description and each comment is deduplicated on its own. Other authors, Agent comments, and non-Relay Issues still return `invalid_relay_source`; these comments have no start reaction, so `--clear-start-reaction` returns `not_applicable`.
 

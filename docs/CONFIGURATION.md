@@ -157,11 +157,12 @@ footer appearance 每次发送时都从私有配置读取。`displayName` 是完
   "emojiGuide": "/path/to/private/emoji/favorites.md",
   "emojiCatalog": "/path/to/private/emoji/catalog.json",
   "icons": {"time": "⏱️", "model": "🤖", "tools": "🔧", "skills": "🪄", "github": "🔗", "multica": "↗️"},
-  "footerStats": ["time", "model", "tools", "skills"]
+  "footerStats": ["time", "model", "tools", "skills"],
+  "modelLabels": {"gpt-6-astra": "Astra"}
 }
 ```
 
-这些是附加字段，保留原 JSON 的 `displayName`、`agentId`、`workspaceId`、`projectId`、`teamId`、`serverUrl`。图标可使用当前 workspace 已确认存在的 shortcode。`footerStats` 列出统计行要显示的项，默认四项全显示，例如只填 `["time", "model"]` 就不显示 tools 和 skills。未指定个人风格时使用通用回复风格；表情库不全量进入每次模型输入。
+这些是附加字段，保留原 JSON 的 `displayName`、`agentId`、`workspaceId`、`projectId`、`teamId`、`serverUrl`。图标可使用当前 workspace 已确认存在的 shortcode。`footerStats` 列出统计行要显示的项，默认四项全显示，例如只填 `["time", "model"]` 就不显示 tools 和 skills。`modelLabels` 把配置模型名换成自定义文字，键是模型名，值最长 80 字符，可含 shortcode；没有对应键时显示原模型名，Fast 标记照常追加。未指定个人风格时使用通用回复风格；表情库不全量进入每次模型输入。
 
 可选的 `ownerMulticaUserId` 填 owner 的 Multica user UUID（评论的 `author_id`）。配置后，owner 在 Relay Issue 上直接写的 Multica 评论可以作为 `--comment-id` 来源：回复发到 Issue 描述记录的原 Slack 线程，每条评论单独去重。其他作者、Agent 评论和非 Relay Issue 仍返回 `invalid_relay_source`；这类评论没有启动表情，`--clear-start-reaction` 返回 `not_applicable`。
 
