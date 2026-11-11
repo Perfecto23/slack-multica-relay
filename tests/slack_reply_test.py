@@ -179,6 +179,18 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(result['blocks'][-1]['elements'][0]['text'], '🤖 Example')
         self.assertIn('PR #123', result['text'])
 
+    def test_footer_stats_limits_rendered_statistics(self):
+        context = {'version': 1, 'issue_id': 'I1', 'run_id': 'R1', 'statistics': {
+            'duration_seconds': 187, 'model': 'gpt-6-astra', 'model_source': 'agent_config',
+            'tools': 18, 'skills': 1}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'run.json'
+            path.write_text(json.dumps(context))
+            stats = reply.run_statistics(path, 'I1', 'R1', {'footerStats': ['time', 'model']})
+            self.assertEqual(stats, '⏱️ 3m 07s · 🤖 gpt-6-astra')
+            with self.assertRaisesRegex(ValueError, 'invalid_footer_stats'):
+                reply.run_statistics(path, 'I1', 'R1', {'footerStats': ['cost']})
+
     def test_private_icons_and_verified_branch_without_pr_render_once(self):
         config = {**CONFIG, 'icons': {'github': ':custom_github:'}}
         github = {'version': 1, 'pullRequests': [], 'branches': [

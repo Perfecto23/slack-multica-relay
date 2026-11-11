@@ -77,6 +77,16 @@ def icon(config, name):
     return value
 
 
+FOOTER_STATS = ('time', 'model', 'tools', 'skills')
+
+
+def footer_stats(config):
+    value = config.get('footerStats', FOOTER_STATS)
+    if not isinstance(value, list | tuple) or any(item not in FOOTER_STATS for item in value):
+        raise ValueError('invalid_footer_stats')
+    return set(value)
+
+
 def run_statistics(path, issue_id, task_id=None, config=None):
     if not path:
         return None
@@ -88,18 +98,19 @@ def run_statistics(path, issue_id, task_id=None, config=None):
     if not isinstance(stats, dict):
         raise ValueError('invalid_run_context')
     config = config or {}
+    shown = footer_stats(config)
     rendered = []
     duration = format_duration(stats.get('duration_seconds'))
-    if duration:
+    if duration and 'time' in shown:
         rendered.append(icon(config, 'time') + ' ' + duration)
     model = stats.get('model')
-    if (stats.get('model_source') == 'agent_config' and isinstance(model, str)
+    if ('model' in shown and stats.get('model_source') == 'agent_config' and isinstance(model, str)
             and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}', model)):
         fast = ' ⚡ Fast' if stats.get('service_tier_source') == 'agent_config' and stats.get('service_tier') == 'priority' else ''
         rendered.append(icon(config, 'model') + ' ' + model + fast)
     for key in ('tools', 'skills'):
         value = stats.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 10000:
+        if key in shown and isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 10000:
             rendered.append(f'{icon(config, key)} {value} {key}')
     identifier, url = data.get('issue_identifier'), data.get('issue_url')
     if isinstance(identifier, str) and re.fullmatch(r'[A-Z][A-Z0-9]{0,31}-[1-9][0-9]{0,15}', identifier) and isinstance(url, str):
