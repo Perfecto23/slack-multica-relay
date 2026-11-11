@@ -31,3 +31,26 @@ it('projects recognized replies without changing message identity or attachment 
   expect(message).toMatchObject({ts:'101.000001',authorId:'U2',origin:'bot_or_app',footerOmitted:true,text:agentBody(raw)});
   expect(message.files).toHaveLength(1);expect(message.files[0]!.id).toBe('F1');
 });
+
+// Shape recorded from chat.postMessage with a markdown block, read back via conversations.history.
+const t=(text:string,style?:Record<string,boolean>)=>({type:'text',text,...(style?{style}:{})});
+const sectionRich=(...elements:unknown[])=>({type:'rich_text_section',elements});
+const cell=(text:string)=>({type:'rich_text',block_id:'c',elements:[sectionRich(t(text))]});
+const storedMarkdown={app_id:'A1',user:'U2',text:'flattened',blocks:[
+  {type:'rich_text',block_id:'a',elements:[sectionRich(t('结论：'),t('\n\n'))]},
+  {type:'header',block_id:'b',text:{type:'plain_text',text:'小标题',emoji:true},level:2},
+  {type:'rich_text',block_id:'d',elements:[
+    sectionRich(t('粗体',{bold:true}),t('、'),t('code',{code:true}),t(' 见 '),{type:'link',url:'https://example.test/pr/1',text:'PR #1'},t('\n\n')),
+    {type:'rich_text_list',style:'bullet',indent:0,elements:[sectionRich(t('一'))]},
+    {type:'rich_text_list',style:'bullet',indent:1,elements:[sectionRich(t('嵌套'))]},
+    {type:'rich_text_list',style:'ordered',indent:0,elements:[sectionRich(t('甲')),sectionRich(t('乙'))]},
+    {type:'rich_text_quote',elements:[t('引用')]}]},
+  {type:'table',block_id:'e',rows:[[cell('项'),cell('结果')],[cell('表格'),cell('正常')]]},
+  {type:'rich_text',block_id:'f',elements:[{type:'rich_text_preformatted',language:'python',elements:[t('print(1)')]},sectionRich(t('\n'),t('表情 '),{type:'emoji',name:'doge'},t(' 好～'))]},
+  context('stats'),context('Sent by Agent',marker)]};
+it('recognizes the rich_text layout Slack stores for a markdown block',()=>{
+  expect(agentBody(storedMarkdown)).toBe('结论：\n## 小标题\n**粗体**、`code` 见 [PR #1](https://example.test/pr/1)\n\n- 一\n  - 嵌套\n1. 甲\n2. 乙\n> 引用\n| 项 | 结果 |\n|---|---|\n| 表格 | 正常 |\n```\nprint(1)\n```\n\n表情 :doge: 好～');
+  expect(agentBody({...storedMarkdown,blocks:[{type:'markdown',text:'**hi**'},context('Sent by Agent',marker)]})).toBe('**hi**');
+  expect(agentBody({...storedMarkdown,blocks:[{type:'rich_text',elements:[{type:'unknown_element'}]},context('Sent by Agent',marker)]})).toBeUndefined();
+  expect(agentBody({...storedMarkdown,blocks:[{type:'rich_text',elements:[sectionRich(t('x'))]},context('Sent by Agent')]})).toBeUndefined();
+});

@@ -105,7 +105,7 @@ A 在本次 Slack 结果中缺失时，使用已持久化 eventPayload 的正文
 
 `replyContext` 与 eventPayload/context 同级，来自经过 Agent/Workspace ID 校验的 Agent 配置快照。每次新消息准备时查询一次，最多 2 秒，失败标记 unavailable；随 envelope 冻结。模型为空/非法时为 null，serviceTier 只接受 priority/default，否则为 null。仅投影模型、档位、来源、身份和采集时间，不传 instructions、凭据或完整配置。
 
-footer 使用每个新事件各自冻结的快照和 `messageTs`；只有配置模型已知且 Agent 匹配时显示。priority 追加 Fast，default/null 不追加 Fast，null 不证明默认档位关闭。查询失败或模型为空时省略模型字段，自动化标识仍由发送适配器追加。scripts/slack-reply.py 从原 Issue/Comment 回读 envelope，从私有配置读取固定显示名，将正文发送为 section blocks，并追加 context/mrkdwn footer；fallback text 同样包含正文和 footer。任务说明只指向运行时发送入口，格式与标识由代码负责，人格 Instructions 不要求模型生成标识。
+footer 使用每个新事件各自冻结的快照和 `messageTs`；只有配置模型已知且 Agent 匹配时显示。priority 追加 Fast，default/null 不追加 Fast，null 不证明默认档位关闭。查询失败或模型为空时省略模型字段，自动化标识仍由发送适配器追加。scripts/slack-reply.py 从原 Issue/Comment 回读 envelope，从私有配置读取固定显示名，将正文发送为一个 markdown block（超过 12000 字时退回 3000 字一段的 mrkdwn section），并追加 context/mrkdwn footer；fallback text 同样包含正文和 footer。任务说明只指向运行时发送入口，格式与标识由代码负责，人格 Instructions 不要求模型生成标识。
 
 
 

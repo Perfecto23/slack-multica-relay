@@ -10,7 +10,7 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
 ## 发送
 
 1. **读配置**：读 `FINAL_REPLY_CONFIG` 指向的私有 JSON，取 `adapterPath`。语气按 Agent Instructions；写正式长消息或英文消息时再读 `styleGuide`。表情从 `emojiGuide` 挑，常用池不够再按名称查 `emojiCatalog`。两者都没配置时，分别用 [通用回复风格](references/reply-style.md) 和 [Emoji 使用](references/emoji-guide.md)。
-2. **写正文**：把完整正文写进任务私有目录的 UTF-8 文件，只写给 Slack 读者看的内容。Footer（统计、任务链接、PR）由 adapter 生成。
+2. **写正文**：把完整正文写进任务私有目录的 UTF-8 文件，只写给 Slack 读者看的内容。用标准 Markdown（`**粗体**`、`[文字](链接)`、列表、表格、代码块），adapter 以 Block Kit markdown block 发送，由 Slack 原生渲染；正文控制在 12000 字以内。Footer（统计、任务链接、PR）由 adapter 生成。
 3. **写 GitHub 证据（可选）**：本轮自己用 `gh` 处理并回读过的 PR 或分支，写进 `github-context.json`，最多五项。PR Review/复审另读 [PR 回执](references/pr-review-receipt.md)。
 
    ```json

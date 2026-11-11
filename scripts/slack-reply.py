@@ -173,6 +173,9 @@ def github_footers(path, config=None):
     return rows
 
 
+MARKDOWN_BLOCK_LIMIT = 12000
+
+
 def render_reply(config, envelope, text, delivery_block_id=None, statistics=None, github_rows=None):
     event = envelope['eventPayload']
     if event.get('teamId') != config['teamId'] or not re.fullmatch(r'[CDG][A-Z0-9]+', event.get('channelId', '')):
@@ -185,7 +188,11 @@ def render_reply(config, envelope, text, delivery_block_id=None, statistics=None
     body = re.sub(r'^\s*' + re.escape(config['displayName']) + r'\s*[:：]\s*', '', body, count=1).strip()
     if not body or len(body) > 35000:
         raise ValueError('invalid_reply_length')
-    blocks = [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': body[i:i + 3000]}} for i in range(0, len(body), 3000)]
+    if len(body) <= MARKDOWN_BLOCK_LIMIT:
+        blocks = [{'type': 'markdown', 'text': body}]
+    else:
+        # Slack caps markdown blocks at 12,000 characters per message; longer bodies fall back to mrkdwn sections.
+        blocks = [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': body[i:i + 3000]}} for i in range(0, len(body), 3000)]
     context_lines = [line for line in [statistics, *(github_rows or []), footer] if line]
     for line in context_lines[:-1]:
         blocks.append({'type': 'context', 'elements': [{'type': 'mrkdwn', 'text': line}]})

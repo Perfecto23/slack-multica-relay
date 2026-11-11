@@ -260,9 +260,9 @@ class ReplyTests(unittest.TestCase):
             self.assertEqual(result['text'], 'hello\n\n' + label)
         config = {**CONFIG, 'displayName': ':wave: Changed'}
         result = reply.render_reply(config, {'eventPayload': EVENT}, ':wave: Changed: hello')
-        self.assertEqual(result['blocks'][0]['text']['text'], 'hello')
+        self.assertEqual(result['blocks'][0]['text'], 'hello')
         result = reply.render_reply({**CONFIG, 'displayName': 'Changed'}, {'eventPayload': EVENT}, 'Changed the plan')
-        self.assertEqual(result['blocks'][0]['text']['text'], 'Changed the plan')
+        self.assertEqual(result['blocks'][0]['text'], 'Changed the plan')
         for invalid in (None, '', 'a' * 65, '<@U123>', '\n'):
             with self.assertRaises(ValueError):
                 reply.render_reply({**CONFIG, 'displayName': invalid}, {'eventPayload': EVENT}, 'hello')
@@ -278,7 +278,7 @@ class ReplyTests(unittest.TestCase):
 
     def test_legacy_prefix_does_not_duplicate_and_quoted_body_survives(self):
         result = reply.render_reply(CONFIG, {'eventPayload': EVENT}, '🤖 Example：正文里引用 🤖 Example 不应被删除')
-        self.assertEqual(result['blocks'][0]['text']['text'], '正文里引用 🤖 Example 不应被删除')
+        self.assertEqual(result['blocks'][0]['text'], '正文里引用 🤖 Example 不应被删除')
         self.assertEqual(result['blocks'][-1]['elements'][0]['text'], '🤖 Example')
 
     def test_scope_and_body_limits(self):
@@ -286,8 +286,14 @@ class ReplyTests(unittest.TestCase):
             reply.render_reply(CONFIG, {'eventPayload': {**EVENT, 'teamId': 'other'}}, 'hello')
         with self.assertRaises(ValueError):
             reply.render_reply(CONFIG, {'eventPayload': EVENT}, '')
-        result = reply.render_reply(CONFIG, {'eventPayload': EVENT}, 'a' * 7000)
-        self.assertTrue(all(len(block['text']['text']) <= 3000 for block in result['blocks'][:-1]))
+        result = reply.render_reply(CONFIG, {'eventPayload': EVENT}, 'a' * 13000)
+        self.assertTrue(all(block['type'] == 'section' and len(block['text']['text']) <= 3000 for block in result['blocks'][:-1]))
+
+    def test_body_renders_as_one_markdown_block(self):
+        body = '**结论**：见 [PR #1](https://github.com/o/r/pull/1)\n\n| a | b |\n|---|---|\n| 1 | 2 |'
+        result = reply.render_reply(CONFIG, {'eventPayload': EVENT}, body + 'x' * (12000 - len(body)))
+        self.assertEqual(result['blocks'][0], {'type': 'markdown', 'text': body + 'x' * (12000 - len(body))})
+        self.assertEqual(result['blocks'][-1]['type'], 'context')
 
     def test_legacy_and_current_payload_formats(self):
         payload = {'eventPayload': EVENT, 'context': {'selection': {'mode': 'focused'}}}
