@@ -1,11 +1,11 @@
 ---
 name: multica-final-reply
-description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖成功、失败、阻塞、部分完成和 owner 在 Multica 评论里要求的回复；通过 reply adapter 一条命令发送，附带本轮 PR/分支与附件。
+description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖成功、失败、阻塞、部分完成，以及 owner 在 Multica 评论里明确要求发到 Slack 的回复；通过 reply adapter 一条命令发送，附带本轮 PR/分支与附件。
 ---
 
 # Multica 最终回复
 
-答复只回 Relay 来源的原线程，由 reply adapter 发送。是否回复、能做哪些业务操作、能披露什么，以 Agent Instructions 为准；本 Skill 只负责把已决定的正文送达。Squad 中由 leader 调用 adapter，成员把结果写成 Issue 评论交回 leader。
+答复只回 Relay 来源的原线程，由 reply adapter 发送。是否回复、能做哪些业务操作、能披露什么，以 Agent Instructions 为准；本 Skill 只负责把已决定的正文送达。owner 在 Multica 的评论默认在 Multica 回答，评论明确要求发到 Slack 时才调用本 Skill。Squad 中由 leader 调用 adapter，成员把结果写成 Issue 评论交回 leader。
 
 ## 发送
 
@@ -26,7 +26,7 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
    python3 <adapterPath> --config "$FINAL_REPLY_CONFIG" --issue-id <当前 Issue UUID> --current-run --text-file <正文文件>
    ```
 
-   `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 的 Multica 评论、成员交回的结果、定时唤醒），并采集统计和任务链接。命令只需要上面这些参数。
+   `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 要求发到 Slack 的 Multica 评论、成员交回的结果、定时唤醒），并采集统计和任务链接。命令只需要上面这些参数。
 
 完成标准：adapter 返回 `ok: true` 和 `message_ts`；或者按下表处理完错误，并在 Multica 任务结果里写明送达状态。
 
