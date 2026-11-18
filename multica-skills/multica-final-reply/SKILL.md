@@ -5,7 +5,7 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
 
 # Multica 最终回复
 
-答复只回 Relay 来源的原线程，由 reply adapter 发送。是否回复、能做哪些业务操作、能披露什么，以 Agent Instructions 为准；本 Skill 只负责把已决定的正文送达。owner 在 Multica 的评论默认在 Multica 回答，评论明确要求发到 Slack 时才调用本 Skill。派给其他 Agent 的活，由对方写成 Issue 评论 @ 你交回，再由你调用 adapter 回复。
+答复只回 Relay 来源的原线程，由 reply adapter 发送。是否回复、能做哪些业务操作、能披露什么，以 Agent Instructions 为准；本 Skill 只负责把已决定的正文送达。触发评论开头是 `<!-- relay-message:` 的，是 Relay 以 owner 账号转来的 Slack 追问，必须用本 Skill 回原线程。owner 亲手写的 Multica 评论默认在 Multica 回答，评论明确要求发到 Slack 时才调用本 Skill。派给其他 Agent 的活，由对方写成 Issue 评论 @ 你交回，再由你调用 adapter 回复。
 
 ## 发送
 
