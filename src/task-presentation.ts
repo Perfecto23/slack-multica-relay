@@ -72,6 +72,9 @@ function quoteMessage(text: string): string {
 }
 
 
+// Agents runtimes default to answering in a Multica comment, which the Slack sender never sees.
+const REPLY_HINT='**这是 Slack 里的请求：用 multica-final-reply 把答复发回 Slack 原线程，只写 Multica 评论对方看不到。**';
+
 export function formatTaskDescription(envelope:string, marker:string, followup=false):string {
   const payload=JSON.parse(envelope);const event=payload.eventPayload as SlackThreadEvent;
   const raw=clip(event.text,4096);const quote=quoteMessage(decodeSlack(raw))+(raw!==event.text?'\n> （展示已截断，完整请求见数据区）':'');
@@ -82,7 +85,7 @@ export function formatTaskDescription(envelope:string, marker:string, followup=f
   const render=(json:string)=>{
     const fence='`'.repeat((json.match(/`+/g)??[]).reduce((n,run)=>Math.max(n,run.length+1),3));
     const fileCount=Array.isArray(event.files)?event.files.length:0;
-    return [marker,followup?'## Slack thread 后续消息':'## Slack 原始消息',quote,`[原会话](${link}) · ${time}${fileCount?` · ${fileCount} 个附件`:''}`,summary,'## 对话上下文',PAYLOAD_START,`${fence}json\n${json}\n${fence}`,PAYLOAD_END].join('\n\n').replace(marker+'\n\n',marker+'\n');
+    return [marker,followup?'## Slack thread 后续消息':'## Slack 原始消息',REPLY_HINT,quote,`[原会话](${link}) · ${time}${fileCount?` · ${fileCount} 个附件`:''}`,summary,'## 对话上下文',PAYLOAD_START,`${fence}json\n${json}\n${fence}`,PAYLOAD_END].join('\n\n').replace(marker+'\n\n',marker+'\n');
   };
   let body=render(Number(payload.schemaVersion)>=5?compactTaskPayload(payload):serializeEnvelope(payload,2));
   if(Buffer.byteLength(body)>64*1024)body=render(envelope);

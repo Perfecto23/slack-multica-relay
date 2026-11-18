@@ -17,7 +17,7 @@ describe('readable tasks with preserved context',()=>{
   const reply:SlackReplyContext={type:'slack_reply_context',source:'agent_config',agentId:'A1',capturedAt:'fixed',status:'available',model:'model-test',serviceTier:'priority'};
   const envelope=buildEnvelope(e,{...c,selection:{mode:'focused',baseline:'available',omittedRoots:3,omittedCurrentReplies:0}},reply);
   const body=formatTaskDescription(envelope,marker,true);
-  expect(body.startsWith(marker+'\n')).toBe(true);expect(body).toContain('## Slack thread 后续消息');expect(body).toContain('2026-09-07 11:10:11');
+  expect(body.startsWith(marker+'\n')).toBe(true);expect(body).toContain('## Slack thread 后续消息');expect(body).toContain('用 multica-final-reply 把答复发回 Slack 原线程');expect(body).toContain('2026-09-07 11:10:11');
   expect(readTaskEnvelope(body)).toEqual(JSON.parse(envelope));
   expect(readTaskEnvelope(marker+'\n'+envelope)).toEqual(JSON.parse(envelope));
  });
