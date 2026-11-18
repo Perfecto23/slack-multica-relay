@@ -30,11 +30,18 @@ describe("deployment assignment", () => {
     expect(threadScopeId(config)).toBe("old-agent");
     expect(config.multicaLegacyAgentId).toBe("old-agent");
   });
+  it("keeps the agent scope when moving back from a squad", () => {
+    const config = loadRelayConfig({ ...env, MULTICA_LEGACY_SQUAD_ID: "team" });
+    expect(threadScopeId(config)).toBe(assignee(config).id);
+    expect(config.multicaLegacySquadId).toBe("team");
+  });
   it.each([
     { MULTICA_ASSIGNEE_TYPE: "user" },
     { MULTICA_ASSIGNEE_TYPE: "squad" },
     { MULTICA_LEGACY_AGENT_ID: "old-agent" },
     { MULTICA_ASSIGNEE_TYPE: "squad", MULTICA_ASSIGNEE_ID: "team", MULTICA_LEGACY_AGENT_ID: "old-agent" },
+    { MULTICA_ASSIGNEE_TYPE: "squad", MULTICA_ASSIGNEE_ID: "team", MULTICA_LEGACY_SQUAD_ID: "team" },
+    { MULTICA_LEGACY_SQUAD_ID: "team", MULTICA_THREAD_SCOPE_ID: "elsewhere" },
   ])("rejects incomplete or contradictory assignment: %j", (change) => {
     expect(() => loadRelayConfig({ ...env, ...change })).toThrow();
   });

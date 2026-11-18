@@ -391,6 +391,15 @@ describe("Team migration", () => {
     await routeSlackThreadEvent(root, { ...config, multicaLegacyAgentId: "agent" }, f.fetcher);
     expect(f.issuePosts).toBe(1);
   });
+  it("keeps routing squad-era threads after the Relay assigns the agent directly", async () => {
+    const f = fixture();
+    await routeSlackThreadEvent(root, { ...f.config, ...team, multicaThreadScopeId: "agent", multicaLegacyAgentId: "agent" }, f.fetcher);
+    f.issues[0]!.assignee_type = "squad";
+    f.issues[0]!.assignee_id = team.multicaAssigneeId;
+    await expect(routeSlackThreadEvent(root, f.config, f.fetcher)).rejects.toThrow("invalid_issue_scope");
+    await routeSlackThreadEvent(root, { ...f.config, multicaLegacySquadId: team.multicaAssigneeId }, f.fetcher);
+    expect(f.issuePosts).toBe(1);
+  });
   it("preserves ambiguous create intent across target changes", async () => {
     const f = fixture();
     f.loseIssueResponse();

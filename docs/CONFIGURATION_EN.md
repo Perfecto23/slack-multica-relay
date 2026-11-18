@@ -40,6 +40,7 @@ The Slack App Request URL is `https://<deployment-host>/api/slack/events`. Subsc
 | `MULTICA_ASSIGNEE_ID` | Conditional | Target Agent/Team UUID; required for squad. |
 | `MULTICA_THREAD_SCOPE_ID` | No | Stable original Agent ID when migrating existing threads. |
 | `MULTICA_LEGACY_AGENT_ID` | No | Temporary old Agent allowance; squad only, matching THREAD_SCOPE_ID. |
+| `MULTICA_LEGACY_SQUAD_ID` | No | Former Team allowance when moving back to a single Agent; agent only, with THREAD_SCOPE_ID equal to that Agent. |
 | `MULTICA_QUEUE_AGENT_ID` | No | Agent whose active runs mean a follow-up waits. Defaults to the agent in agent mode; for a squad set the leader's agent ID, otherwise no queued marker is added. |
 
 The Relay calls ordinary Issue and Comment APIs. It does not require a Multica Autopilot or webhook URL.
@@ -193,7 +194,7 @@ Cloudflare retains QStash and Upstash Redis; it does not replace them with Cloud
 
 Existing MULTICA_AGENT_ID configurations retain their Agent scope. New configurations use MULTICA_ASSIGNEE_TYPE (agent or squad) and MULTICA_ASSIGNEE_ID; Teams require an explicit ID. A new Team uses squad:<ID> as its thread scope.
 
-To preserve existing threads during an Agent-to-Team migration, set MULTICA_THREAD_SCOPE_ID to the old Agent ID after verifying the target issues. Set MULTICA_LEGACY_AGENT_ID to the same ID only while old Agent assignments must remain accepted. Remove the legacy allowance after migration; retain the thread scope and all Redis, marker and delivery records.
+To preserve existing threads during an Agent-to-Team migration, set MULTICA_THREAD_SCOPE_ID to the old Agent ID after verifying the target issues. Set MULTICA_LEGACY_AGENT_ID to the same ID only while old Agent assignments must remain accepted. Remove the legacy allowance after migration; retain the thread scope and all Redis, marker and delivery records. Moving back from a Team to a single Agent keeps existing threads only when the scope already equals that Agent ID; set MULTICA_LEGACY_SQUAD_ID to the former Team ID and mirror it as `legacySquadId` in the adapter config. In single-Agent mode the Agent can @mention other Agents in Issue comments to delegate; their reply comments come back to it for the Slack reply, and cancellation also stops delegated runs on the Issue.
 
 Cached mappings are revalidated against the current project, assignee and marker. Cancellation binds the current Issue/workspace run set, including multiple Team members; later runs are preserved and reported. Team reply snapshots have agentId=null and status=unavailable. Final model statistics come from the current run's actual Agent.
 

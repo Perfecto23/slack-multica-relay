@@ -881,7 +881,7 @@ class OwnerCommentSourceTests(unittest.TestCase):
 
     def test_other_authors_agents_and_unconfigured_owner_are_rejected(self):
         cases = [(self.config, self.comment(author_id='11111111-1111-1111-1111-111111111111')),
-                 (self.config, self.comment(author_type='agent')),
+                 (self.config, self.comment(author_type='agent', author_id=self.config['agentId'])),
                  (self.config, self.comment(issue_id='I2')),
                  ({**self.config, 'ownerMulticaUserId': None}, self.comment()),
                  ({**self.config, 'ownerMulticaUserId': 'Perfecto'}, self.comment())]
@@ -1017,11 +1017,15 @@ class SquadHandoffTests(unittest.TestCase):
         self.assertEqual((envelope['eventPayload']['messageTs'], kind), ('100.000001', 'handoff'))
         self.assertNotEqual(reply.delivery_identity(self.config, 'I1', 'H1'), reply.delivery_identity(self.config, 'I1', None))
 
-    def test_agent_comments_only_count_as_handoffs_for_a_squad(self):
+    def test_delegated_agent_handoff_counts_in_agent_mode_but_own_comments_do_not(self):
         root = {'id': 'R1', 'issue_id': 'I1', 'author_type': 'agent', 'content': 'dispatching'}
-        agent_config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test'}
+        agent_config = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.test',
+                        'agentId': 'A1'}
+        rows = [root, self.handoff()]
+        envelope, kind = reply.read_reply_source(agent_config, 'I1', 'H1', self.runner(rows, ('agent', 'A1')))
+        self.assertEqual((envelope['eventPayload']['messageTs'], kind), ('100.000001', 'handoff'))
         with self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
-            reply.read_reply_source(agent_config, 'I1', 'H1', self.runner([root, self.handoff()], ('agent', 'A1')))
+            reply.read_reply_source(agent_config, 'I1', 'H1', self.runner([root, self.handoff(author_id='A1')], ('agent', 'A1')))
         with self.assertRaisesRegex(ValueError, 'invalid_relay_source'):
             reply.read_reply_source(self.config, 'I1', 'H1', self.runner([root, self.handoff(author_type='member', author_id='someone')]))
 
@@ -1177,6 +1181,19 @@ class TeamReplyTests(unittest.TestCase):
         self.assertEqual(self.source(migrated, 'agent', 'A1')['eventPayload'], EVENT)
         with self.assertRaisesRegex(ValueError, 'invalid_migration_scope'):
             self.source(self.config(legacyAgentId='A1'), 'agent', 'A1')
+
+    def test_agent_mode_keeps_threads_from_the_former_squad(self):
+        agent = {**CONFIG, 'workspaceId': 'W1', 'projectId': 'P1', 'serverUrl': 'https://multica.example',
+                 'agentId': 'A1', 'threadScopeId': 'A1'}
+        squad_era = self.config(threadScopeId='A1', legacyAgentId='A1')
+        migrated = {**agent, 'legacySquadId': 'S1'}
+        self.assertEqual(reply.delivery_identity(squad_era, 'I1', 'C1'), reply.delivery_identity(migrated, 'I1', 'C1'))
+        self.assertEqual(self.source(migrated, 'squad', 'S1')['eventPayload'], EVENT)
+        self.assertEqual(self.source(migrated, 'agent', 'A1')['eventPayload'], EVENT)
+        with self.assertRaisesRegex(ValueError, 'invalid_issue_scope'):
+            self.source(agent, 'squad', 'S1')
+        with self.assertRaisesRegex(ValueError, 'invalid_migration_scope'):
+            self.source({**migrated, 'threadScopeId': 'other'}, 'agent', 'A1')
 
     def test_members_share_a_ledger_scope_and_team_hides_old_agent_snapshot(self):
         config = self.config()

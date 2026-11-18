@@ -1,6 +1,7 @@
 import {
   findIssue,
   getIssue,
+  ownsIssue,
   listIssueRuns,
   cancelIssueRun,
   isActiveRun,
@@ -93,8 +94,8 @@ export async function cancelThread(
       if (!runs.length) throw new Error("cancellation_pending");
       const active = runs.filter(isActiveRun);
       if (!active.length) return finish("no_active_run");
-      if (issue.assignee_type === "agent" && active.some((run) => run.agent_id !== issue.assignee_id))
-        throw new Error("invalid_issue_scope");
+      // Delegated agents also run on the issue, so ownership of the issue decides the scope.
+      if (!ownsIssue(config, issue)) throw new Error("invalid_issue_scope");
       cancellation.runIds = active.map((run) => run.id);
       await save();
     }

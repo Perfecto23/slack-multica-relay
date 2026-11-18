@@ -40,6 +40,7 @@ Slack App Request URL 为 `https://<deployment-host>/api/slack/events`。只订�
 | `MULTICA_ASSIGNEE_ID` | 条件必填 | 目标 Agent/Team UUID；squad 必填。 |
 | `MULTICA_THREAD_SCOPE_ID` | 否 | 迁移已有线程时保留的旧 Agent ID。 |
 | `MULTICA_LEGACY_AGENT_ID` | 否 | 过渡期旧 Agent 允许值；仅 squad 且等于 THREAD_SCOPE_ID 时有效。 |
+| `MULTICA_LEGACY_SQUAD_ID` | 否 | 从 Team 改回单 Agent 时的旧 Team 允许值；仅 agent 且 THREAD_SCOPE_ID 等于该 Agent 时有效。 |
 | `MULTICA_QUEUE_AGENT_ID` | 否 | 判断排队时看哪个 Agent 的进行中任务。单 Agent 默认就是它；squad 填 Leader 的 Agent ID，不填则不加排队提示。 |
 
 Relay 调用普通 Issue 和 Comment API，不需要 Multica Autopilot 或 webhook URL。
@@ -193,7 +194,7 @@ Cloudflare 沿用现有 QStash 和 Upstash Redis，不使用 Cloudflare Queues�
 
 单 Agent 旧配置继续使用 MULTICA_AGENT_ID，默认 scope 不变。新配置使用 MULTICA_ASSIGNEE_TYPE=agent|squad 和 MULTICA_ASSIGNEE_ID；squad 必须显式提供 Team ID。新 Team 的线程 scope 为 squad:<ID>。
 
-从 Agent 切换 Team 并继续既有线程时，先核对任务归属与原线程，再把 MULTICA_THREAD_SCOPE_ID 固定为旧 Agent ID。过渡期仍有旧 Agent 任务时，显式设置 MULTICA_LEGACY_AGENT_ID 为同一旧 ID；只接受原项目中的该 Agent 或当前 Team。全部迁移结束后移除 LEGACY 字段，THREAD_SCOPE_ID 保持稳定，保留既有 Redis、marker 和 ledger。
+从 Agent 切换 Team 并继续既有线程时，先核对任务归属与原线程，再把 MULTICA_THREAD_SCOPE_ID 固定为旧 Agent ID。过渡期仍有旧 Agent 任务时，显式设置 MULTICA_LEGACY_AGENT_ID 为同一旧 ID；只接受原项目中的该 Agent 或当前 Team。全部迁移结束后移除 LEGACY 字段，THREAD_SCOPE_ID 保持稳定，保留既有 Redis、marker 和 ledger。从 Team 改回单 Agent 时，scope 本来就是该 Agent ID 才能续用原线程；设置 MULTICA_LEGACY_SQUAD_ID 为旧 Team ID，adapter 配置同步 `legacySquadId`。单 Agent 模式下，Agent 可以在 Issue 评论里 @ 其他 Agent 派活，对方评论交回后由该 Agent 回复 Slack；取消会一起停掉 Issue 上被派单 Agent 的运行。
 
 每次使用缓存映射前回读当前 Issue 的项目、assignee 和 marker。取消只绑定该 Issue、该工作区的活动 run；Team 内多个 Agent 的运行可一起取消，结果不明重试沿原 run ID 集合，新出现的 run 保留并报告。Team 快照 agentId=null、status=unavailable，最终统计来自本次实际 run。
 

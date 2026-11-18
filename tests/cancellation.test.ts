@@ -344,6 +344,14 @@ describe("取消和恢复", () => {
     expect(f.reactions.get(root.messageTs)![0]!.users).not.toContain("U1");
     expect(f.reactions.get("101.000001")![0]!.users).not.toContain("U1");
   });
+  it("同时取消被派单 Agent 在本 issue 上的任务", async () => {
+    const f = fixture();
+    await f.route();
+    f.runs[0]!.status = "running";
+    f.runs.push({ ...f.runs[0]!, id: "member-run", agent_id: "member" });
+    expect((await f.route(cancel)).action).toBe("cancelled");
+    expect(f.runs.map((run) => run.status)).toEqual(["cancelled", "cancelled"]);
+  });
   it("issue 指派改变后不取消其他 Agent 的任务", async () => {
     const f = fixture();
     await f.route();

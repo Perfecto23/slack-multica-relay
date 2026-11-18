@@ -21,6 +21,8 @@ export interface ApiConfig {
   multicaAssigneeId?: string;
   multicaThreadScopeId?: string;
   multicaLegacyAgentId?: string;
+  /** Squad that owned this scope's issues before the Relay assigned the Agent directly. */
+  multicaLegacySquadId?: string;
 }
 export function assignee(config: ApiConfig): { type: "agent" | "squad"; id: string } {
   const type = config.multicaAssigneeType ?? "agent";
@@ -32,13 +34,15 @@ export function threadScopeId(config: ApiConfig): string {
   const target = assignee(config);
   return config.multicaThreadScopeId ?? (target.type === "agent" ? target.id : `squad:${target.id}`);
 }
-function ownsIssue(config: ApiConfig, candidate: MulticaIssue): boolean {
+export function ownsIssue(config: ApiConfig, candidate: MulticaIssue): boolean {
   const target = assignee(config);
   return candidate.project_id === config.multicaProjectId && (
     (candidate.assignee_type === target.type && candidate.assignee_id === target.id) ||
     (target.type === "squad" && !!config.multicaLegacyAgentId &&
       config.multicaThreadScopeId === config.multicaLegacyAgentId &&
-      candidate.assignee_type === "agent" && candidate.assignee_id === config.multicaLegacyAgentId)
+      candidate.assignee_type === "agent" && candidate.assignee_id === config.multicaLegacyAgentId) ||
+    (target.type === "agent" && !!config.multicaLegacySquadId && threadScopeId(config) === target.id &&
+      candidate.assignee_type === "squad" && candidate.assignee_id === config.multicaLegacySquadId)
   );
 }
 export async function validateMappedIssue(config: ApiConfig, id: string, marker: string, fetchImpl: typeof fetch): Promise<void> {

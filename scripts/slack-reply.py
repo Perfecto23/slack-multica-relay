@@ -212,6 +212,9 @@ def reply_assignee(config):
     legacy = config.get('legacyAgentId')
     if legacy and (kind != 'squad' or config.get('threadScopeId') != legacy):
         raise ValueError('invalid_migration_scope')
+    legacy_squad = config.get('legacySquadId')
+    if legacy_squad and (kind != 'agent' or (config.get('threadScopeId') or target) != target):
+        raise ValueError('invalid_migration_scope')
     return kind, target
 
 
@@ -227,7 +230,8 @@ def read_reply_source(config, issue_id, comment_id, runner=subprocess.run):
     issue = multica_json(config, ['issue', 'get', issue_id], runner)
     kind, target = reply_assignee(config)
     assigned = (issue.get('assignee_type'), issue.get('assignee_id'))
-    legacy = kind == 'squad' and config.get('legacyAgentId') and assigned == ('agent', config['legacyAgentId'])
+    legacy = ((kind == 'squad' and config.get('legacyAgentId') and assigned == ('agent', config['legacyAgentId']))
+              or (kind == 'agent' and config.get('legacySquadId') and assigned == ('squad', config['legacySquadId'])))
     if (issue.get('workspace_id') != config['workspaceId'] or issue.get('project_id') != config['projectId']
             or (assigned != (kind, target) and not legacy)):
         raise ValueError('invalid_issue_scope')
@@ -258,9 +262,10 @@ def read_reply_source(config, issue_id, comment_id, runner=subprocess.run):
                 and row.get('issue_id') == issue_id
                 and isinstance(source, str) and source.startswith('<!-- relay-thread:')):
             return envelope_from_text(source), 'owner_comment'
-        # A squad member hands its result back to the leader with its own comment. The reply still
-        # answers the Slack request that started the comment thread, or the Issue's first request.
-        if kind == 'squad' and row.get('author_type') == 'agent' and row.get('issue_id') == issue_id:
+        # A delegated agent hands its result back with its own comment. The reply still answers
+        # the Slack request that started the comment thread, or the Issue's first request.
+        if (row.get('author_type') == 'agent' and row.get('issue_id') == issue_id
+                and (kind == 'squad' or row.get('author_id') != target)):
             root = next((r for r in rows if isinstance(r, dict) and not r.get('parent_id')), None)
             root_content = root.get('content', '') if root else ''
             if isinstance(root_content, str) and root_content.startswith('<!-- relay-message:'):

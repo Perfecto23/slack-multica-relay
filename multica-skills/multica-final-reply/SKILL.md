@@ -5,7 +5,7 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
 
 # Multica 最终回复
 
-答复只回 Relay 来源的原线程，由 reply adapter 发送。是否回复、能做哪些业务操作、能披露什么，以 Agent Instructions 为准；本 Skill 只负责把已决定的正文送达。owner 在 Multica 的评论默认在 Multica 回答，评论明确要求发到 Slack 时才调用本 Skill。Squad 中由 leader 调用 adapter，成员把结果写成 Issue 评论交回 leader。
+答复只回 Relay 来源的原线程，由 reply adapter 发送。是否回复、能做哪些业务操作、能披露什么，以 Agent Instructions 为准；本 Skill 只负责把已决定的正文送达。owner 在 Multica 的评论默认在 Multica 回答，评论明确要求发到 Slack 时才调用本 Skill。派给其他 Agent 的活，由对方写成 Issue 评论 @ 你交回，再由你调用 adapter 回复。
 
 ## 发送
 
@@ -26,7 +26,7 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
    python3 <adapterPath> --config "$FINAL_REPLY_CONFIG" --issue-id <当前 Issue UUID> --current-run --text-file <正文文件>
    ```
 
-   `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 要求发到 Slack 的 Multica 评论、成员交回的结果、定时唤醒），并采集统计和任务链接。命令只需要上面这些参数。
+   `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 要求发到 Slack 的 Multica 评论、被派单 Agent 交回的结果、定时唤醒），并采集统计和任务链接。命令只需要上面这些参数。
 
 完成标准：adapter 返回 `ok: true` 和 `message_ts`；或者按下表处理完错误，并在 Multica 任务结果里写明送达状态。
 
@@ -41,7 +41,7 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
 | `reply_delivery_busy` | 同一来源正在另一个进程发送 | 等 10 秒用同一命令重试 |
 | `reply_failed_verify_before_retry` | 中途出错，可能已经发出 | 用 `moe-slack` 读原线程：消息已在就算送达；没有就用同一命令重试一次（adapter 的发送记录会挡住重复发送） |
 | `slack_delivery_unknown`、`slack_send_unverified`、`slack_attachment_delivery_unknown` | 已发出请求，结果不明；adapter 会锁住这条来源 | 用 `moe-slack` 读原线程：消息已在就算送达；没有就在任务结果写“结果不明，原线程未见消息”，留给本人处理 |
-| `invalid_relay_source` | 触发评论不属于 Relay、owner 或 Squad 成员 | 在任务结果说明；回复只发原线程 |
+| `invalid_relay_source` | 触发评论不属于 Relay、owner 或被派单的 Agent | 在任务结果说明；回复只发原线程 |
 
 其他错误码照原样写进任务结果。
 

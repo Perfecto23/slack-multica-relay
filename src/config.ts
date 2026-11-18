@@ -46,6 +46,8 @@ export function loadRelayConfig(
   const legacy = env.MULTICA_LEGACY_AGENT_ID?.trim() || undefined;
   const scope = env.MULTICA_THREAD_SCOPE_ID?.trim() || undefined;
   if (legacy && (type !== "squad" || scope !== legacy)) throw new Error("invalid_migration_scope");
+  const legacySquad = env.MULTICA_LEGACY_SQUAD_ID?.trim() || undefined;
+  if (legacySquad && (type !== "agent" || (scope ?? targetId) !== targetId)) throw new Error("invalid_migration_scope");
   return {
     signingSecret: required(env, "SLACK_SIGNING_SECRET"),
     teamId: required(env, "SLACK_TEAM_ID"),
@@ -68,6 +70,7 @@ export function loadRelayConfig(
     multicaAssigneeId: targetId,
     multicaThreadScopeId: scope,
     multicaLegacyAgentId: legacy,
+    multicaLegacySquadId: legacySquad,
     slackReactionToken:
       env.SLACK_BOT_TOKEN?.trim() || required(env, "SLACK_USER_TOKEN"),
     slackContextToken: required(env, "SLACK_CONTEXT_TOKEN"),
