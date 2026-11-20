@@ -100,7 +100,7 @@ tests/                       TypeScript 与 Python 测试
 
 ## 准备条件
 
-第一次搭建时，按 [从零搭建](docs/SETUP.md) 一步步操作：用现成的 manifest 创建 Slack App、从 GitHub 导入部署到 Cloudflare Workers、开启事件订阅，再配置 Agent 回复。
+第一次搭建时，按 [从零搭建](docs/SETUP.md) 一步步操作：用现成的 manifest 创建 Slack App、从 GitHub 导入部署到 Cloudflare Workers、开启事件订阅，再配置 Agent 回复。也可以把 [Agent 搭建指南](docs/AGENT-SETUP.md) 交给你的 Agent，让它带你走完全程。
 
 部署 Relay 前需要：
 

@@ -100,7 +100,7 @@ tests/                       TypeScript and Python tests
 
 ## Prerequisites
 
-For a first-time setup, follow the step-by-step [setup guide](docs/SETUP.md) (Chinese): create the Slack App from the bundled manifest, deploy to Cloudflare Workers by importing from GitHub, enable event subscriptions, then configure the Agent reply path.
+For a first-time setup, follow the step-by-step [setup guide](docs/SETUP.md) (Chinese): create the Slack App from the bundled manifest, deploy to Cloudflare Workers by importing from GitHub, enable event subscriptions, then configure the Agent reply path. You can also hand the [agent setup guide](docs/AGENT-SETUP.md) (Chinese) to your Agent and let it walk you through.
 
 To deploy the Relay, you need:
 

@@ -2,6 +2,8 @@
 
 本文带你从一个空的 Slack App 走到“在 Slack 里 @ 你，你的 Multica Agent 在原线程回复”。变量的完整含义和信任边界见 [配置说明](CONFIGURATION.md)，本文只写搭建顺序和每个值从哪里拿。
 
+想让 Agent 带你搭：把 [AGENT-SETUP.md](AGENT-SETUP.md) 交给它，它会先盘点电脑上能用的浏览器和命令行，再一步步带你做，需要你出手时会说清楚。
+
 第 1–5 步都在网页里完成，用哪个浏览器都行，不需要命令行。第 6 步配置 Agent 的本机 Runtime，需要终端。
 
 ## 准备
@@ -42,7 +44,7 @@
 3. 安装完成后，这个页面会显示 **User OAuth Token**，`xoxp-` 开头。
 4. App 设置页 → **Basic Information** → **App Credentials** → **Signing Secret**。
 
-等审批的同时可以先做第 3 步：Signing Secret 在第 1 步建好 App 后就能拿到，Request URL 验证只需要它。两个 `xoxp-` 变量等批下来再补进 Secret。
+等审批的同时可以先做第 3 步，做到 `/api/health` 能打开为止，两个 `xoxp-` 变量先空着。批下来后补上这两个 Secret，再做第 4 步：Request URL 验证时 Relay 会加载全部必填变量，缺一个都验证不过。
 
 这两个值只填进 Worker 的 Secret 和第 6 步的 Runtime 环境，不贴进聊天、Issue 或 Git。安装后再增加 scope，要重新安装一次，可能还要再审批一次，所以 scope 尽量一次勾全。
 
@@ -108,7 +110,7 @@ QStash 必须能直接访问 Worker 地址，不要给它开 Cloudflare Access �
 
 | 现象 | 先看哪里 |
 | --- | --- |
-| 第 4 步 Request URL 验证不过 | `/api/health` 能否打开；`SLACK_SIGNING_SECRET` 是否填对 |
+| 第 4 步 Request URL 验证不过 | `/api/health` 能否打开；变量表里的 Secret 是否全部填好，`SLACK_SIGNING_SECRET` 是否填对 |
 | 验证通过，但发消息没反应 | `SLACK_TEAM_ID`、`SLACK_TARGET_USER_IDS`、`SLACK_ALLOWED_CHANNEL_IDS`、`SLACK_ALLOWED_SENDER_IDS` 是否匹配 |
 | Worker 的 **Observability** 日志里有 QStash 401 或发布失败 | `RELAY_CONSUMER_URL` 是否是 Worker 地址；五个 Upstash 变量是否都在 |
 | 有 👀，Multica 里没有 Issue | `MULTICA_*` 变量，以及这个 PAT 能否访问该项目和 Agent |
