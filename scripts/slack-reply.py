@@ -221,6 +221,17 @@ def reply_assignee(config):
 UUID_PATTERN = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 
 
+def flatten_comment_rows(rows):
+    flat = []
+    for item in rows:
+        if isinstance(item, dict):
+            flat.append(item)
+            replies = item.get('replies')
+            if isinstance(replies, list):
+                flat.extend(flatten_comment_rows(replies))
+    return flat
+
+
 def read_source(config, issue_id, comment_id, runner=subprocess.run):
     return read_reply_source(config, issue_id, comment_id, runner)[0]
 
@@ -241,19 +252,25 @@ def read_reply_source(config, issue_id, comment_id, runner=subprocess.run):
                                      '--thread', comment_id, '--tail', '0'], runner)
         if not isinstance(rows, list):
             raise ValueError('multica_read_failed')
-        row = next((row for row in rows if isinstance(row, dict) and row.get('id') == comment_id), None)
+        rows = flatten_comment_rows(rows)
+        row = next((row for row in rows if row.get('id') == comment_id), None)
         if not row:
-            # `--tail 0` returns only the thread root; an owner reply nested in a thread needs the full thread.
+            # `--tail 0` returns only the thread root; a reply nested in a thread needs the full thread.
             rows = multica_json(config, ['issue', 'comment', 'list', issue_id,
                                          '--thread', comment_id, '--full'], runner)
             if not isinstance(rows, list):
                 raise ValueError('multica_read_failed')
-            row = next((row for row in rows if isinstance(row, dict) and row.get('id') == comment_id), None)
+            rows = flatten_comment_rows(rows)
+            row = next((row for row in rows if row.get('id') == comment_id), None)
         if not row:
             raise ValueError('source_comment_missing')
         content = row.get('content', '')
         if isinstance(content, str) and content.startswith('<!-- relay-message:'):
             return envelope_from_text(content), 'relay'
+        fallback_match = re.match(r'^<!-- relay-steer-fallback:(' + UUID_PATTERN + r') -->\n', content) \
+            if isinstance(content, str) else None
+        if fallback_match and fallback_match.group(1) != comment_id:
+            return read_reply_source(config, issue_id, fallback_match.group(1), runner)
         # The Relay may also post as the owner, so markers are checked first. An owner's own
         # Multica comment carries no Slack envelope; it replies to the Issue's original thread.
         owner = config.get('ownerMulticaUserId')
@@ -312,8 +329,8 @@ TIME_WAKEUP_KINDS = ('cron', 'every', 'at')
 RUN_CONTEXT_SCRIPT = Path(__file__).resolve().parents[1] / 'multica-skills/multica-final-reply/scripts/run_context.py'
 
 
-def resolve_current_run(config, issue_id, comment_id, task_id, runner=subprocess.run):
-    """Return (trigger comment id, is scheduled wakeup) for the run named by MULTICA_TASK_ID."""
+def resolve_current_run(config, issue_id, comment_id, task_id, runner=subprocess.run, include_supplements=False):
+    """Return (trigger comment id, is scheduled wakeup[, supplement comment ids]) for MULTICA_TASK_ID."""
     if not isinstance(task_id, str) or not re.fullmatch(UUID_PATTERN, task_id):
         raise ValueError('invalid_current_run')
     runs = multica_json(config, ['issue', 'runs', issue_id], runner)
@@ -330,7 +347,14 @@ def resolve_current_run(config, issue_id, comment_id, task_id, runner=subprocess
         wakeup = multica_json(config, ['issue', 'wakeup', 'get', issue_id, run['wakeup_id']], runner)
         # Event wakeups answer their trigger comment like any follow-up; only time wakeups get a new occurrence.
         scheduled = isinstance(wakeup, dict) and wakeup.get('kind') in TIME_WAKEUP_KINDS
-    return trigger, scheduled
+    if not include_supplements:
+        return trigger, scheduled
+    folded_raw = [*(run.get('coalesced_comment_ids') or []), *(run.get('supplement_comment_ids') or [])]
+    supplements = list(dict.fromkeys(
+        item for item in folded_raw
+        if isinstance(item, str) and re.fullmatch(UUID_PATTERN, item) and item != trigger
+    ))
+    return trigger, scheduled, supplements
 
 
 def collect_run_context(issue_id, runner=subprocess.run, script=RUN_CONTEXT_SCRIPT):
@@ -525,6 +549,47 @@ def clear_queued_reaction(config, envelope, opener=urllib.request.urlopen):
         return 'unavailable'
 
 
+def clear_offline_reaction(config, envelope, opener=urllib.request.urlopen):
+    """Best effort: clear the offline-runtime marker once the local runtime wakes and finishes."""
+    if config.get('offlineReaction') is None:
+        return 'disabled'
+    try:
+        return clear_configured_reaction(config, envelope, 'offlineReaction', False, opener)['action']
+    except Exception:
+        return 'unavailable'
+
+
+def clear_supplement_reactions(config, issue_id, supplement_ids, clear_start=False,
+                               runner=subprocess.run, opener=urllib.request.urlopen):
+    """Best effort: clean up queued/pending/offline (and on silent runs, start) reactions on folded follow-ups."""
+    if not supplement_ids:
+        return []
+    cleaned = []
+    for sup_id in supplement_ids:
+        try:
+            sup_envelope, sup_kind = read_reply_source(config, issue_id, sup_id, runner)
+            if sup_kind != 'relay':
+                continue
+            entry = {'comment_id': sup_id, 'queued_reaction': clear_queued_reaction(config, sup_envelope, opener)}
+            if config.get('offlineReaction') is not None:
+                entry['offline_reaction'] = clear_offline_reaction(config, sup_envelope, opener)
+            if config.get('steerPendingReaction') is not None:
+                try:
+                    entry['steer_pending_reaction'] = clear_configured_reaction(
+                        config, sup_envelope, 'steerPendingReaction', False, opener)['action']
+                except Exception:
+                    entry['steer_pending_reaction'] = 'unavailable'
+            if clear_start and config.get('startReaction') is not None:
+                try:
+                    entry['start_reaction'] = clear_start_reaction(config, sup_envelope, False, opener)['action']
+                except Exception:
+                    entry['start_reaction'] = 'unavailable'
+            cleaned.append(entry)
+        except Exception:
+            cleaned.append({'comment_id': sup_id, 'status': 'unavailable'})
+    return cleaned
+
+
 def clear_configured_reaction(config, envelope, key, dry_run=False, opener=urllib.request.urlopen):
     setting = config.get(key)
     if (not isinstance(setting, dict)
@@ -637,6 +702,102 @@ def delivery_paths(config_path, identity):
     root.mkdir(mode=0o700, exist_ok=True)
     root.chmod(0o700)
     return root / (identity + '.json'), root / (identity + '.lock')
+
+
+def progress_paths(config_path, identity):
+    root = delivery_paths(config_path, identity)[0].parent
+    return root / ('progress-' + identity + '.json'), root / ('progress-' + identity + '.lock')
+
+
+def render_progress_payload(config, envelope, text, block_id):
+    event = envelope['eventPayload']
+    if event.get('teamId') != config['teamId'] or not re.fullmatch(r'[CDG][A-Z0-9]+', event.get('channelId', '')):
+        raise ValueError('invalid_reply_scope')
+    if not re.fullmatch(r'\d+\.\d{1,6}', event.get('threadTs', '')):
+        raise ValueError('invalid_thread')
+    cleaned = ' '.join(text.strip().split())
+    if not cleaned or len(cleaned) > 500:
+        raise ValueError('invalid_progress_text')
+    escaped = cleaned.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    footer = footer_for(config, {})
+    blocks = [
+        {'type': 'section', 'text': {'type': 'mrkdwn', 'text': f'⏳ {escaped}'}},
+        {'type': 'context', 'block_id': block_id, 'elements': [{'type': 'mrkdwn', 'text': footer}]},
+    ]
+    return {
+        'channel': event['channelId'],
+        'thread_ts': event['threadTs'],
+        'text': f'{cleaned}\n\n{footer}',
+        'blocks': blocks,
+        'unfurl_links': False,
+        'unfurl_media': False,
+    }
+
+
+def upsert_progress_message(config_path, config, envelope, identity, text, dry_run=False, opener=urllib.request.urlopen):
+    block_id = 'relay-progress-' + identity
+    payload = render_progress_payload(config, envelope, text, block_id)
+    if dry_run:
+        return {'ok': True, 'dry_run': True, 'payload': payload}
+    token = os.environ.get('SLACK_USER_TOKEN')
+    if not token:
+        raise ValueError('slack_user_token_missing')
+    state_path, lock_path = progress_paths(config_path, identity)
+    with delivery_lock(lock_path):
+        existing = json.loads(state_path.read_text()) if state_path.exists() else None
+        existing_ts = existing.get('messageTs') if isinstance(existing, dict) else None
+        if isinstance(existing_ts, str) and re.fullmatch(r'\d+\.\d{1,6}', existing_ts):
+            try:
+                slack_call(token, 'chat.update', payload={
+                    'channel': payload['channel'],
+                    'ts': existing_ts,
+                    'text': payload['text'],
+                    'blocks': payload['blocks'],
+                }, opener=opener)
+                return {'ok': True, 'action': 'updated', 'channel': payload['channel'],
+                        'message_ts': existing_ts, 'thread_ts': payload['thread_ts']}
+            except ValueError:
+                state_path.unlink(missing_ok=True)
+        verify_reply_root(token, envelope, opener)
+        data = slack_call(token, 'chat.postMessage', payload=payload, opener=opener)
+        message_ts = data.get('ts')
+        if not isinstance(message_ts, str) or not re.fullmatch(r'\d+\.\d{1,6}', message_ts):
+            raise ValueError('slack_send_unverified')
+        write_delivery_state(state_path, {
+            'version': 1,
+            'channel': payload['channel'],
+            'threadTs': payload['thread_ts'],
+            'messageTs': message_ts,
+        })
+        return {'ok': True, 'action': 'posted', 'channel': payload['channel'],
+                'message_ts': message_ts, 'thread_ts': payload['thread_ts']}
+
+
+def clear_progress_message(config_path, identity, token=None, opener=urllib.request.urlopen):
+    """Best effort: delete any transient progress card so the final reply rings as a fresh message."""
+    state_path, lock_path = progress_paths(config_path, identity)
+    if not state_path.exists():
+        return 'absent'
+    resolved_token = token or os.environ.get('SLACK_USER_TOKEN')
+    if not resolved_token:
+        return 'unavailable'
+    try:
+        with delivery_lock(lock_path):
+            if not state_path.exists():
+                return 'absent'
+            state = json.loads(state_path.read_text())
+            channel = state.get('channel') if isinstance(state, dict) else None
+            ts = state.get('messageTs') if isinstance(state, dict) else None
+            if isinstance(channel, str) and isinstance(ts, str):
+                try:
+                    slack_call(resolved_token, 'chat.delete', payload={'channel': channel, 'ts': ts}, opener=opener)
+                except ValueError as err:
+                    if str(err) != 'slack_send_rejected':
+                        return 'unavailable'
+            state_path.unlink(missing_ok=True)
+            return 'deleted'
+    except Exception:
+        return 'unavailable'
 
 
 def attachment_delivery_paths(config_path, identity, attachment):
@@ -841,6 +1002,7 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     action.add_argument('--text-file')
     action.add_argument('--clear-start-reaction', action='store_true')
     action.add_argument('--session-status', choices=['processing', 'active', 'suspended'])
+    action.add_argument('--progress', help='Post or update a transient single-line progress status deleted before final reply')
     parser.add_argument('--run-context-file')
     parser.add_argument('--github-context-file')
     parser.add_argument('--deliver-task-attachments', action='store_true')
@@ -848,26 +1010,40 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     parser.add_argument('--wakeup-run', action='store_true', help='Use the current verified scheduled run as a distinct delivery occurrence')
     parser.add_argument('--current-run', action='store_true',
                         help='Derive the trigger comment, scheduled wakeup and run statistics from MULTICA_TASK_ID')
+    parser.add_argument('--interim', help='Send a retry-safe mid-run progress reply with this step key without locking out the final reply')
     args = parser.parse_args(argv)
     config_path = Path(args.config)
     config = json.loads(config_path.read_text())
-    occurrence, source_kind, collected_context = None, 'relay', None
+    occurrence, source_kind, collected_context, supplement_ids = None, 'relay', None, []
+    if args.interim is not None:
+        if not args.text_file or not args.current_run:
+            raise ValueError('invalid_interim_arguments')
+        if not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', args.interim):
+            raise ValueError('invalid_interim_key')
+    if args.progress is not None and not args.current_run:
+        raise ValueError('invalid_progress_arguments')
     if args.current_run:
         if args.wakeup_run:
             raise ValueError('invalid_current_run_arguments')
-        args.comment_id, args.wakeup_run = resolve_current_run(
-            config, args.issue_id, args.comment_id, os.environ.get('MULTICA_TASK_ID'), runner)
+        resolved = resolve_current_run(
+            config, args.issue_id, args.comment_id, os.environ.get('MULTICA_TASK_ID'), runner, True)
+        if len(resolved) == 3:
+            args.comment_id, args.wakeup_run, supplement_ids = resolved
+        else:
+            args.comment_id, args.wakeup_run = resolved
         if args.clear_start_reaction and args.wakeup_run:
-            # A scheduled run has no start reaction of its own; it may still have set processing.
-            envelope = read_wakeup_source(config, args.issue_id, args.comment_id,
-                                          os.environ.get('MULTICA_TASK_ID'), runner)[0]
+            # A scheduled run has no start reaction of its own; it may still have set processing or progress.
+            envelope, wk_comment_id, wk_occurrence = read_wakeup_source(
+                config, args.issue_id, args.comment_id, os.environ.get('MULTICA_TASK_ID'), runner)
             result = {'ok': True, 'action': 'not_applicable'}
             if not args.dry_run:
+                wk_identity = delivery_identity(config, args.issue_id, wk_comment_id, wk_occurrence)
+                clear_progress_message(config_path, wk_identity, opener=opener)
                 result['session_status'] = update_session_status(
                     config, envelope, args.issue_id, 'active', runner, opener)
             print(json.dumps(result))
             return
-        if args.text_file and not args.run_context_file:
+        if args.text_file and not args.run_context_file and not args.interim:
             collected_context = collect_run_context(args.issue_id, runner)
             args.run_context_file = collected_context
     if args.wakeup_run:
@@ -879,6 +1055,9 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         envelope, source_kind = read_reply_source(config, args.issue_id, args.comment_id, runner)
     else:
         envelope = read_source(config, args.issue_id, args.comment_id, runner)
+    if args.interim is not None:
+        task_id = os.environ.get('MULTICA_TASK_ID', '')
+        occurrence = f'interim:{task_id}:{args.interim}' if occurrence is None else f'{occurrence}:interim:{args.interim}'
     if args.session_status:
         if args.dry_run:
             print(json.dumps({'ok': True, 'session_status': args.session_status, 'dry_run': True}))
@@ -889,19 +1068,34 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     if args.clear_start_reaction:
         if args.run_context_file or args.github_context_file or args.deliver_task_attachments:
             raise ValueError('invalid_cleanup_arguments')
+        base_identity = delivery_identity(config, args.issue_id, args.comment_id, occurrence)
         if source_kind in ('owner_comment', 'handoff'):
             # Only Relay messages get a start reaction; the root message's belongs to its own run.
             result = {'ok': True, 'action': 'not_applicable'}
         else:
             queued = 'dry_run' if args.dry_run else clear_queued_reaction(config, envelope, opener)
+            offline = 'dry_run' if args.dry_run else clear_offline_reaction(config, envelope, opener)
             result = clear_start_reaction(config, envelope, args.dry_run, opener)
             if not args.dry_run:
                 result['queued_reaction'] = queued
+                if config.get('offlineReaction') is not None:
+                    result['offline_reaction'] = offline
         if not args.dry_run:
+            progress_cleanup = clear_progress_message(config_path, base_identity, opener=opener)
+            if progress_cleanup != 'absent':
+                result['progress_cleanup'] = progress_cleanup
+            if supplement_ids:
+                result['supplement_reactions'] = clear_supplement_reactions(
+                    config, args.issue_id, supplement_ids, True, runner, opener)
             result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
         print(json.dumps(result))
         return
     identity = delivery_identity(config, args.issue_id, args.comment_id, occurrence)
+    if args.progress is not None:
+        progress_result = upsert_progress_message(
+            config_path, config, envelope, identity, args.progress, args.dry_run, opener)
+        print(json.dumps(progress_result, ensure_ascii=False))
+        return
     block_id = 'relay-delivery-' + identity
     try:
         stats = run_statistics(args.run_context_file, args.issue_id, os.environ.get('MULTICA_TASK_ID'), config)
@@ -931,9 +1125,18 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         if attachments is not None:
             result['attachments'] = upload_task_attachments(
                 config_path, config, envelope, identity, attachments, runner, token, opener)
+        if args.interim is not None:
+            result['interim'] = args.interim
+            print(json.dumps(result, ensure_ascii=False))
+            return
         if config.get('sessionStatus') is not None:
             result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
         result['queued_reaction'] = clear_queued_reaction(config, envelope, opener)
+        if config.get('offlineReaction') is not None:
+            result['offline_reaction'] = clear_offline_reaction(config, envelope, opener)
+        if supplement_ids:
+            result['supplement_reactions'] = clear_supplement_reactions(
+                config, args.issue_id, supplement_ids, False, runner, opener)
         print(json.dumps(result, ensure_ascii=False))
 
     with delivery_lock(lock_path):
@@ -964,6 +1167,8 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
             # Absence after an ambiguous POST is not proof that Slack did not commit it.
             raise ValueError('slack_delivery_unknown')
         verify_reply_root(token, envelope, opener)
+        if args.interim is None:
+            clear_progress_message(config_path, identity, token=token, opener=opener)
         attempted_at = slack_timestamp()
         lookup_from = slack_timestamp(time.time() - 300)
         write_delivery_state(state_path, {'version': 1, 'phase': 'attempting', 'attemptedAt': attempted_at,

@@ -23,9 +23,17 @@ Slack ID 使用逗号分隔的大写标识符。`SLACK_TARGET_USER_IDS` 与 `SLA
 | `SLACK_BOT_TOKEN` | 条件必填 | 作者身份查询及 reaction 添加、查询和清理优先使用的 Bot 身份，需 users:read 和 reactions:read/write。 |
 | `SLACK_USER_TOKEN` | 条件必填 | 未配置 Bot 时用于作者身份查询及 reaction 的 User 身份。 |
 | `SLACK_CANCEL_KEYWORDS` | 否 | 逗号分隔的完整取消关键词，默认 cancel,取消。 |
+| `SLACK_NEW_SESSION_KEYWORDS` | 否 | 逗号分隔的线程重开指令词，默认 `!new,!fresh,重开`（仅 `SLACK_CONTROL_USER_IDS` 可触发，在同一 Slack 线程切换到全新 Multica Issue）。 |
+| `SLACK_WAKE_PATTERNS` | 否 | 逗号分隔的称呼唤醒词（如 `小 p,little perf`），大小写不敏感。 |
+| `SLACK_IMPLICIT_THREAD_FOLLOWUP` | 否 | 设为 `true` 时开启活跃线程免 `@` 续聊：仅对已参与或运行中的线程生效，自动忽略频道广播、首词 `@其他成员` 及部署者本人的无 `@` 普通回复，入场零表情且连续静默后自动冷却（默认 `SLACK_IMPLICIT_THREAD_MAX_SILENT=3`）。 |
+| `SLACK_EDIT_MENTION_WAKE` | 否 | 默认 `true`；真人编辑旧消息补上目标 `@` 或唤醒词时触发一次（忽略单纯链接展开）。 |
 | `SLACK_CONTEXT_TOKEN` | 是 | 带目标会话 history scopes 的 user token。consumer 用它读取有界 history/replies；如需通过 `users.info` 补充参与者姓名，还需 `users:read`。可以与 reaction 使用同一个已授权 token，但必须显式配置。 |
 | `SLACK_REACTION_NAME` | 是 | 不带冒号的 Slack emoji shortcode，例如 `eyes`。reaction 只确认 Relay 已持久化，不证明 Agent 已完成。 |
 | `SLACK_QUEUED_REACTION_NAME` | 否 | 排队提示表情，例如 `hourglass_flowing_sand`。后续消息进来时，若 `MULTICA_QUEUE_AGENT_ID` 在同一 Issue 上有进行中的任务（Multica 对同一 Agent 同一 Issue 只跑一个任务），再加这个表情，含义是“收到了，还没回复”；Agent 回复或静默收尾时由 adapter 的 `queuedReaction` 配置移除，名字须与这里一致。 |
+| `SLACK_STEER_PENDING_REACTION_NAME` | 否 | 运行中 Steer 插话等待 Agent 读取时的表情，默认沿用 `SLACK_QUEUED_REACTION_NAME`（或 `hourglass_flowing_sand`）；读取成功后自动替换为 `SLACK_STEER_READ_REACTION_NAME`（默认 `SLACK_REACTION_NAME`）。 |
+| `SLACK_OFFLINE_REACTION_NAME` | 否 | 本机 Runtime 离线/休眠时的提示表情（如 `zzz`）；任务仍入队等待上线执行，adapter 可通过 `offlineReaction` 在完成后移除。 |
+| `SLACK_DISPATCH_DELAY_SECONDS` | 否 | 普通任务发布到 QStash 的可选防抖延迟秒数（`0..15`，默认 `0`）。 |
+| `SLACK_WATCHDOG_DELAY_SECONDS` | 否 | 失败/中断任务看门狗检查延迟秒数（`0..3600`，默认 `0` 关闭）；启用后若检测到运行以 `failed` 或 `cancelled` 结束且未回复，自动清理残留表情与状态，并可选向 `SLACK_ALERT_CHANNEL_ID` 发送告警。 |
 
 Slack App Request URL 为 `https://<deployment-host>/api/slack/events`。只订阅目标频道类型需要的 message events；读取私有频道时必须把 App 安装到对应频道。
 
