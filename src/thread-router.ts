@@ -1,6 +1,10 @@
 import { setSlackSessionStatus } from "./slack-session.js";
-import { Buffer } from 'node:buffer';
-import {formatTaskTitle,formatTaskDescription,readTaskEnvelope} from './task-presentation.js';
+import { Buffer } from "node:buffer";
+import {
+  formatTaskTitle,
+  formatTaskDescription,
+  readTaskEnvelope,
+} from "./task-presentation.js";
 import { createHash, randomUUID } from "node:crypto";
 import {
   ApiError,
@@ -10,24 +14,60 @@ import {
   findIssue,
   createComment,
   findComment,
+  findCommentById,
+  retryTaskSupplement,
   getSlackReplyContext,
   getIssue,
   listRelayMessageContents,
   listIssueRuns,
+  cancelIssueRun,
   isActiveRun,
+  isSteerableRun,
   type ApiConfig,
+  type MulticaComment,
+  type IssueRun,
 } from "./multica-api.js";
 import type { MentionMatch } from "./mentions.js";
-import { addSlackReaction, reactionErrorDetails } from "./reaction.js";
+import type { InboundOperation, TriggerSource } from "./inbound-policy.js";
+import {
+  addSlackReaction,
+  removeSlackReaction,
+  reactionErrorDetails,
+} from "./reaction.js";
 import {
   cancelThread,
   maxTimestamp,
   type CancellationState,
 } from "./cancellation.js";
 import { type ThreadStore } from "./thread-store.js";
-import { buildEnvelope, compactInitialContext, mergeParticipants, projectFiles, compareTs, timestampValid, updateCoverage, type ThreadContext } from './context-envelope.js';
-import { missingSection, normalizeContext, noteOmission } from './context-coverage.js';
-import type { ContextReadOptions } from './slack-context.js';
+import {
+  buildEnvelope,
+  compactInitialContext,
+  mergeParticipants,
+  projectFiles,
+  compareTs,
+  timestampValid,
+  updateCoverage,
+  type ThreadContext,
+} from "./context-envelope.js";
+import {
+  missingSection,
+  normalizeContext,
+  noteOmission,
+} from "./context-coverage.js";
+import type { ContextReadOptions } from "./slack-context.js";
+
+export interface SteerCheckPayload {
+  issueId: string;
+  commentId: string;
+  taskId: string;
+  attempt: number;
+}
+
+export interface WatchdogCheckPayload {
+  issueId: string;
+  attempt: number;
+}
 
 export interface SlackThreadEvent {
   teamId: string;
@@ -40,32 +80,58 @@ export interface SlackThreadEvent {
   files?: unknown;
   filesTruncated?: boolean;
   sourceFingerprint?: string;
-  operation?: "dispatch" | "cancel";
-  trigger?: "native_stop";
+  operation?: InboundOperation;
+  trigger?: TriggerSource;
+  steerCheck?: SteerCheckPayload;
+  watchdogCheck?: WatchdogCheckPayload;
 }
+
 export interface ThreadRouterConfig extends ApiConfig {
   store: ThreadStore;
-  readContext: (event: SlackThreadEvent, options?: ContextReadOptions) => Promise<ThreadContext>;
+  readContext: (
+    event: SlackThreadEvent,
+    options?: ContextReadOptions,
+  ) => Promise<ThreadContext>;
   slackReactionToken?: string;
   slackReactionName?: string;
   slackQueuedReactionName?: string;
+  slackSteerPendingReactionName?: string;
+  slackSteerReadReactionName?: string;
+  slackOfflineReactionName?: string;
+  slackResetReactionName?: string;
   multicaQueueAgentId?: string;
   slackStatusToken?: string;
+  slackAlertChannelId?: string;
+  implicitThreadMaxSilentTurns?: number;
 }
+
 export interface ThreadState {
   version: 2;
   rootMessageKey: string;
   issueId?: string;
   creating: boolean;
+  epoch?: number;
+  epochStartedTs?: string;
+  implicitMode?: "open" | "closed";
+  lastSeenReplyTs?: string;
+  implicitSilentCount?: number;
   lastMessageTs?: string;
   ignoredThrough?: string;
   reactionMessages?: string[];
   reactionHistoryKnown?: boolean;
   cancellation?: CancellationState;
 }
+
 interface MessageState {
   phase: "writing" | "done" | "rejected";
 }
+
+export interface SteerReceipt {
+  commentId: string;
+  taskId: string;
+  status: "pending" | "delivering" | "delivered" | "failed";
+}
+
 export interface ThreadRouteResult {
   action:
     | "created"
@@ -73,18 +139,85 @@ export interface ThreadRouteResult {
     | "duplicate"
     | "cancelled"
     | "no_active_run"
-    | "ignored";
+    | "ignored"
+    | "session_reset"
+    | "steer_delivered"
+    | "steer_pending"
+    | "steer_failed"
+    | "watchdog_active"
+    | "watchdog_cleaned";
   issueId?: string;
+  steerReceipt?: SteerReceipt;
 }
+
 export const STATE_TTL_SECONDS = 90 * 24 * 60 * 60;
-export function threadKey(event: SlackThreadEvent): string {
+
+export function threadKey(
+  event: Pick<SlackThreadEvent, "teamId" | "channelId" | "threadTs">,
+): string {
   return `${event.teamId}:${event.channelId}:${event.threadTs}`;
 }
-export function messageKey(event: SlackThreadEvent): string {
+
+export function messageKey(
+  event: Pick<SlackThreadEvent, "teamId" | "channelId" | "messageTs">,
+): string {
   return `${event.teamId}:${event.channelId}:${event.messageTs}`;
 }
+
 export function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+export function relayScopeHash(config: ApiConfig): string {
+  return digest(
+    config.multicaWorkspaceId +
+      ":" +
+      config.multicaProjectId +
+      ":" +
+      threadScopeId(config),
+  );
+}
+
+export function threadStateStorageKey(
+  config: ApiConfig,
+  event: Pick<SlackThreadEvent, "teamId" | "channelId" | "threadTs">,
+): string {
+  return `relay:${relayScopeHash(config)}:thread:${digest(threadKey(event))}`;
+}
+
+export function threadRepliedStorageKey(
+  config: ApiConfig,
+  event: Pick<SlackThreadEvent, "teamId" | "channelId" | "threadTs">,
+): string {
+  return `${threadStateStorageKey(config, event)}:replied`;
+}
+
+export async function isThreadOpenForImplicitFollowup(
+  store: ThreadStore,
+  config: ApiConfig,
+  event: Pick<SlackThreadEvent, "teamId" | "channelId" | "threadTs">,
+): Promise<boolean> {
+  const raw = await store.get(threadStateStorageKey(config, event));
+  if (!raw) return false;
+  try {
+    const parsed = JSON.parse(raw) as Partial<ThreadState>;
+    if (parsed.version !== 2) return false;
+    if (!parsed.issueId && !parsed.creating) return false;
+    return parsed.implicitMode !== "closed";
+  } catch {
+    return false;
+  }
+}
+
+function buildThreadMarker(
+  scope: string,
+  event: SlackThreadEvent,
+  epoch: number | undefined,
+): string {
+  const identityInput = epoch
+    ? `${threadKey(event)}:${epoch}`
+    : threadKey(event);
+  return `<!-- relay-thread:${scope}:${digest(identityInput)} -->`;
 }
 
 export async function routeSlackThreadEvent(
@@ -92,17 +225,16 @@ export async function routeSlackThreadEvent(
   config: ThreadRouterConfig,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ThreadRouteResult> {
-  const scope = digest(
-    config.multicaWorkspaceId +
-      ":" +
-      config.multicaProjectId +
-      ":" +
-      threadScopeId(config),
-  );
-  const key = `relay:${scope}:thread:${digest(threadKey(event))}`;
-  const msgKey = `relay:${scope}:message:${digest(messageKey(event))}`;
-  const lockKey = key + ":lock",
-    owner = randomUUID();
+  const scope = relayScopeHash(config);
+  const key = threadStateStorageKey(config, event);
+  const repliedKey = threadRepliedStorageKey(config, event);
+  const msgIdentity =
+    event.trigger === "edit_mention"
+      ? `${messageKey(event)}:edit`
+      : messageKey(event);
+  const msgKey = `relay:${scope}:message:${digest(msgIdentity)}`;
+  const lockKey = key + ":lock";
+  const owner = randomUUID();
   if (!(await config.store.setIfAbsent(lockKey, owner, 120)))
     throw new Error("thread_lock_busy");
   try {
@@ -116,17 +248,20 @@ export async function routeSlackThreadEvent(
         typeof state.creating !== "boolean"
       )
         throw new Error("invalid_thread_state");
-    } else
+    } else {
       state = {
         version: 2,
         rootMessageKey: messageKey(event),
         creating: false,
       };
-    const marker = `<!-- relay-thread:${scope}:${digest(threadKey(event))} -->`;
+    }
+    let marker = buildThreadMarker(scope, event, state.epoch);
     const save = () =>
       config.store.set(key, JSON.stringify(state), STATE_TTL_SECONDS);
+
     if (event.operation === "cancel")
       return await cancelThread(event, state, marker, config, save, fetchImpl);
+
     if (state.cancellation && state.cancellation.phase !== "done") {
       state.ignoredThrough = maxTimestamp(
         state.ignoredThrough,
@@ -140,7 +275,140 @@ export async function routeSlackThreadEvent(
       compareTs(event.messageTs, state.ignoredThrough) <= 0
     )
       return { action: "ignored", issueId: state.issueId };
-    if (state.issueId) await validateMappedIssue(config, state.issueId, marker, fetchImpl);
+
+    if (event.operation === "watchdog") {
+      return await handleWatchdogCheck(
+        event,
+        state,
+        marker,
+        repliedKey,
+        config,
+        fetchImpl,
+      );
+    }
+
+    if (event.operation === "steer_ack") {
+      return await handleSteerAck(event, state, marker, config, fetchImpl);
+    }
+
+    const previous = await config.store.get(msgKey);
+    const alreadyDone =
+      Boolean(previous) &&
+      (JSON.parse(previous!) as MessageState).phase === "done";
+
+    if (event.operation === "new_session") {
+      if (alreadyDone) {
+        return { action: "duplicate", issueId: state.issueId };
+      }
+      if (state.epochStartedTs !== event.messageTs) {
+        if (state.issueId) {
+          try {
+            const runs = await listIssueRuns(config, state.issueId, fetchImpl);
+            for (const run of runs) {
+              if (isActiveRun(run)) {
+                await cancelIssueRun(config, state.issueId, run.id, fetchImpl);
+              }
+            }
+          } catch {
+            // Best-effort stop of old session before rotating epoch.
+          }
+        }
+        const nextEpoch = (state.epoch ?? 0) + 1;
+        state = {
+          version: 2,
+          rootMessageKey: messageKey(event),
+          creating: false,
+          epoch: nextEpoch,
+          epochStartedTs: event.messageTs,
+          implicitMode: "open",
+          implicitSilentCount: 0,
+          lastMessageTs: event.messageTs,
+        };
+        marker = buildThreadMarker(scope, event, state.epoch);
+        await save();
+      }
+      if (!event.text.trim()) {
+        await setSlackSessionStatus(
+          config.slackStatusToken,
+          event,
+          "active",
+          fetchImpl,
+        );
+        const resetReaction =
+          config.slackResetReactionName ?? config.slackReactionName;
+        if (config.slackReactionToken && resetReaction) {
+          try {
+            await addSlackReaction(
+              config.slackReactionToken,
+              event.channelId,
+              event.messageTs,
+              resetReaction,
+              fetchImpl,
+            );
+          } catch (error) {
+            console.warn("relay_reaction", {
+              eventId: digest(messageKey(event)),
+              reason: "reaction_failed",
+              ...reactionErrorDetails(error),
+            });
+          }
+        }
+        await config.store.set(
+          msgKey,
+          JSON.stringify({ phase: "done" }),
+          STATE_TTL_SECONDS,
+        );
+        return { action: "session_reset" };
+      }
+    }
+
+    if (state.issueId)
+      await validateMappedIssue(config, state.issueId, marker, fetchImpl);
+
+    const isImplicit = event.trigger === "implicit_thread";
+    let pendingImplicitIncrement = false;
+    let preloadedRuns: IssueRun[] | undefined;
+    if (isImplicit && !alreadyDone) {
+      if (!state.issueId) return { action: "ignored" };
+      const rawReplied = await config.store.get(repliedKey);
+      if (
+        rawReplied &&
+        timestampValid(rawReplied) &&
+        (!state.epochStartedTs || compareTs(rawReplied, state.epochStartedTs) > 0) &&
+        (!state.lastSeenReplyTs || compareTs(rawReplied, state.lastSeenReplyTs) > 0)
+      ) {
+        state.lastSeenReplyTs = rawReplied;
+        state.implicitSilentCount = 0;
+        state.implicitMode = "open";
+      }
+      preloadedRuns = await listIssueRuns(config, state.issueId, fetchImpl);
+      const hasActive = preloadedRuns.some(
+        (run) =>
+          (!config.multicaQueueAgentId ||
+            run.agent_id === config.multicaQueueAgentId) &&
+          isActiveRun(run),
+      );
+      const hasParticipated = Boolean(state.lastSeenReplyTs);
+      if (!hasParticipated && !hasActive) {
+        state.implicitMode = "closed";
+        await save();
+        return { action: "ignored", issueId: state.issueId };
+      }
+      if (hasParticipated && !hasActive) {
+        const maxSilent = config.implicitThreadMaxSilentTurns ?? 3;
+        const streak = state.implicitSilentCount ?? 0;
+        if (maxSilent > 0 && streak >= maxSilent) {
+          state.implicitMode = "closed";
+          await save();
+          return { action: "ignored", issueId: state.issueId };
+        }
+        pendingImplicitIncrement = true;
+      }
+    } else if (!isImplicit && !alreadyDone) {
+      state.implicitMode = "open";
+      state.implicitSilentCount = 0;
+    }
+
     state.lastMessageTs = maxTimestamp(state.lastMessageTs, event.messageTs);
     // 保存触发消息，再尝试外部写入，取消恢复才能找到响应丢失的消息。
     state.reactionMessages ??= raw
@@ -149,22 +417,72 @@ export async function routeSlackThreadEvent(
     if (!state.reactionMessages.includes(event.messageTs))
       state.reactionMessages.push(event.messageTs);
     await save();
+
     let queued = false;
+    let runtimeOffline = false;
+    let steerReceipt: SteerReceipt | undefined;
     const finish = async (
       action: "created" | "comment_persisted" | "duplicate",
     ): Promise<ThreadRouteResult> => {
       // 添加和取消清理共用线程锁，避免迟到的启动 reaction 出现在已取消任务上。
-      if (action !== "duplicate" && config.slackReactionToken && config.slackReactionName) {
+      if (action !== "duplicate" && config.slackReactionToken) {
         try {
-          await addSlackReaction(
-            config.slackReactionToken,
-            event.channelId,
-            event.messageTs,
-            config.slackReactionName,
-            fetchImpl,
-          );
-          if (queued && config.slackQueuedReactionName)
-            await addSlackReaction(config.slackReactionToken, event.channelId, event.messageTs, config.slackQueuedReactionName, fetchImpl);
+          if (
+            steerReceipt &&
+            (steerReceipt.status === "pending" ||
+              steerReceipt.status === "delivering")
+          ) {
+            const pendingReaction =
+              config.slackSteerPendingReactionName ??
+              config.slackQueuedReactionName;
+            if (pendingReaction)
+              await addSlackReaction(
+                config.slackReactionToken,
+                event.channelId,
+                event.messageTs,
+                pendingReaction,
+                fetchImpl,
+              );
+          } else if (steerReceipt && steerReceipt.status === "delivered") {
+            const readReaction =
+              config.slackSteerReadReactionName ?? config.slackReactionName;
+            if (readReaction)
+              await addSlackReaction(
+                config.slackReactionToken,
+                event.channelId,
+                event.messageTs,
+                readReaction,
+                fetchImpl,
+              );
+          } else {
+            if (!isImplicit && config.slackReactionName) {
+              await addSlackReaction(
+                config.slackReactionToken,
+                event.channelId,
+                event.messageTs,
+                config.slackReactionName,
+                fetchImpl,
+              );
+              if (queued && config.slackQueuedReactionName) {
+                await addSlackReaction(
+                  config.slackReactionToken,
+                  event.channelId,
+                  event.messageTs,
+                  config.slackQueuedReactionName,
+                  fetchImpl,
+                );
+              }
+            }
+            if (runtimeOffline && config.slackOfflineReactionName) {
+              await addSlackReaction(
+                config.slackReactionToken,
+                event.channelId,
+                event.messageTs,
+                config.slackOfflineReactionName,
+                fetchImpl,
+              );
+            }
+          }
         } catch (error) {
           console.warn("relay_reaction", {
             eventId: digest(messageKey(event)),
@@ -173,9 +491,14 @@ export async function routeSlackThreadEvent(
           });
         }
       }
-      return { action, issueId: state.issueId };
+      return {
+        action,
+        issueId: state.issueId,
+        ...(steerReceipt ? { steerReceipt } : {}),
+      };
     };
-    const selectionKey = key + ':sent-context-index';
+
+    const selectionKey = state.epoch ? `${key}:epoch:${state.epoch}:sent-context-index` : key + ':sent-context-index';
     type SelectionIndex = { version: 3; cutoffTs: string; initialContext: ThreadContext; request: SlackThreadEvent };
     let recoveredDescription: string | undefined;
     const advanceSelection = async (): Promise<void> => {
@@ -190,6 +513,7 @@ export async function routeSlackThreadEvent(
       const preparedKey = msgKey + ':envelope';
       const frozen = await config.store.get(preparedKey);
       if (frozen) {
+        try { const pf = JSON.parse(frozen) as { replyContext?: { runtimeOnline?: boolean } }; if (pf.replyContext?.runtimeOnline === false) runtimeOffline = true; } catch {}
         console.info('relay_context',{eventId:digest(messageKey(event)),snapshot:'reused',envelopeBytes:Buffer.byteLength(frozen)});
         return frozen;
       }
@@ -264,6 +588,7 @@ export async function routeSlackThreadEvent(
       }
       const agentConfigStartedAt=Date.now();
       const replyContext=await getSlackReplyContext(config,fetchImpl);
+      if(replyContext.runtimeOnline===false)runtimeOffline=true;
       const agentConfigMs=Date.now()-agentConfigStartedAt;
       const assemblyStart=Date.now();
       // First nearby discussion is immutable background; no unrelated new timeline on follow-up.
@@ -300,13 +625,14 @@ export async function routeSlackThreadEvent(
       if(saved===body)await config.store.set(msgKey+':selection-index',JSON.stringify({version:3,cutoffTs:event.messageTs,initialContext:firstContext,request:JSON.parse(body).eventPayload}),24*60*60);
       return saved;
     };
+
     if (!state.issueId) {
       // Recover by immutable description marker before any write. A POST whose
       // result is unknown must never be repeated blindly.
       const existing = await findIssue(config, marker, fetchImpl);
       if (existing) {
         state.issueId = existing.id;
-        recoveredDescription=existing.description??undefined;
+        recoveredDescription = existing.description ?? undefined;
         if (!raw) {
           const original = readTaskEnvelope(existing.description!);
           if (
@@ -315,7 +641,9 @@ export async function routeSlackThreadEvent(
           )
             throw new Error("invalid_thread_state");
           state.rootMessageKey = messageKey(original.eventPayload);
-          if (!state.reactionMessages!.includes(original.eventPayload.messageTs))
+          if (
+            !state.reactionMessages!.includes(original.eventPayload.messageTs)
+          )
             state.reactionMessages!.push(original.eventPayload.messageTs);
         }
       } else {
@@ -324,12 +652,17 @@ export async function routeSlackThreadEvent(
         state.rootMessageKey = messageKey(event);
         state.creating = true;
         await config.store.set(key, JSON.stringify(state), STATE_TTL_SECONDS);
-        await setSlackSessionStatus(config.slackStatusToken, event, "processing", fetchImpl);
+        await setSlackSessionStatus(
+          config.slackStatusToken,
+          event,
+          "processing",
+          fetchImpl,
+        );
         try {
           const created = await createIssue(
             config,
-            formatTaskTitle(event,scope),
-            formatTaskDescription(envelope,marker),
+            formatTaskTitle(event, scope),
+            formatTaskDescription(envelope, marker),
             fetchImpl,
           );
           state.issueId = created.id;
@@ -342,7 +675,12 @@ export async function routeSlackThreadEvent(
             error.status >= 400 &&
             error.status < 500
           ) {
-            await setSlackSessionStatus(config.slackStatusToken, event, "active", fetchImpl);
+            await setSlackSessionStatus(
+              config.slackStatusToken,
+              event,
+              "active",
+              fetchImpl,
+            );
             state.creating = false;
             await config.store.set(
               key,
@@ -356,8 +694,8 @@ export async function routeSlackThreadEvent(
       state.creating = false;
       await config.store.set(key, JSON.stringify(state), STATE_TTL_SECONDS);
     }
-    const previous = await config.store.get(msgKey);
-    if (previous && (JSON.parse(previous) as MessageState).phase === "done")
+
+    if (alreadyDone)
       return await finish("duplicate");
     if (messageKey(event) === state.rootMessageKey) {
       await advanceSelection();
@@ -368,7 +706,8 @@ export async function routeSlackThreadEvent(
       );
       return await finish("created");
     }
-    const messageMarker = `<!-- relay-message:${digest(messageKey(event))} -->`;
+
+    const messageMarker = `<!-- relay-message:${digest(msgIdentity)} -->`;
     const existingComment = await findComment(
       config,
       state.issueId,
@@ -382,12 +721,41 @@ export async function routeSlackThreadEvent(
       )
         throw new Error("ambiguous_comment_create");
       const envelope = await prepare();
-      // Multica runs one task per agent per Issue; a follow-up behind an active run waits its turn.
-      // A redelivery that finds the comment already written skips this check; the marker is cosmetic.
-      if (config.slackQueuedReactionName && config.multicaQueueAgentId) {
+      let steerTaskId: string | undefined;
+      let coalesceParentId: string | undefined;
+      let observedActiveRun = false;
+      if (config.multicaQueueAgentId) {
         try {
-          queued = (await listIssueRuns(config, state.issueId, fetchImpl))
-            .some((run) => run.agent_id === config.multicaQueueAgentId && isActiveRun(run));
+          const runs =
+            preloadedRuns ??
+            (await listIssueRuns(config, state.issueId, fetchImpl));
+          observedActiveRun = runs.some(
+            (run) =>
+              run.agent_id === config.multicaQueueAgentId && isActiveRun(run),
+          );
+          const steerable = runs.find(
+            (run) =>
+              run.agent_id === config.multicaQueueAgentId && isSteerableRun(run),
+          );
+          if (steerable) {
+            steerTaskId = steerable.id;
+          } else {
+            const queuedCommentRun = runs.find(
+              (run) =>
+                run.agent_id === config.multicaQueueAgentId &&
+                run.status === "queued" &&
+                (run.trigger_thread_id || run.trigger_comment_id),
+            );
+            if (queuedCommentRun) {
+              coalesceParentId =
+                (queuedCommentRun.trigger_thread_id ||
+                  queuedCommentRun.trigger_comment_id) ??
+                undefined;
+            }
+            if (config.slackQueuedReactionName) {
+              queued = observedActiveRun;
+            }
+          }
         } catch {
           queued = false;
         }
@@ -397,17 +765,39 @@ export async function routeSlackThreadEvent(
         JSON.stringify({ phase: "writing" }),
         STATE_TTL_SECONDS,
       );
-      await setSlackSessionStatus(config.slackStatusToken, event, "processing", fetchImpl);
-      try {
-        await createComment(
-          config,
-          state.issueId,
-          formatTaskDescription(envelope,messageMarker,true),
+      if (!isImplicit || steerTaskId) {
+        await setSlackSessionStatus(
+          config.slackStatusToken,
+          event,
+          "processing",
           fetchImpl,
         );
+      }
+      try {
+        const createdComment = await createComment(
+          config,
+          state.issueId,
+          formatTaskDescription(envelope, messageMarker, true),
+          fetchImpl,
+          steerTaskId
+            ? { steerTaskIds: [steerTaskId] }
+            : coalesceParentId
+              ? { parentId: coalesceParentId }
+              : undefined,
+        );
+        if (steerTaskId) {
+          const bound = extractSupplementReceipt(createdComment, steerTaskId);
+          if (bound) {
+            steerReceipt = {
+              commentId: createdComment.id,
+              taskId: bound.task_id,
+              status: bound.status,
+            };
+          } else if (config.slackQueuedReactionName) {
+            queued = observedActiveRun;
+          }
+        }
       } catch (error) {
-        // Do not clear ambiguous writes. Explicit rejections are retried by
-        // the queue after storing a non-writing phase.
         if (
           error instanceof ApiError &&
           error.status >= 400 &&
@@ -421,6 +811,10 @@ export async function routeSlackThreadEvent(
         throw error;
       }
     }
+    if (pendingImplicitIncrement) {
+      state.implicitSilentCount = (state.implicitSilentCount ?? 0) + 1;
+      await save();
+    }
     await advanceSelection();
     await config.store.set(
       msgKey,
@@ -431,4 +825,291 @@ export async function routeSlackThreadEvent(
   } finally {
     await config.store.releaseIfOwner(lockKey, owner);
   }
+}
+
+async function handleSteerAck(
+  event: SlackThreadEvent,
+  state: ThreadState,
+  marker: string,
+  config: ThreadRouterConfig,
+  fetchImpl: typeof fetch,
+): Promise<ThreadRouteResult> {
+  const check = event.steerCheck;
+  if (!check || !state.issueId || state.issueId !== check.issueId)
+    return { action: "ignored", issueId: state.issueId };
+  await validateMappedIssue(config, state.issueId, marker, fetchImpl);
+  const comment = await findCommentById(
+    config,
+    state.issueId,
+    check.commentId,
+    fetchImpl,
+  );
+  if (!comment) return { action: "ignored", issueId: state.issueId };
+  const receipt = extractSupplementReceipt(comment, check.taskId);
+  const pendingReaction =
+    config.slackSteerPendingReactionName ?? config.slackQueuedReactionName;
+  const readReaction =
+    config.slackSteerReadReactionName ?? config.slackReactionName;
+  if (!receipt) return { action: "ignored", issueId: state.issueId };
+  if (receipt.status === "delivered") {
+    let targetStillActive = true;
+    try {
+      const runs = await listIssueRuns(config, state.issueId, fetchImpl);
+      const targetRun = runs.find((run) => run.id === check.taskId);
+      if (targetRun && !isActiveRun(targetRun)) {
+        targetStillActive = false;
+      }
+    } catch {
+      // Default to active if status lookup fails transiently.
+    }
+    if (config.slackReactionToken) {
+      try {
+        if (pendingReaction && pendingReaction !== readReaction)
+          await removeSlackReaction(
+            config.slackReactionToken,
+            event.channelId,
+            event.messageTs,
+            pendingReaction,
+            fetchImpl,
+          );
+        if (readReaction && targetStillActive)
+          await addSlackReaction(
+            config.slackReactionToken,
+            event.channelId,
+            event.messageTs,
+            readReaction,
+            fetchImpl,
+          );
+      } catch (error) {
+        console.warn("relay_reaction", {
+          eventId: digest(messageKey(event)),
+          reason: "reaction_failed",
+          ...reactionErrorDetails(error),
+        });
+      }
+    }
+    return {
+      action: "steer_delivered",
+      issueId: state.issueId,
+      steerReceipt: {
+        commentId: check.commentId,
+        taskId: check.taskId,
+        status: "delivered",
+      },
+    };
+  }
+  if (receipt.status === "pending" || receipt.status === "delivering") {
+    return {
+      action: "steer_pending",
+      issueId: state.issueId,
+      steerReceipt: {
+        commentId: check.commentId,
+        taskId: check.taskId,
+        status: receipt.status,
+      },
+    };
+  }
+  if (receipt.status === "failed") {
+    const runs = await listIssueRuns(config, state.issueId, fetchImpl);
+    const targetRun = runs.find((run) => run.id === check.taskId);
+    if (targetRun && isSteerableRun(targetRun) && check.attempt <= 2) {
+      await retryTaskSupplement(
+        config,
+        state.issueId,
+        check.taskId,
+        check.commentId,
+        fetchImpl,
+      );
+      return {
+        action: "steer_pending",
+        issueId: state.issueId,
+        steerReceipt: {
+          commentId: check.commentId,
+          taskId: check.taskId,
+          status: "pending",
+        },
+      };
+    }
+    const wakeAgentId = config.multicaQueueAgentId;
+    const hasActiveAgentRun = wakeAgentId
+      ? runs.some((run) => run.agent_id === wakeAgentId && isActiveRun(run))
+      : false;
+    if (wakeAgentId && !hasActiveAgentRun) {
+      const wakeupMarker = `<!-- relay-steer-fallback:${check.commentId} -->`;
+      const existingFallback = await findComment(
+        config,
+        state.issueId,
+        wakeupMarker,
+        fetchImpl,
+      );
+      if (!existingFallback) {
+        await createComment(
+          config,
+          state.issueId,
+          `${wakeupMarker}\n[@Agent](mention://agent/${wakeAgentId}) 上一轮运行结束前未读到 Slack 插话评论 \`${check.commentId}\`，请读取该条评论的请求上下文并回复 Slack 原线程。`,
+          fetchImpl,
+          { parentId: check.commentId },
+        );
+      }
+    }
+    if (config.slackReactionToken) {
+      try {
+        if (pendingReaction && pendingReaction !== readReaction)
+          await removeSlackReaction(
+            config.slackReactionToken,
+            event.channelId,
+            event.messageTs,
+            pendingReaction,
+            fetchImpl,
+          );
+        if (readReaction && wakeAgentId && !hasActiveAgentRun)
+          await addSlackReaction(
+            config.slackReactionToken,
+            event.channelId,
+            event.messageTs,
+            readReaction,
+            fetchImpl,
+          );
+      } catch (error) {
+        console.warn("relay_reaction", {
+          eventId: digest(messageKey(event)),
+          reason: "reaction_failed",
+          ...reactionErrorDetails(error),
+        });
+      }
+    }
+    return {
+      action: "steer_failed",
+      issueId: state.issueId,
+      steerReceipt: {
+        commentId: check.commentId,
+        taskId: check.taskId,
+        status: "failed",
+      },
+    };
+  }
+  return { action: "ignored", issueId: state.issueId };
+}
+
+async function handleWatchdogCheck(
+  event: SlackThreadEvent,
+  state: ThreadState,
+  marker: string,
+  repliedKey: string,
+  config: ThreadRouterConfig,
+  fetchImpl: typeof fetch,
+): Promise<ThreadRouteResult> {
+  const check = event.watchdogCheck;
+  if (!check || !state.issueId || state.issueId !== check.issueId) {
+    return { action: "ignored", issueId: state.issueId };
+  }
+  await validateMappedIssue(config, state.issueId, marker, fetchImpl);
+  const runs = await listIssueRuns(config, state.issueId, fetchImpl);
+  const scoped = config.multicaQueueAgentId
+    ? runs.filter((run) => run.agent_id === config.multicaQueueAgentId)
+    : runs;
+  if (scoped.some(isActiveRun)) {
+    return { action: "watchdog_active", issueId: state.issueId };
+  }
+  const latest = scoped[0];
+  if (!latest || (latest.status !== "failed" && latest.status !== "cancelled")) {
+    return { action: "ignored", issueId: state.issueId };
+  }
+  const repliedTs = await config.store.get(repliedKey);
+  if (repliedTs && timestampValid(repliedTs) && compareTs(repliedTs, event.messageTs) > 0) {
+    return { action: "ignored", issueId: state.issueId };
+  }
+  if (config.slackReactionToken) {
+    const reactionsToClear = new Set(
+      [
+        config.slackReactionName,
+        config.slackQueuedReactionName,
+        config.slackOfflineReactionName,
+        config.slackSteerPendingReactionName,
+      ].filter((x): x is string => Boolean(x)),
+    );
+    for (const reaction of reactionsToClear) {
+      try {
+        await removeSlackReaction(
+          config.slackReactionToken,
+          event.channelId,
+          event.messageTs,
+          reaction,
+          fetchImpl,
+        );
+      } catch {
+        // Best-effort cleanup of stuck reaction.
+      }
+    }
+  }
+  await setSlackSessionStatus(
+    config.slackStatusToken,
+    event,
+    "active",
+    fetchImpl,
+  );
+  if (
+    latest.status === "failed" &&
+    config.slackAlertChannelId &&
+    config.slackReactionToken
+  ) {
+    const permalink = `https://slack.com/archives/${event.channelId}/p${event.messageTs.replace(".", "")}?thread_ts=${event.threadTs}&cid=${event.channelId}`;
+    const alertText = `⚠️ Multica 任务异常失败（\`failed\`），已自动清理残留状态：${permalink} · Issue \`${state.issueId}\``;
+    try {
+      const alertRes = await fetchImpl("https://slack.com/api/chat.postMessage", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${config.slackStatusToken ?? config.slackReactionToken}`,
+          "content-type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify({
+          channel: config.slackAlertChannelId,
+          text: alertText,
+          unfurl_links: false,
+        }),
+        signal: AbortSignal.timeout(3000),
+      });
+      const alertBody: unknown = await alertRes.json().catch(() => null);
+      if (
+        !alertRes.ok ||
+        !alertBody ||
+        typeof alertBody !== "object" ||
+        (alertBody as { ok?: unknown }).ok !== true
+      ) {
+        console.warn("relay_watchdog", { reason: "alert_delivery_failed" });
+      }
+    } catch {
+      console.warn("relay_watchdog", { reason: "alert_delivery_failed" });
+    }
+  }
+  return { action: "watchdog_cleaned", issueId: state.issueId };
+}
+
+function extractSupplementReceipt(
+  comment: MulticaComment,
+  expectedTaskId: string,
+): { task_id: string; status: SteerReceipt["status"] } | undefined {
+  const validStatus = (s: unknown): s is SteerReceipt["status"] =>
+    s === "pending" ||
+    s === "delivering" ||
+    s === "delivered" ||
+    s === "failed";
+  if (Array.isArray(comment.supplements)) {
+    const match = comment.supplements.find(
+      (item) =>
+        item && item.task_id === expectedTaskId && validStatus(item.status),
+    );
+    if (match)
+      return { task_id: match.task_id, status: match.status as SteerReceipt["status"] };
+  }
+  if (
+    comment.supplement_task_id === expectedTaskId &&
+    validStatus(comment.supplement_status)
+  ) {
+    return {
+      task_id: comment.supplement_task_id,
+      status: comment.supplement_status,
+    };
+  }
+  return undefined;
 }

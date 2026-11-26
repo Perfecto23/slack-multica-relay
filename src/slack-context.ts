@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { clip, compareTs, projectFiles, sourceMessageFingerprint, timestampValid, updateCoverage, type ContextSection, type ContextMessage, type ThreadContext } from './context-envelope.js';
 import type { SlackThreadEvent } from './thread-router.js';
-import { agentBody } from './slack-message-text.js';
+import { agentBody, isRelayProgressMessage } from './slack-message-text.js';
 import { missingSection, noteOmission } from './context-coverage.js';
 
 type RawMessage = Record<string, unknown>;
@@ -63,6 +63,7 @@ export async function readContext(event: SlackThreadEvent, token: string, fetchI
           if(method==='history'&&!referenceTs&&raw.ts===event.threadTs)continue;
           if(method==='replies'&&compareTs(raw.ts,rootTs)<0)continue;
           if(method==='replies'&&!optional&&options.sinceTs&&raw.ts!==rootTs&&compareTs(raw.ts,options.sinceTs)<0)continue;
+          if(isRelayProgressMessage(raw))continue;
           if(optional&&raw.subtype&&!['bot_message','file_share','thread_broadcast','me_message'].includes(String(raw.subtype)))continue;
           if(timestampValid(raw.thread_ts))parents.set(raw.ts,raw.thread_ts);
           if(method==='history'&&typeof raw.reply_count==='number'&&raw.reply_count>0)

@@ -22,13 +22,22 @@ export function findTargetMention(
   return undefined;
 }
 
+/** Allowlist of Slack message subtypes that represent conversational posts rather than channel housekeeping. */
+export const CONVERSATIONAL_SUBTYPES: ReadonlySet<string> = new Set([
+  '',
+  'file_share',
+  'thread_broadcast',
+  'me_message',
+  'bot_message',
+]);
+
 export function isSupportedMessage(event: SlackMessageEvent): boolean {
-  const subtype = typeof event.subtype === 'string' ? event.subtype : undefined;
+  const subtype = typeof event.subtype === 'string' ? event.subtype : '';
   return (event.type === 'message' || event.type === 'app_mention')
     && typeof event.channel === 'string'
     && typeof event.ts === 'string'
     && typeof event.text === 'string'
-    && !['message_changed', 'message_deleted'].includes(subtype ?? '');
+    && CONVERSATIONAL_SUBTYPES.has(subtype);
 }
 
 export interface SlackMessageEvent {
@@ -44,6 +53,10 @@ export interface SlackMessageEvent {
   bot_id?: unknown;
   app_id?: unknown;
   files?: unknown;
+  attachments?: unknown;
+  blocks?: unknown;
+  message?: unknown;
+  previous_message?: unknown;
 }
 
 export function isCancelCommand(

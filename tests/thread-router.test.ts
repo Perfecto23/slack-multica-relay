@@ -486,3 +486,386 @@ describe("投递成功后的 reaction 诊断", () => {
     expect(JSON.stringify(warning.mock.calls)).not.toContain("private-response");
   });
 });
+
+describe("Steer 实时插话与等待读取/已读取表情反馈", () => {
+  it("steers into a running task-supplement-v1 turn, marks pending reaction, then swaps to read reaction on steer_ack", async () => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "bug_eyes";
+    f.config.slackQueuedReactionName = "hourglass_flowing_sand";
+    f.config.slackSteerPendingReactionName = "hourglass_flowing_sand";
+    f.config.multicaQueueAgentId = "agent";
+
+    const reactions: { op: "add" | "remove"; name: string; ts: string }[] = [];
+    const postedCommentBodies: Record<string, unknown>[] = [];
+    let supplementStatus: "pending" | "delivered" = "pending";
+
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/reactions.add")) {
+        const b = JSON.parse(String(init?.body));
+        reactions.push({ op: "add", name: b.name, ts: b.timestamp });
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/reactions.remove")) {
+        const b = JSON.parse(String(init?.body));
+        reactions.push({ op: "remove", name: b.name, ts: b.timestamp });
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/task-runs")) {
+        return Response.json([
+          {
+            id: "run-live-1",
+            issue_id: f.issues[0]!.id,
+            workspace_id: "ws",
+            agent_id: "agent",
+            status: "running",
+            supplement_capability: "task-supplement-v1",
+            can_supplement: true,
+          },
+        ]);
+      }
+      if (url.includes("/comments") && init?.method === "POST") {
+        const parsed = JSON.parse(String(init.body));
+        postedCommentBodies.push(parsed);
+        const row = {
+          id: "comment-steered-1",
+          content: parsed.content,
+          supplement_task_id: "run-live-1",
+          supplement_status: supplementStatus,
+          supplements: [{ task_id: "run-live-1", agent_id: "agent", status: supplementStatus }],
+        };
+        (f.comments as Record<string, unknown>[]).push(row);
+        return Response.json(row, { status: 201 });
+      }
+      if (url.includes("/comments") && init?.method !== "POST") {
+        return Response.json(
+          f.comments.map((c) =>
+            c.id === "comment-steered-1"
+              ? {
+                  ...c,
+                  supplement_task_id: "run-live-1",
+                  supplement_status: supplementStatus,
+                  supplements: [{ task_id: "run-live-1", agent_id: "agent", status: supplementStatus }],
+                }
+              : c,
+          ),
+        );
+      }
+      return f.fetcher(input, init);
+    };
+
+    // 1. Root message creates issue and gets bug_eyes
+    await routeSlackThreadEvent(root, f.config, fetcher);
+    expect(reactions).toEqual([{ op: "add", name: "bug_eyes", ts: "100.000001" }]);
+
+    // 2. Follow-up while agent is running steers into run-live-1 and ONLY adds waiting hourglass_flowing_sand
+    const followup = { ...root, messageTs: "102.000001", text: "<@U1> 先回我一句再继续" };
+    const dispatchResult = await routeSlackThreadEvent(followup, f.config, fetcher);
+    expect(postedCommentBodies[0]?.steer_task_ids).toEqual(["run-live-1"]);
+    expect(dispatchResult).toEqual({
+      action: "comment_persisted",
+      issueId: "issue-1",
+      steerReceipt: { commentId: "comment-steered-1", taskId: "run-live-1", status: "pending" },
+    });
+    expect(reactions).toEqual([
+      { op: "add", name: "bug_eyes", ts: "100.000001" },
+      { op: "add", name: "hourglass_flowing_sand", ts: "102.000001" },
+    ]);
+
+    // 3. First steer_ack while still pending keeps hourglass_flowing_sand
+    const ackPending = await routeSlackThreadEvent(
+      {
+        ...followup,
+        operation: "steer_ack",
+        steerCheck: { issueId: "issue-1", commentId: "comment-steered-1", taskId: "run-live-1", attempt: 1 },
+      },
+      f.config,
+      fetcher,
+    );
+    expect(ackPending.action).toBe("steer_pending");
+    expect(reactions).toHaveLength(2);
+
+    // 4. Once daemon delivers supplement to running agent, steer_ack removes hourglass_flowing_sand and adds bug_eyes!
+    supplementStatus = "delivered";
+    const ackDelivered = await routeSlackThreadEvent(
+      {
+        ...followup,
+        operation: "steer_ack",
+        steerCheck: { issueId: "issue-1", commentId: "comment-steered-1", taskId: "run-live-1", attempt: 2 },
+      },
+      f.config,
+      fetcher,
+    );
+    expect(ackDelivered.action).toBe("steer_delivered");
+    expect(reactions).toEqual([
+      { op: "add", name: "bug_eyes", ts: "100.000001" },
+      { op: "add", name: "hourglass_flowing_sand", ts: "102.000001" },
+      { op: "remove", name: "hourglass_flowing_sand", ts: "102.000001" },
+      { op: "add", name: "bug_eyes", ts: "102.000001" },
+    ]);
+  });
+
+  it("wakes the agent via fallback comment if supplement failed because the target turn ended mid-flight", async () => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "bug_eyes";
+    f.config.slackSteerPendingReactionName = "hourglass_flowing_sand";
+    f.config.multicaQueueAgentId = "agent";
+
+    await routeSlackThreadEvent(root, f.config, f.fetcher);
+    f.comments.push({
+      id: "comment-steered-dead",
+      content: "<!-- relay-message:abc -->\nbody",
+      supplement_task_id: "run-ended-1",
+      supplement_status: "failed",
+      supplements: [{ task_id: "run-ended-1", agent_id: "agent", status: "failed", failure_reason: "turn_ended" }],
+    } as never);
+
+    const wakeupPosts: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/reactions.add") || url.endsWith("/reactions.remove")) {
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/task-runs")) {
+        return Response.json([
+          { id: "run-ended-1", issue_id: "issue-1", workspace_id: "ws", agent_id: "agent", status: "completed" },
+        ]);
+      }
+      if (url.includes("/comments") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        wakeupPosts.push(body);
+        const row = { id: "wakeup-1", content: body.content };
+        f.comments.push(row);
+        return Response.json(row, { status: 201 });
+      }
+      return f.fetcher(input, init);
+    };
+
+    const res = await routeSlackThreadEvent(
+      {
+        ...root,
+        messageTs: "102.000001",
+        operation: "steer_ack",
+        steerCheck: { issueId: "issue-1", commentId: "comment-steered-dead", taskId: "run-ended-1", attempt: 1 },
+      },
+      f.config,
+      fetcher,
+    );
+    expect(res.action).toBe("steer_failed");
+    expect(wakeupPosts).toHaveLength(1);
+    expect(String(wakeupPosts[0]?.content)).toContain("mention://agent/agent");
+    expect(wakeupPosts[0]?.parent_id).toBe("comment-steered-dead");
+  });
+
+  it("coalesces rapid follow-ups into an unclaimed queued comment-run via parent_id", async () => {
+    const f = fixture();
+    f.config.multicaQueueAgentId = "agent";
+    await routeSlackThreadEvent(root, f.config, f.fetcher);
+
+    const postedPayloads: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/task-runs")) {
+        return Response.json([
+          {
+            id: "run-queued-2",
+            issue_id: "issue-1",
+            workspace_id: "ws",
+            agent_id: "agent",
+            status: "queued",
+            trigger_comment_id: "comment-root-2",
+            trigger_thread_id: "comment-root-2",
+          },
+        ]);
+      }
+      if (url.includes("/comments") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        postedPayloads.push(body);
+        const row = { id: `c-${postedPayloads.length}`, content: body.content };
+        f.comments.push(row);
+        return Response.json(row, { status: 201 });
+      }
+      return f.fetcher(input, init);
+    };
+
+    const res = await routeSlackThreadEvent(
+      { ...root, messageTs: "103.000001", text: "<@U1> 顺便补张日志截图" },
+      f.config,
+      fetcher,
+    );
+    expect(res.action).toBe("comment_persisted");
+    expect(postedPayloads).toHaveLength(1);
+    expect(postedPayloads[0]?.parent_id).toBe("comment-root-2");
+    expect(postedPayloads[0]?.steer_task_ids).toBeUndefined();
+  });
+
+  it("enforces implicit thread participation, stealth zero-reaction entry, and silent auto-cooldown", async () => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "bug_eyes";
+    f.config.multicaQueueAgentId = "agent";
+    f.config.implicitThreadMaxSilentTurns = 2;
+
+    const reactions: string[] = [];
+    let runs: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/reactions.add")) {
+        reactions.push(JSON.parse(String(init?.body)).name);
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/task-runs")) {
+        return Response.json(runs);
+      }
+      return f.fetcher(input, init);
+    };
+
+    // 1. Explicit root mention creates issue and adds bug_eyes
+    await routeSlackThreadEvent(root, f.config, fetcher);
+    expect(reactions).toEqual(["bug_eyes"]);
+
+    // 2. Initial run ended silently (no `:replied` in store, no active run) -> implicit follow-up closes mode & ignores!
+    runs = [{ id: "r1", issue_id: "issue-1", workspace_id: "ws", agent_id: "agent", status: "completed" }];
+    const ignoredUnparticipated = await routeSlackThreadEvent(
+      { ...root, messageTs: "101.000001", text: "同事继续聊别的", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    expect(ignoredUnparticipated.action).toBe("ignored");
+    expect(f.comments).toHaveLength(0);
+
+    // 3. Explicit mention re-opens thread, and agent replies in Slack (setting `:replied` key)
+    const explicit2 = await routeSlackThreadEvent(
+      { ...root, messageTs: "102.000001", text: "<@U1> 小 p 查一下" },
+      f.config,
+      fetcher,
+    );
+    expect(explicit2.action).toBe("comment_persisted");
+    expect(reactions).toEqual(["bug_eyes", "bug_eyes"]);
+
+    const { threadRepliedStorageKey } = await import("../src/thread-router.js");
+    await f.config.store.set(threadRepliedStorageKey(f.config, root), "102.500001", 3600);
+
+    // 4. Two implicit follow-ups enter stealthily (NO new bug_eyes reaction!), then 3rd hits cooldown!
+    const imp1 = await routeSlackThreadEvent(
+      { ...root, messageTs: "103.000001", text: "收到谢谢", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    const imp2 = await routeSlackThreadEvent(
+      { ...root, messageTs: "104.000001", text: "我再去确认下", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    const imp3 = await routeSlackThreadEvent(
+      { ...root, messageTs: "105.000001", text: "好的", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    expect(imp1.action).toBe("comment_persisted");
+    expect(imp2.action).toBe("comment_persisted");
+    expect(imp3.action).toBe("ignored");
+    // Stealth check: reactions stayed at 2 (zero reactions added on implicit turns!)
+    expect(reactions).toEqual(["bug_eyes", "bug_eyes"]);
+  });
+
+  it("supports !new session reset, offline runtime zzz reaction, and failed-run watchdog cleanup + alert", async () => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "bug_eyes";
+    f.config.slackOfflineReactionName = "zzz";
+    f.config.slackResetReactionName = "sparkles";
+    f.config.slackAlertChannelId = "DALERT";
+    f.config.multicaQueueAgentId = "agent";
+    f.config.multicaCheckRuntimeOnline = true;
+
+    const reactions: { op: string; name: string; ts: string }[] = [];
+    const alerts: Record<string, unknown>[] = [];
+    let runtimeStatus = "offline";
+    let runStatus = "failed";
+
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/api/agents/agent")) {
+        return Response.json({
+          id: "agent",
+          workspace_id: "ws",
+          model: "gemini-4-hydrogen-medium",
+          runtime_bound: true,
+          runtime_id: "rt-mac",
+        });
+      }
+      if (url.endsWith("/api/runtimes")) {
+        return Response.json([{ id: "rt-mac", status: runtimeStatus }]);
+      }
+      if (url.endsWith("/reactions.add")) {
+        const b = JSON.parse(String(init?.body));
+        reactions.push({ op: "add", name: b.name, ts: b.timestamp });
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/reactions.remove")) {
+        const b = JSON.parse(String(init?.body));
+        reactions.push({ op: "remove", name: b.name, ts: b.timestamp });
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/chat.postMessage")) {
+        alerts.push(JSON.parse(String(init?.body)));
+        return Response.json({ ok: true, ts: "999.000001" });
+      }
+      if (url.endsWith("/task-runs")) {
+        return Response.json([
+          { id: "run-dead", issue_id: f.issues.at(-1)?.id ?? "issue-1", workspace_id: "ws", agent_id: "agent", status: runStatus },
+        ]);
+      }
+      if (url.includes("/cancel")) {
+        return Response.json({ ok: true });
+      }
+      return f.fetcher(input, init);
+    };
+
+    // 1. Offline runtime stacks `zzz` alongside `bug_eyes`
+    const created1 = await routeSlackThreadEvent(root, f.config, fetcher);
+    expect(created1.action).toBe("created");
+    expect(reactions).toEqual([
+      { op: "add", name: "bug_eyes", ts: "100.000001" },
+      { op: "add", name: "zzz", ts: "100.000001" },
+    ]);
+
+    // 2. Watchdog detects failed run -> removes stuck reactions and posts alert to DALERT
+    const dog = await routeSlackThreadEvent(
+      {
+        ...root,
+        operation: "watchdog",
+        watchdogCheck: { issueId: created1.issueId!, attempt: 1 },
+      },
+      f.config,
+      fetcher,
+    );
+    expect(dog.action).toBe("watchdog_cleaned");
+    expect(reactions.some((r) => r.op === "remove" && r.name === "zzz")).toBe(true);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.channel).toBe("DALERT");
+    expect(String(alerts[0]?.text)).toContain(created1.issueId!);
+
+    // 3. `!new` without prompt resets thread binding and adds `sparkles`, then next message creates issue-2!
+    runtimeStatus = "online";
+    runStatus = "completed";
+    const resetRes = await routeSlackThreadEvent(
+      { ...root, messageTs: "110.000001", text: "", operation: "new_session" },
+      f.config,
+      fetcher,
+    );
+    expect(resetRes.action).toBe("session_reset");
+    expect(reactions.at(-1)).toEqual({ op: "add", name: "sparkles", ts: "110.000001" });
+
+    const created2 = await routeSlackThreadEvent(
+      { ...root, messageTs: "111.000001", text: "<@U1> 全新话题" },
+      f.config,
+      fetcher,
+    );
+    expect(created2.action).toBe("created");
+    expect(created2.issueId).toBe("issue-2");
+  });
+});
