@@ -1,9 +1,0 @@
-{
-  "installCommand": "pnpm install --frozen-lockfile",
-  "buildCommand": "pnpm lint",
-  "outputDirectory": "public",
-  "cloudFunctions": {
-    "overseasRegions": ["ap-singapore"],
-    "nodejs": { "maxDuration": 60 }
-  }
-}

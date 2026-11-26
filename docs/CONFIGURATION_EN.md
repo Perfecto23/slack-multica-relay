@@ -2,7 +2,7 @@
 
 **English** | [简体中文](CONFIGURATION.md)
 
-The Relay and the Multica Agent Runtime are separate trust domains. Relay variables belong to Vercel, EdgeOne, or Cloudflare Workers. Agent Runtime variables belong to the machine or Pod that executes the selected Multica Agent. Do not copy one environment wholesale into the other.
+The Relay and the Multica Agent Runtime are separate trust domains. Relay variables belong to Cloudflare Workers. Agent Runtime variables belong to the machine or Pod that executes the selected Multica Agent. Do not copy one environment wholesale into the other.
 
 ## Relay deployment environment
 
@@ -207,10 +207,6 @@ To preserve existing threads during an Agent-to-Team migration, set MULTICA_THRE
 Cached mappings are revalidated against the current project, assignee and marker. Cancellation binds the current Issue/workspace run set, including multiple Team members; later runs are preserved and reported. Team reply snapshots have agentId=null and status=unavailable. Final model statistics come from the current run's actual Agent.
 
 The designated reply adapter uses private assigneeType="squad" and assigneeId fields. Match threadScopeId and legacyAgentId during migration to preserve existing delivery identities. Existing single-Agent agentId configurations remain supported. Team members must share one FINAL_REPLY_CONFIG path and persistent ledger directory; per-host file locks do not deduplicate across separate machines or directories. Keep one designated delivery role.
-
-## Daily and weekly workflows
-
-See [workflow setup](duty/SETUP.md) and [role templates](../prompts/README.md). Configure all identities and tool paths explicitly, pin the scheduler revision, preserve private persona/style settings, and verify deployment separately from local tests. Daily investigation uses two lanes followed by serial repair; the board distinguishes merged PRs from verified production delivery.
 
 ## Author identity and silent cleanup
 

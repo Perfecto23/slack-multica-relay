@@ -27,7 +27,7 @@
 - **原线程取消**：目标用户可通过 mention + cancel/取消停止关联 run，持久化取消与 reaction 清理进度。
 - **最终回复资料**：并行 Skill 统计、Multica 任务入口和 GitHub PR/分支关联；个人风格与表情由私有配置提供。
 - **最终发送去重**：每个来源 Issue/comment 对应稳定 delivery block ID；本地 ledger 记录 `attempting → accepted → sent`。
-- **多平台入口**：共享核心逻辑可由 Vercel Functions、EdgeOne Cloud Functions 或 Cloudflare Workers 承载。
+- **Cloudflare Workers 单栈入口**：由 Cloudflare Workers 承载 `/api/slack/events`、`/api/queue/consume` 与 `/api/health`。
 
 ## 工作流程
 
@@ -56,7 +56,7 @@ Configured Multica Agent
             └─ 回复原 Slack thread
 ```
 
-Relay 部署环境和 Agent Runtime 是两个独立的信任域。Vercel/EdgeOne/Cloudflare 负责入口、队列消费和 Multica 路由；私有 Agent Instructions、Skills、Slack user token 与 reply adapter 配置保存在执行 Agent 的 Runtime。
+Relay 部署环境和 Agent Runtime 是两个独立的信任域。Cloudflare Workers 负责入口、队列消费和 Multica 路由；私有 Agent Instructions、Skills、Slack user token 与 reply adapter 配置保存在执行 Agent 的 Runtime。
 
 ## 上下文模型
 
@@ -85,8 +85,6 @@ Multica 写入通过 Redis 状态和稳定 marker 处理重试。最终 Slack �
 ## 项目结构
 
 ```text
-api/                         Vercel Functions 入口
-cloud-functions/             EdgeOne Cloud Functions 入口
 src/cloudflare.ts            Cloudflare Workers 入口
 wrangler.jsonc               Workers 部署配置
 src/                         共享 Relay、上下文、路由与持久化逻辑
@@ -109,7 +107,7 @@ tests/                       TypeScript 与 Python 测试
 - QStash；
 - Relay 专用 Upstash Redis；
 - 可访问目标 Workspace、Project 和 Agent 的 Multica PAT；
-- Vercel、EdgeOne 或 Cloudflare Workers 部署环境。
+- Cloudflare Workers 部署环境。
 
 如需通过本地 adapter 以指定 user identity 回复，还需要：
 
@@ -134,27 +132,13 @@ pnpm lint
 
 完整变量来源、Runtime 配置和部署验收步骤见 [配置说明](docs/CONFIGURATION.md)。
 
-## 部署入口
+## 部署入口（Cloudflare Workers）
 
-| 平台 | Slack Events | Queue consumer | Health |
-| --- | --- | --- | --- |
-| Vercel | `/api/slack/events` | `/api/queue/consume` | `/api/health` |
-| EdgeOne | `/api/slack/events` | `/api/queue/consume` | `/api/health` |
-| Cloudflare Workers | `/api/slack/events` | `/api/queue/consume` | `/api/health` |
-
-### Vercel / EdgeOne
-
-1. 在 Vercel 或 EdgeOne 中导入本仓库；平台配置已分别保存在 `vercel.json` 和 `edgeone.json`。
-2. 按 [配置说明](docs/CONFIGURATION.md) 创建 Relay 环境变量，并把 token、PAT 和 signing key 放入平台 Secret Store。
-3. 确定公开域名后，将 `RELAY_CONSUMER_URL` 设置为该域名下准确的 `/api/queue/consume`；它必须与 QStash 实际调用和验签使用的 URL 完全一致。
-4. 部署通过测试的 immutable commit，回读 `/api/health`。
-5. 将 Slack App Request URL 指向 `/api/slack/events`，完成 URL verification，并只订阅目标会话类型需要的 message events。
-6. 在授权测试频道发送一条 mention，分别核验 QStash 接收、Multica Issue/comment、reaction identity、Agent execution 和原 thread 最终回复。
-7. 再用 blocked channel 或 sender 验证不会产生 QStash 与 Multica 副作用。
-
-配置、deployment ready 或 HTTP 200 只能证明对应阶段，不能代替完整链路验收。
-
-### Cloudflare Workers
+| 路由 | 用途 |
+| --- | --- |
+| `/api/slack/events` | Slack Events 入口 |
+| `/api/queue/consume` | QStash 队列消费入口 |
+| `/api/health` | 健康检查 |
 
 使用 `pnpm dev:cf` 本地运行、`pnpm build:cf` 离线构建；配置账号和 Secrets 后使用 `pnpm deploy:cf` 发布。完整步骤见 [Cloudflare 配置](docs/CONFIGURATION.md#cloudflare-workers)。Workers 承载 Relay；QStash、Upstash Redis 和私有 Multica Runtime 仍为必要组件。
 
@@ -195,16 +179,9 @@ pnpm lint   # TypeScript typecheck
 - [贡献指南](CONTRIBUTING_ZH.md)
 
 
-## Team 路由与值守工作流
+## Team 路由
 
-支持单 Agent 和 Team（squad），可显式保留旧 Agent 线程 scope 迁移；已有 v5 上下文、确定性回复、附件回执与 Cloudflare 支持继续保留。配置见 [Agent / Team 路由](docs/CONFIGURATION.md#agent--team-路由)。
-
-- 每日值守：三源采集、两工位调查、完整索引、全局串行修复、有界失败跳过和受阻接续。
-- 周度值守：Leader 选题和七项决策卡、真人决定版本、Engineer 串行交付与验收。
-- 看板：阶段进度、历史日期、静态 HTML、回告与回应跟踪；PR 已合并和生产发布已核验分开统计。
-- Prompt：通用角色协议与私有人格分离，保留自己的表达、工具绑定、身份和授权。
-
-[接入与验收](docs/duty/SETUP.md) · [角色模板](prompts/README.md) · [上游版本与维护边界](docs/UPSTREAM.md)
+支持单 Agent 和 Team（squad），可显式保留旧 Agent 线程 scope 迁移；已有上下文组装、确定性回复、附件回执与 Cloudflare Workers 支持继续保留。配置见 [Agent / Team 路由](docs/CONFIGURATION.md#agent--team-路由)，上游同步边界见 [上游版本与维护边界](docs/UPSTREAM.md)。
 
 ## 许可证
 
