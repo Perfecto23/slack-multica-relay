@@ -11,8 +11,8 @@ interface UpstashResponse {
 }
 
 /**
- * 使用 Upstash/Vercel KV 的 REST 命令接口，避免把 Redis 客户端打进函数包。
- * 所有请求都由显式 token 认证，Vercel 实例之间共享同一份线程状态。
+ * 使用 Upstash Redis 的 REST 命令接口，避免把 Redis 客户端打进 Worker 包。
+ * 所有请求都由显式 token 认证，Worker 实例之间共享同一份线程状态。
  */
 export class UpstashThreadStore implements ThreadStore {
   constructor(

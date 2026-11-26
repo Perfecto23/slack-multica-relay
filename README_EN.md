@@ -27,7 +27,7 @@ A direct Slack-to-Agent integration easily conflates “Slack acknowledged the e
 - **Thread cancellation** — target users can cancel associated runs with a mention plus cancel/取消; run targets and reaction cleanup are persisted.
 - **Final-reply context** — parallel Skill statistics, Multica task links, and GitHub PR/branch associations, with private style and emoji configuration.
 - **Final-send deduplication** — every source Issue/comment gets a stable delivery block ID and a local `attempting → accepted → sent` ledger.
-- **Three deployment adapters** — the shared implementation can run behind Vercel Functions, EdgeOne Cloud Functions, or Cloudflare Workers.
+- **Cloudflare Workers deployment** — runs directly on Cloudflare Workers behind `/api/slack/events`, `/api/queue/consume`, and `/api/health`.
 
 ## How it works
 
@@ -56,7 +56,7 @@ Configured Multica Agent
             └─ reply in the original Slack thread
 ```
 
-The Relay deployment and the Agent Runtime are separate trust domains. Vercel, EdgeOne, or Cloudflare Workers owns ingress, queue consumption, and Multica routing. Private Agent Instructions, Skills, the Slack user token, and reply-adapter configuration stay on the Runtime that executes the Agent.
+The Relay deployment and the Agent Runtime are separate trust domains. Cloudflare Workers owns ingress, queue consumption, and Multica routing. Private Agent Instructions, Skills, the Slack user token, and reply-adapter configuration stay on the Runtime that executes the Agent.
 
 ## Context model
 
@@ -85,8 +85,6 @@ Multica writes use Redis state and stable markers for retry recovery. Final Slac
 ## Repository layout
 
 ```text
-api/                         Vercel Functions entry points
-cloud-functions/             EdgeOne Cloud Functions entry points
 src/cloudflare.ts            Cloudflare Workers entry point
 wrangler.jsonc               Workers deployment configuration
 src/                         shared Relay, context, routing, and persistence logic
@@ -109,7 +107,7 @@ To deploy the Relay, you need:
 - QStash;
 - a dedicated Upstash Redis database;
 - a Multica PAT that can access the target Workspace, Project, and Agent;
-- a Vercel, EdgeOne, or Cloudflare Workers deployment environment.
+- a Cloudflare Workers deployment environment.
 
 To reply through the local adapter with a selected user identity, you also need:
 
@@ -134,27 +132,13 @@ pnpm lint
 
 See [Configuration](docs/CONFIGURATION_EN.md) for variable sources, Runtime configuration, and deployment verification.
 
-## Deployment entry points
+## Deployment entry points (Cloudflare Workers)
 
-| Platform | Slack Events | Queue consumer | Health |
-| --- | --- | --- | --- |
-| Vercel | `/api/slack/events` | `/api/queue/consume` | `/api/health` |
-| EdgeOne | `/api/slack/events` | `/api/queue/consume` | `/api/health` |
-| Cloudflare Workers | `/api/slack/events` | `/api/queue/consume` | `/api/health` |
-
-### Vercel / EdgeOne
-
-1. Import this repository into Vercel or EdgeOne. Platform settings live in `vercel.json` and `edgeone.json`.
-2. Create the Relay environment from [Configuration](docs/CONFIGURATION_EN.md), placing tokens, PATs, and signing keys in the platform secret store.
-3. After the public domain is known, set `RELAY_CONSUMER_URL` to its exact `/api/queue/consume` URL. It must match the URL used by QStash for delivery and signature verification.
-4. Deploy the immutable commit that passed validation, then read back `/api/health`.
-5. Point the Slack App Request URL at `/api/slack/events`, complete URL verification, and subscribe only to message events required by the selected conversation types.
-6. Send one mention in an authorized test channel. Independently verify QStash acceptance, Multica Issue/comment persistence, reaction identity, Agent execution, and the final reply in the original thread.
-7. Confirm that a blocked channel or sender produces no QStash or Multica side effect.
-
-Configuration, deployment readiness, and HTTP 200 each prove only their own stage; none replaces end-to-end acceptance.
-
-### Cloudflare Workers
+| Route | Purpose |
+| --- | --- |
+| `/api/slack/events` | Slack Events ingress |
+| `/api/queue/consume` | QStash queue consumer |
+| `/api/health` | Health check |
 
 Use `pnpm dev:cf` for local development, `pnpm build:cf` for an offline deployment build, and `pnpm deploy:cf` to publish after configuring your account and Secrets. See [Cloudflare configuration](docs/CONFIGURATION_EN.md#cloudflare-workers) for the complete setup. Workers hosts the Relay only; QStash, Upstash Redis, and the private Multica Runtime remain required.
 
@@ -195,13 +179,9 @@ Offline tests prove code contracts. They do not prove a real deployment, Agent e
 - [Contributing Guide](CONTRIBUTING.md)
 
 
-## Team routing and duty workflows
+## Team routing
 
-Single-Agent and Team (squad) routing support explicit migration of existing thread scopes. The v5 context model, deterministic replies, attachment receipts and Cloudflare compatibility remain intact. See [routing configuration](docs/CONFIGURATION_EN.md#agent--team-routing).
-
-Daily duty includes source collection, two investigation lanes, a complete evidence index, serial repair, bounded retries and blocked-item handoff. Weekly duty adds decision cards, versioned human decisions and Leader/Engineer handoff. The static HTML board tracks stages and historical dates, and distinguishes merged PRs from verified production delivery.
-
-Role templates keep private persona, style, tool bindings and authorization separate. [Setup](docs/duty/SETUP.md), [role templates](prompts/README.md) and [upstream maintenance](docs/UPSTREAM.md) describe the integration; workflow templates are currently in Chinese.
+Single-Agent and Team (squad) routing support explicit migration of existing thread scopes. Context assembly, deterministic replies, attachment receipts, and Cloudflare Workers compatibility remain intact. See [routing configuration](docs/CONFIGURATION_EN.md#agent--team-routing) and [upstream maintenance](docs/UPSTREAM.md).
 
 ## License
 

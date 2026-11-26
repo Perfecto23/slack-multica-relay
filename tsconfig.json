@@ -9,8 +9,6 @@
     "types": ["node", "vitest"]
   },
   "include": [
-    "api/**/*.ts",
-    "cloud-functions/**/*.ts",
     "src/**/*.ts",
     "tests/**/*.test.ts"
   ]
