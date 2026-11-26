@@ -868,4 +868,91 @@ describe("Steer 实时插话与等待读取/已读取表情反馈", () => {
     expect(created2.action).toBe("created");
     expect(created2.issueId).toBe("issue-2");
   });
+
+  it("reads supplement receipts from /timeline even when /comments omits supplements and adds read reaction after fast completion", async () => {
+    const f = fixture();
+    f.config.multicaQueueAgentId = "agent";
+    f.config.slackReactionToken = "slack-token";
+    f.config.slackReactionName = "bug_eyes";
+    f.config.slackQueuedReactionName = "hourglass_flowing_sand";
+    const reactions: { op: string; name: string; ts: string }[] = [];
+    let currentRunStatus = "running";
+
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/reactions.add") || url.endsWith("/reactions.remove")) {
+        const body = JSON.parse(String(init?.body)) as { name: string; timestamp: string };
+        reactions.push({ op: url.endsWith(".add") ? "add" : "remove", name: body.name, ts: body.timestamp });
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/task-runs")) {
+        return Response.json([
+          {
+            id: "run-fast",
+            issue_id: f.issues[0]?.id ?? "issue-1",
+            workspace_id: "ws",
+            agent_id: "agent",
+            status: currentRunStatus,
+            can_supplement: currentRunStatus === "running",
+            supplement_capability: "task-supplement-v1",
+          },
+        ]);
+      }
+      if (url.includes("/comments") && init?.method === "POST") {
+        const res = await f.fetcher(input, init);
+        const created = (await res.json()) as { id: string; content: string };
+        return Response.json(
+          {
+            ...created,
+            supplements: [{ task_id: "run-fast", status: "pending" }],
+          },
+          { status: 201 },
+        );
+      }
+      if (url.endsWith("/timeline")) {
+        return Response.json([
+          {
+            type: "comment",
+            id: f.comments[0]?.id ?? "comment-1",
+            content: f.comments[0]?.content ?? "",
+            supplements: [{ task_id: "run-fast", status: "delivered" }],
+            supplement_task_id: "run-fast",
+            supplement_status: "delivered",
+          },
+        ]);
+      }
+      return f.fetcher(input, init);
+    };
+
+    const created = await routeSlackThreadEvent(root, f.config, fetcher);
+    const steered = await routeSlackThreadEvent(
+      { ...root, messageTs: "101.000001", text: "<@U1> 补充一句" },
+      f.config,
+      fetcher,
+    );
+    expect(steered.steerReceipt?.status).toBe("pending");
+    currentRunStatus = "completed";
+
+    const ack = await routeSlackThreadEvent(
+      {
+        ...root,
+        messageTs: "101.000001",
+        operation: "steer_ack",
+        steerCheck: {
+          issueId: created.issueId!,
+          commentId: steered.steerReceipt!.commentId,
+          taskId: "run-fast",
+          attempt: 1,
+        },
+      },
+      f.config,
+      fetcher,
+    );
+    expect(ack.action).toBe("steer_delivered");
+    expect(reactions.filter((r) => r.ts === "101.000001")).toEqual([
+      { op: "add", name: "hourglass_flowing_sand", ts: "101.000001" },
+      { op: "remove", name: "hourglass_flowing_sand", ts: "101.000001" },
+      { op: "add", name: "bug_eyes", ts: "101.000001" },
+    ]);
+  });
 });

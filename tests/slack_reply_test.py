@@ -1424,6 +1424,77 @@ class InterimAndSteerSupplementTests(unittest.TestCase):
         self.assertEqual(kind, 'relay')
         self.assertEqual(env_resolved['eventPayload']['messageTs'], '188.000001')
 
+    def test_current_run_advances_to_undelivered_steered_supplement_and_cleans_task_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps({
+                **CONFIG,
+                'workspaceId': 'W1',
+                'projectId': 'P1',
+                'serverUrl': 'https://multica.example',
+                'agentId': 'A1',
+            }))
+            t1_file = Path(directory) / 't1.txt'
+            t2_file = Path(directory) / 't2.txt'
+            t1_file.write_text('first answer')
+            t2_file.write_text('second steered answer')
+
+            trig_id = '66666666-6666-4666-8666-666666666666'
+            steer_id = '77777777-7777-4777-8777-777777777777'
+            run_row = {
+                'id': self.run_id,
+                'issue_id': 'I1',
+                'workspace_id': 'W1',
+                'status': 'running',
+                'trigger_comment_id': trig_id,
+                'supplement_comment_ids': [],
+            }
+            envelopes = {
+                trig_id: {'eventPayload': {**EVENT, 'messageTs': '110.000001'}},
+                steer_id: {'eventPayload': {**EVENT, 'messageTs': '120.000001'}},
+            }
+            sent_blocks = []
+            chat_ops = []
+
+            def fake_slack_call(_token, method, payload=None, query=None, **_kw):
+                chat_ops.append(method)
+                if method == 'conversations.replies' and query and query.get('limit') == '1':
+                    return {'ok': True, 'messages': [{'ts': EVENT['threadTs']}]}
+                if method == 'chat.postMessage':
+                    ts = f'300.00000{len(chat_ops)}'
+                    sent_blocks.append((ts, payload['blocks']))
+                    return {'ok': True, 'channel': 'C1', 'ts': ts}
+                if method in ('chat.update', 'chat.delete'):
+                    return {'ok': True, 'channel': 'C1', 'ts': payload['ts']}
+                if method == 'conversations.replies':
+                    return {'ok': True, 'messages': [{'ts': ts, 'blocks': b} for ts, b in sent_blocks], 'response_metadata': {'next_cursor': ''}}
+                if method == 'auth.test':
+                    return {'ok': True, 'user_id': 'U1', 'team_id': 'T1'}
+                if method == 'reactions.get':
+                    return {'ok': True, 'channel': 'C1', 'message': {'ts': query['timestamp'], 'reactions': []}}
+                raise AssertionError(method)
+
+            with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'user', 'MULTICA_TASK_ID': self.run_id}), \
+                    patch.object(reply, 'multica_json', side_effect=lambda *a, **k: [run_row]), \
+                    patch.object(reply, 'collect_run_context', return_value=None), \
+                    patch.object(reply, 'read_source', side_effect=lambda _c, _i, cid, *_a: envelopes[cid]), \
+                    patch.object(reply, 'read_reply_source', side_effect=lambda _c, _i, cid, *_a: (envelopes[cid], 'relay')), \
+                    patch.object(reply, 'slack_call', side_effect=fake_slack_call):
+                out1, prog_out, out2 = io.StringIO(), io.StringIO(), io.StringIO()
+                with redirect_stdout(out1):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--text-file', str(t1_file)])
+                self.assertFalse(json.loads(out1.getvalue())['duplicate'])
+
+                # Now a steered follow-up arrives in the same running task, Agent posts progress then replies again via --current-run
+                run_row['supplement_comment_ids'] = [steer_id]
+                with redirect_stdout(prog_out):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--progress', 'working on steered'])
+                with redirect_stdout(out2):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--text-file', str(t2_file)])
+                res2 = json.loads(out2.getvalue())
+                self.assertFalse(res2['duplicate'])
+                self.assertIn('chat.delete', chat_ops)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -349,6 +349,40 @@ export async function findCommentById(
   commentId: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<MulticaComment | undefined> {
+  try {
+    const tlRes = await api(
+      config,
+      `/api/issues/${encodeURIComponent(issueId)}/timeline`,
+      {},
+      fetchImpl,
+    );
+    if (tlRes.ok) {
+      const tlBody: unknown = await tlRes.json();
+      const entries = Array.isArray(tlBody)
+        ? tlBody
+        : object(tlBody) && Array.isArray(tlBody.entries)
+          ? tlBody.entries
+          : undefined;
+      if (entries) {
+        const hit = entries.find(
+          (item) =>
+            object(item) &&
+            item.type === "comment" &&
+            item.id === commentId &&
+            typeof item.content === "string",
+        );
+        if (
+          object(hit) &&
+          typeof hit.id === "string" &&
+          typeof hit.content === "string"
+        ) {
+          return hit as unknown as MulticaComment;
+        }
+      }
+    }
+  } catch {
+    // Fall back to /comments when /timeline is unavailable.
+  }
   for await (const page of issueCommentPages(config, issueId, fetchImpl)) {
     const match = page.find((comment) => comment.id === commentId);
     if (match) return match;
