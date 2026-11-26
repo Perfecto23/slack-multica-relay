@@ -852,16 +852,6 @@ async function handleSteerAck(
     config.slackSteerReadReactionName ?? config.slackReactionName;
   if (!receipt) return { action: "ignored", issueId: state.issueId };
   if (receipt.status === "delivered") {
-    let targetStillActive = true;
-    try {
-      const runs = await listIssueRuns(config, state.issueId, fetchImpl);
-      const targetRun = runs.find((run) => run.id === check.taskId);
-      if (targetRun && !isActiveRun(targetRun)) {
-        targetStillActive = false;
-      }
-    } catch {
-      // Default to active if status lookup fails transiently.
-    }
     if (config.slackReactionToken) {
       try {
         if (pendingReaction && pendingReaction !== readReaction)
@@ -872,7 +862,7 @@ async function handleSteerAck(
             pendingReaction,
             fetchImpl,
           );
-        if (readReaction && targetStillActive)
+        if (readReaction)
           await addSlackReaction(
             config.slackReactionToken,
             event.channelId,

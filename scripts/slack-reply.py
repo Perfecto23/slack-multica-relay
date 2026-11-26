@@ -709,6 +709,12 @@ def progress_paths(config_path, identity):
     return root / ('progress-' + identity + '.json'), root / ('progress-' + identity + '.lock')
 
 
+def progress_identity_for(config, issue_id, base_identity, task_id=None):
+    if isinstance(task_id, str) and re.fullmatch(UUID_PATTERN, task_id):
+        return delivery_identity(config, issue_id, None, f'run-progress:{task_id}')
+    return base_identity
+
+
 def render_progress_payload(config, envelope, text, block_id):
     event = envelope['eventPayload']
     if event.get('teamId') != config['teamId'] or not re.fullmatch(r'[CDG][A-Z0-9]+', event.get('channelId', '')):
@@ -1025,12 +1031,30 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     if args.current_run:
         if args.wakeup_run:
             raise ValueError('invalid_current_run_arguments')
+        explicit_comment_id = args.comment_id
         resolved = resolve_current_run(
             config, args.issue_id, args.comment_id, os.environ.get('MULTICA_TASK_ID'), runner, True)
         if len(resolved) == 3:
             args.comment_id, args.wakeup_run, supplement_ids = resolved
         else:
             args.comment_id, args.wakeup_run = resolved
+        if (explicit_comment_id is None and not args.wakeup_run and args.text_file
+                and args.interim is None and supplement_ids):
+            initial_id = delivery_identity(config, args.issue_id, args.comment_id, None)
+            initial_state = read_delivery_state(delivery_paths(config_path, initial_id)[0])
+            if initial_state and initial_state.get('phase') == 'sent':
+                for cand_id in reversed(supplement_ids):
+                    try:
+                        _, cand_kind = read_reply_source(config, args.issue_id, cand_id, runner)
+                    except ValueError:
+                        continue
+                    if cand_kind != 'relay':
+                        continue
+                    cand_identity = delivery_identity(config, args.issue_id, cand_id, None)
+                    cand_state = read_delivery_state(delivery_paths(config_path, cand_identity)[0])
+                    if not (cand_state and cand_state.get('phase') == 'sent'):
+                        args.comment_id = cand_id
+                        break
         if args.clear_start_reaction and args.wakeup_run:
             # A scheduled run has no start reaction of its own; it may still have set processing or progress.
             envelope, wk_comment_id, wk_occurrence = read_wakeup_source(
@@ -1038,7 +1062,10 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
             result = {'ok': True, 'action': 'not_applicable'}
             if not args.dry_run:
                 wk_identity = delivery_identity(config, args.issue_id, wk_comment_id, wk_occurrence)
-                clear_progress_message(config_path, wk_identity, opener=opener)
+                wk_prog_id = progress_identity_for(config, args.issue_id, wk_identity, os.environ.get('MULTICA_TASK_ID'))
+                clear_progress_message(config_path, wk_prog_id, opener=opener)
+                if wk_prog_id != wk_identity:
+                    clear_progress_message(config_path, wk_identity, opener=opener)
                 result['session_status'] = update_session_status(
                     config, envelope, args.issue_id, 'active', runner, opener)
             print(json.dumps(result))
@@ -1069,6 +1096,7 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         if args.run_context_file or args.github_context_file or args.deliver_task_attachments:
             raise ValueError('invalid_cleanup_arguments')
         base_identity = delivery_identity(config, args.issue_id, args.comment_id, occurrence)
+        prog_identity = progress_identity_for(config, args.issue_id, base_identity, os.environ.get('MULTICA_TASK_ID'))
         if source_kind in ('owner_comment', 'handoff'):
             # Only Relay messages get a start reaction; the root message's belongs to its own run.
             result = {'ok': True, 'action': 'not_applicable'}
@@ -1081,7 +1109,9 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
                 if config.get('offlineReaction') is not None:
                     result['offline_reaction'] = offline
         if not args.dry_run:
-            progress_cleanup = clear_progress_message(config_path, base_identity, opener=opener)
+            progress_cleanup = clear_progress_message(config_path, prog_identity, opener=opener)
+            if progress_cleanup == 'absent' and prog_identity != base_identity:
+                progress_cleanup = clear_progress_message(config_path, base_identity, opener=opener)
             if progress_cleanup != 'absent':
                 result['progress_cleanup'] = progress_cleanup
             if supplement_ids:
@@ -1091,9 +1121,10 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         print(json.dumps(result))
         return
     identity = delivery_identity(config, args.issue_id, args.comment_id, occurrence)
+    prog_identity = progress_identity_for(config, args.issue_id, identity, os.environ.get('MULTICA_TASK_ID'))
     if args.progress is not None:
         progress_result = upsert_progress_message(
-            config_path, config, envelope, identity, args.progress, args.dry_run, opener)
+            config_path, config, envelope, prog_identity, args.progress, args.dry_run, opener)
         print(json.dumps(progress_result, ensure_ascii=False))
         return
     block_id = 'relay-delivery-' + identity
@@ -1168,7 +1199,9 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
             raise ValueError('slack_delivery_unknown')
         verify_reply_root(token, envelope, opener)
         if args.interim is None:
-            clear_progress_message(config_path, identity, token=token, opener=opener)
+            clear_progress_message(config_path, prog_identity, token=token, opener=opener)
+            if prog_identity != identity:
+                clear_progress_message(config_path, identity, token=token, opener=opener)
         attempted_at = slack_timestamp()
         lookup_from = slack_timestamp(time.time() - 300)
         write_delivery_state(state_path, {'version': 1, 'phase': 'attempting', 'attemptedAt': attempted_at,
