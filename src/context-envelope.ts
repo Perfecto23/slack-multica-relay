@@ -131,6 +131,7 @@ export function buildEnvelope(event: SlackThreadEvent, input: ThreadContext, rep
   };
   visit(context.timeline);
   const eventPayload = { teamId:event.teamId,channelId:event.channelId,threadTs:event.threadTs,messageTs:event.messageTs,senderUserId:event.senderUserId,text:event.text,mention:{type:event.mention.type,id:event.mention.id},files:projectFiles(event.files,Number.MAX_SAFE_INTEGER),
+    ...(event.trigger ? {trigger:event.trigger} : {}),
     ...(event.filesTruncated ? {filesTruncated:true} : {}) };
   // Coverage and its guidance are recomputed after every byte-budget cut, so they describe what is delivered.
   const result: Record<string, unknown> = { schemaVersion: 6, task: {}, coverage: {}, eventPayload, context, ...(replyContext?{replyContext}:{}) };

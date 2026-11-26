@@ -2,6 +2,14 @@ function object(value:unknown):value is Record<string,unknown>{
   return !!value&&typeof value==='object'&&!Array.isArray(value);
 }
 
+/** Recognize transient `--progress` status cards so they never self-trigger or pollute context. */
+export function isRelayProgressMessage(raw:Record<string,unknown>):boolean {
+  const blocks=raw.blocks;
+  if(!Array.isArray(blocks)||blocks.length<2||!blocks.every(object))return false;
+  const last=blocks.at(-1)!;
+  return last.type==='context'&&typeof last.block_id==='string'&&/^relay-progress-[a-f0-9]{64}$/.test(last.block_id);
+}
+
 /** Recognize the Relay adapter's complete block layout, never prose keywords. */
 export function agentBody(raw:Record<string,unknown>, allowUserToken = false):string|undefined {
   // User-token events can omit app metadata; admission still recognizes our output layout.

@@ -23,9 +23,17 @@ Slack IDs are comma-separated uppercase identifiers. `SLACK_TARGET_USER_IDS` and
 | `SLACK_BOT_TOKEN` | Conditional | Preferred identity for author lookup and reaction add/read/remove; requires users:read, reactions:read and reactions:write. |
 | `SLACK_USER_TOKEN` | Conditional | Used for author lookup and reactions when Bot is not configured. |
 | `SLACK_CANCEL_KEYWORDS` | No | Comma-separated whole-command words; defaults to cancel,取消. |
+| `SLACK_NEW_SESSION_KEYWORDS` | No | Comma-separated thread-reset keywords; defaults to `!new,!fresh,重开` (restricted to `SLACK_CONTROL_USER_IDS`, rotating the Slack thread onto a fresh Multica Issue). |
+| `SLACK_WAKE_PATTERNS` | No | Comma-separated case-insensitive wake phrases. |
+| `SLACK_IMPLICIT_THREAD_FOLLOWUP` | No | When `true`, admits unmentioned replies in active/participated threads while ignoring broadcasts, leading `@other` mentions, and unaddressed owner replies, cooling down after `SLACK_IMPLICIT_THREAD_MAX_SILENT` (default `3`) unanswered turns. |
+| `SLACK_EDIT_MENTION_WAKE` | No | Defaults to `true`; wakes once when a human edits an unmentioned message to add a target mention or wake phrase. |
 | `SLACK_CONTEXT_TOKEN` | Yes | User token with history scopes for the selected conversation types. The consumer uses it for bounded history/reply reads; `users:read` enables optional participant names through `users.info`. It may contain the same authorized token as the reaction credential, but configure it explicitly. |
 | `SLACK_REACTION_NAME` | Yes | Slack emoji shortcode without colons, such as `eyes`. The reaction confirms Relay persistence, not Agent completion. |
 | `SLACK_QUEUED_REACTION_NAME` | No | Queued marker such as `hourglass_flowing_sand`. When a follow-up arrives while `MULTICA_QUEUE_AGENT_ID` has an active run on the same Issue (Multica runs one task per agent per Issue), the Relay adds this reaction too; it means "received, not answered yet", and the adapter's `queuedReaction` setting (same name) removes it when the agent replies or cleans up after silence. |
+| `SLACK_STEER_PENDING_REACTION_NAME` | No | Reaction while a steered mid-run comment awaits agent delivery; defaults to `SLACK_QUEUED_REACTION_NAME` (or `hourglass_flowing_sand`), swapping to `SLACK_STEER_READ_REACTION_NAME` (default `SLACK_REACTION_NAME`) once delivered. |
+| `SLACK_OFFLINE_REACTION_NAME` | No | Reaction shown when the bound Multica runtime is offline/asleep (e.g. `zzz`), cleared via `offlineReaction` in the adapter. |
+| `SLACK_DISPATCH_DELAY_SECONDS` | No | Optional QStash publish delay (`0..15`, default `0`). |
+| `SLACK_WATCHDOG_DELAY_SECONDS` | No | Optional watchdog delay (`0..3600`, default `0` disabled) to clean up stuck reactions/status and optionally notify `SLACK_ALERT_CHANNEL_ID` if a run ends in `failed` or `cancelled`. |
 
 The Slack App Request URL is `https://<deployment-host>/api/slack/events`. Subscribe only to message events required by the selected conversation types. Install the App in private channels when needed.
 

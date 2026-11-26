@@ -1212,5 +1212,218 @@ class TeamReplyTests(unittest.TestCase):
                     'model': 'model', 'model_source': 'agent_config', 'service_tier': tier, 'service_tier_source': source}}))
                 self.assertEqual('⚡ Fast' in reply.run_statistics(path, 'I1', 'R1'), fast)
 
+
+class InterimAndSteerSupplementTests(unittest.TestCase):
+    run_id = '11111111-1111-4111-8111-111111111111'
+    sup_id = '22222222-2222-4222-8222-222222222222'
+
+    def test_interim_reply_is_retry_safe_and_does_not_lock_out_final_reply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config = {
+                **CONFIG,
+                'workspaceId': 'W1',
+                'projectId': 'P1',
+                'serverUrl': 'https://multica.example',
+                'queuedReaction': {'name': 'hourglass_flowing_sand', 'userId': 'U1', 'tokenEnv': 'SLACK_USER_TOKEN'},
+                'sessionStatus': {'userId': 'UBOT', 'tokenEnv': 'SLACK_BOT_TOKEN'},
+            }
+            config_path.write_text(json.dumps(config))
+            interim_file = Path(directory) / 'interim.md'
+            final_file = Path(directory) / 'final.md'
+            interim_file.write_text('正在排查，先回一句进度～')
+            final_file.write_text('全部搞定了！')
+
+            sent_blocks = []
+
+            def fake_slack_call(token, method, payload=None, query=None, opener=None, timeout=20):
+                if method == 'conversations.replies' and query and query.get('limit') == '1':
+                    return {'ok': True, 'messages': [{'ts': EVENT['threadTs']}]}
+                if method == 'chat.postMessage':
+                    sent_blocks.append(payload['blocks'][-1]['block_id'])
+                    return {'ok': True, 'channel': 'C1', 'ts': f'200.00000{len(sent_blocks)}'}
+                if method == 'conversations.replies':
+                    return {
+                        'ok': True,
+                        'messages': [
+                            {'ts': f'200.00000{i + 1}', 'blocks': [{'type': 'context', 'block_id': bid}]}
+                            for i, bid in enumerate(sent_blocks)
+                        ],
+                    }
+                if method == 'auth.test':
+                    return {'ok': True, 'team_id': 'T1', 'user_id': 'UBOT' if token == 'bot' else 'U1'}
+                if method == 'agents.sessions.setStatus':
+                    return {'ok': True}
+                if method == 'reactions.get':
+                    return {'ok': True, 'channel': 'C1', 'message': {'ts': query['timestamp'], 'reactions': []}}
+                raise AssertionError(f'unexpected slack method: {method}')
+
+            run_row = {
+                'id': self.run_id,
+                'issue_id': 'I1',
+                'workspace_id': 'W1',
+                'status': 'running',
+                'trigger_comment_id': None,
+                'supplement_comment_ids': [self.sup_id],
+            }
+            steered_env = {'eventPayload': {**EVENT, 'messageTs': '150.000001'}}
+
+            with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'user', 'SLACK_BOT_TOKEN': 'bot', 'MULTICA_TASK_ID': self.run_id}), \
+                    patch.object(reply, 'multica_json', return_value=[run_row]), \
+                    patch.object(reply, 'collect_run_context', return_value=None), \
+                    patch.object(reply, 'read_source', return_value={'eventPayload': {**EVENT, 'messageTs': '100.000001'}}), \
+                    patch.object(reply, 'read_reply_source', return_value=(steered_env, 'relay')), \
+                    patch.object(reply, 'slack_call', side_effect=fake_slack_call):
+                out1, out2, out3 = io.StringIO(), io.StringIO(), io.StringIO()
+                with redirect_stdout(out1):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--interim', 'ack', '--text-file', str(interim_file)])
+                with redirect_stdout(out2):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--interim', 'ack', '--text-file', str(interim_file)])
+                with redirect_stdout(out3):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--text-file', str(final_file)])
+
+            r1 = json.loads(out1.getvalue())
+            r2 = json.loads(out2.getvalue())
+            r3 = json.loads(out3.getvalue())
+            self.assertFalse(r1['duplicate'])
+            self.assertEqual(r1['interim'], 'ack')
+            self.assertNotIn('session_status', r1)
+            self.assertTrue(r2['duplicate'])
+            self.assertEqual(r2['message_ts'], r1['message_ts'])
+            self.assertFalse(r3['duplicate'])
+            self.assertNotEqual(r3['message_ts'], r1['message_ts'])
+            self.assertEqual(r3['session_status'], 'active')
+            self.assertEqual(r3['supplement_reactions'], [{'comment_id': self.sup_id, 'queued_reaction': 'already_absent'}])
+
+    def test_progress_card_updates_in_place_and_auto_deletes_before_final_reply_with_coalesced_cleanup(self):
+        coalesced_id = '33333333-3333-4333-8333-333333333333'
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config = {
+                **CONFIG,
+                'workspaceId': 'W1',
+                'projectId': 'P1',
+                'serverUrl': 'https://multica.example',
+                'queuedReaction': {'name': 'hourglass_flowing_sand', 'userId': 'U1', 'tokenEnv': 'SLACK_USER_TOKEN'},
+                'offlineReaction': {'name': 'zzz', 'userId': 'U1', 'tokenEnv': 'SLACK_USER_TOKEN'},
+            }
+            config_path.write_text(json.dumps(config))
+            final_file = Path(directory) / 'final.md'
+            final_file.write_text('审查完毕，无阻塞问题。')
+
+            api_calls = []
+            sent_blocks = []
+
+            def fake_slack_call(token, method, payload=None, query=None, opener=None, timeout=20):
+                api_calls.append((method, payload, query))
+                if method == 'conversations.replies' and query and query.get('limit') == '1':
+                    return {'ok': True, 'messages': [{'ts': EVENT['threadTs']}]}
+                if method == 'chat.postMessage':
+                    bid = payload['blocks'][-1]['block_id']
+                    if bid.startswith('relay-progress-'):
+                        return {'ok': True, 'channel': 'C1', 'ts': '199.000001'}
+                    sent_blocks.append(bid)
+                    return {'ok': True, 'channel': 'C1', 'ts': '200.000009'}
+                if method == 'chat.update':
+                    return {'ok': True, 'channel': 'C1', 'ts': payload['ts']}
+                if method == 'chat.delete':
+                    return {'ok': True}
+                if method == 'conversations.replies':
+                    return {
+                        'ok': True,
+                        'messages': [{'ts': '200.000009', 'blocks': [{'type': 'context', 'block_id': bid}]} for bid in sent_blocks],
+                    }
+                if method == 'auth.test':
+                    return {'ok': True, 'team_id': 'T1', 'user_id': 'U1'}
+                if method == 'reactions.get':
+                    return {'ok': True, 'channel': 'C1', 'message': {'ts': query['timestamp'], 'reactions': []}}
+                raise AssertionError(f'unexpected slack method: {method}')
+
+            run_row = {
+                'id': self.run_id,
+                'issue_id': 'I1',
+                'workspace_id': 'W1',
+                'status': 'running',
+                'trigger_comment_id': None,
+                'coalesced_comment_ids': [coalesced_id],
+                'supplement_comment_ids': [self.sup_id],
+            }
+            folded_env = {'eventPayload': {**EVENT, 'messageTs': '150.000001'}}
+
+            with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'user', 'MULTICA_TASK_ID': self.run_id}), \
+                    patch.object(reply, 'multica_json', return_value=[run_row]), \
+                    patch.object(reply, 'collect_run_context', return_value=None), \
+                    patch.object(reply, 'read_source', return_value={'eventPayload': {**EVENT, 'messageTs': '100.000001'}}), \
+                    patch.object(reply, 'read_reply_source', return_value=(folded_env, 'relay')), \
+                    patch.object(reply, 'slack_call', side_effect=fake_slack_call):
+                p1, p2, fin = io.StringIO(), io.StringIO(), io.StringIO()
+                with redirect_stdout(p1):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--progress', '耗时 >1 分钟：检查 slack_reply.py…'])
+                with redirect_stdout(p2):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--progress', '正在核对 A -> B 跨仓调用链…'])
+                with redirect_stdout(fin):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--text-file', str(final_file)])
+
+            self.assertEqual(json.loads(p1.getvalue())['action'], 'posted')
+            self.assertEqual(json.loads(p2.getvalue())['action'], 'updated')
+            final_res = json.loads(fin.getvalue())
+            self.assertEqual(final_res['message_ts'], '200.000009')
+            self.assertEqual(final_res['offline_reaction'], 'already_absent')
+            # Verify order: postMessage(progress) -> chat.update(progress) -> chat.delete(progress) -> postMessage(final)
+            chat_methods = [m for m, _, _ in api_calls if m.startswith('chat.')]
+            self.assertEqual(chat_methods, ['chat.postMessage', 'chat.update', 'chat.delete', 'chat.postMessage'])
+            # Both coalesced and supplement comment IDs were cleaned
+            self.assertEqual([item['comment_id'] for item in final_res['supplement_reactions']], [coalesced_id, self.sup_id])
+
+    def test_unmocked_read_reply_source_resolves_nested_coalesced_and_steer_fallback_child_comments(self):
+        cfg = {
+            **CONFIG,
+            'workspaceId': 'W1',
+            'projectId': 'P1',
+            'serverUrl': 'https://multica.example',
+            'agentId': 'A1',
+        }
+        steered_id = '44444444-4444-4444-8444-444444444444'
+        fallback_id = '55555555-5555-4555-8555-555555555555'
+        steered_payload = {'eventPayload': {**EVENT, 'messageTs': '188.000001'}}
+        issue_doc = {
+            'workspace_id': 'W1',
+            'project_id': 'P1',
+            'assignee_type': 'agent',
+            'assignee_id': 'A1',
+            'description': '<!-- relay-thread:root -->\n' + json.dumps({'eventPayload': EVENT}),
+        }
+        nested_tree = [
+            {
+                'id': steered_id,
+                'issue_id': 'I1',
+                'author_type': 'member',
+                'content': '<!-- relay-message:steered -->\n' + json.dumps(steered_payload),
+                'replies': [
+                    {
+                        'id': fallback_id,
+                        'issue_id': 'I1',
+                        'parent_id': steered_id,
+                        'author_type': 'member',
+                        'content': f'<!-- relay-steer-fallback:{steered_id} -->\n[@Agent](mention://agent/A1) wake up',
+                    },
+                ],
+            },
+        ]
+
+        def runner(command, **_kwargs):
+            if 'get' in command:
+                return subprocess.CompletedProcess(command, 0, json.dumps(issue_doc), '')
+            if '--tail' in command:
+                # Simulate --tail 0 returning only the thread root without nested replies
+                root_only = [{k: v for k, v in nested_tree[0].items() if k != 'replies'}]
+                return subprocess.CompletedProcess(command, 0, json.dumps(root_only), '')
+            return subprocess.CompletedProcess(command, 0, json.dumps(nested_tree), '')
+
+        env_resolved, kind = reply.read_reply_source(cfg, 'I1', fallback_id, runner)
+        self.assertEqual(kind, 'relay')
+        self.assertEqual(env_resolved['eventPayload']['messageTs'], '188.000001')
+
+
 if __name__ == '__main__':
     unittest.main()

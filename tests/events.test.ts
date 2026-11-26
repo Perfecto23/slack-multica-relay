@@ -424,4 +424,33 @@ describe("取消指令的事件路由", () => {
     expect(await response.json()).toEqual({ action: "ignored" });
     expect(calls.every((url) => url === env.KV_REST_API_URL || url.includes("/api/issues/search?"))).toBe(true);
   });
+  it("过滤 channel_join / group_join 等非对话系统事件，不入队不建单", async () => {
+    for (const subtype of ["channel_join", "group_join", "channel_topic", "pinned_item"]) {
+      const f = vi.fn<typeof fetch>();
+      const res = await acceptHumanMessage(request({ ...event, subtype, text: "<@U1> has joined the channel" }), env, f);
+      expect(await res.json()).toEqual({ action: "ignored" });
+      expect(f).not.toHaveBeenCalled();
+    }
+  });
+  it("校验 steer_ack 事件字段并在 pending 时调度延迟回读任务", async () => {
+    const bad = await consumeQueue(
+      new Request(env.RELAY_CONSUMER_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          teamId: "T1",
+          channelId: "C1",
+          senderUserId: "U2",
+          messageTs: "102.000001",
+          threadTs: "100.000001",
+          text: "<@U1> 插话",
+          mention: { type: "user", id: "U1" },
+          operation: "steer_ack",
+          steerCheck: { issueId: "I1", commentId: "C1", taskId: "R1", attempt: 99 },
+        }),
+      }),
+      env,
+      vi.fn<typeof fetch>(),
+    );
+    expect(await bad.json()).toMatchObject({ action: "rejected", error: "invalid_event" });
+  });
 });

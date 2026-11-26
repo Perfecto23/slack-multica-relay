@@ -6,10 +6,22 @@ export interface MulticaIssue {
   assignee_id?: string | null;
   assignee_type?: string | null;
 }
+export interface CommentSupplementReceipt {
+  task_id: string;
+  agent_id?: string;
+  status: string;
+  failure_reason?: string | null;
+  delivered_at?: string | null;
+}
 export interface MulticaComment {
   id: string;
   content: string;
   trigger_outcomes?: unknown;
+  supplements?: CommentSupplementReceipt[];
+  supplement_task_id?: string;
+  supplement_status?: string;
+  supplement_failure_reason?: string | null;
+  supplement_delivered_at?: string | null;
 }
 export interface ApiConfig {
   multicaApiBaseUrl: string;
@@ -23,6 +35,8 @@ export interface ApiConfig {
   multicaLegacyAgentId?: string;
   /** Squad that owned this scope's issues before the Relay assigned the Agent directly. */
   multicaLegacySquadId?: string;
+  /** Whether getSlackReplyContext should also check bound runtime online/offline status. */
+  multicaCheckRuntimeOnline?: boolean;
 }
 export function assignee(config: ApiConfig): { type: "agent" | "squad"; id: string } {
   const type = config.multicaAssigneeType ?? "agent";
@@ -60,6 +74,7 @@ export interface SlackReplyContext {
   status: "available" | "unavailable";
   model: string | null;
   serviceTier: "priority" | "default" | null;
+  runtimeOnline?: boolean;
 }
 export class ApiError extends Error {
   constructor(readonly status: number) {
@@ -110,6 +125,7 @@ export async function getSlackReplyContext(
   let model: string | null = null;
   let serviceTier: SlackReplyContext["serviceTier"] = null;
   let status: SlackReplyContext["status"] = "unavailable";
+  let runtimeOnline: boolean | undefined;
   try {
     const response = await api(
       config,
@@ -132,6 +148,37 @@ export async function getSlackReplyContext(
       model = candidate;
     if (body.service_tier === "priority" || body.service_tier === "default")
       serviceTier = body.service_tier;
+    if (body.runtime_bound === false || body.runtime_availability === "offline") {
+      runtimeOnline = false;
+    } else if (body.runtime_availability === "online") {
+      runtimeOnline = true;
+    } else if (
+      config.multicaCheckRuntimeOnline &&
+      typeof body.runtime_id === "string" &&
+      body.runtime_id.trim()
+    ) {
+      try {
+        const rtRes = await api(
+          config,
+          "/api/runtimes",
+          { signal: AbortSignal.timeout(1500), redirect: "manual" },
+          fetchImpl,
+        );
+        if (rtRes.ok) {
+          const runtimes: unknown = await rtRes.json();
+          if (Array.isArray(runtimes)) {
+            const matched = runtimes.find(
+              (item) => object(item) && item.id === body.runtime_id,
+            );
+            if (object(matched) && typeof matched.status === "string") {
+              runtimeOnline = matched.status === "online";
+            }
+          }
+        }
+      } catch {
+        // Runtime status check is optional; leave runtimeOnline undefined on error.
+      }
+    }
     status = "available";
   } catch {
     // footer 是可选信息；查询失败不阻断任务，也不输出上游响应或异常正文。
@@ -145,6 +192,7 @@ export async function getSlackReplyContext(
     status,
     model,
     serviceTier,
+    ...(runtimeOnline !== undefined ? { runtimeOnline } : {}),
   };
 }
 export async function findIssue(
@@ -265,16 +313,24 @@ async function* issueCommentPages(
   }
   throw new Error("comment_lookup_limit");
 }
+export interface CreateCommentOptions {
+  steerTaskIds?: string[];
+  parentId?: string;
+}
 export async function createComment(
   config: ApiConfig,
   issueId: string,
   content: string,
   fetchImpl: typeof fetch = fetch,
+  options?: CreateCommentOptions,
 ): Promise<MulticaComment> {
+  const payload: Record<string, unknown> = { content, type: "comment" };
+  if (options?.steerTaskIds?.length) payload.steer_task_ids = options.steerTaskIds;
+  if (options?.parentId) payload.parent_id = options.parentId;
   const response = await api(
     config,
     `/api/issues/${encodeURIComponent(issueId)}/comments`,
-    { method: "POST", body: JSON.stringify({ content, type: "comment" }) },
+    { method: "POST", body: JSON.stringify(payload) },
     fetchImpl,
   );
   if (!response.ok) throw new ApiError(response.status);
@@ -287,6 +343,32 @@ export async function createComment(
     throw new Error("invalid_multica_response");
   return body as unknown as MulticaComment;
 }
+export async function findCommentById(
+  config: ApiConfig,
+  issueId: string,
+  commentId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<MulticaComment | undefined> {
+  for await (const page of issueCommentPages(config, issueId, fetchImpl)) {
+    const match = page.find((comment) => comment.id === commentId);
+    if (match) return match;
+  }
+}
+export async function retryTaskSupplement(
+  config: ApiConfig,
+  issueId: string,
+  taskId: string,
+  commentId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const response = await api(
+    config,
+    `/api/issues/${encodeURIComponent(issueId)}/tasks/${encodeURIComponent(taskId)}/supplements/${encodeURIComponent(commentId)}/retry`,
+    { method: "POST", body: "{}" },
+    fetchImpl,
+  );
+  if (!response.ok) throw new ApiError(response.status);
+}
 
 export interface IssueRun {
   id: string;
@@ -294,6 +376,19 @@ export interface IssueRun {
   workspace_id: string;
   agent_id: string;
   status: string;
+  trigger_comment_id?: string | null;
+  trigger_thread_id?: string | null;
+  coalesced_comment_ids?: string[];
+  supplement_capability?: string | null;
+  can_supplement?: boolean;
+  supplement_comment_ids?: string[];
+}
+export function isSteerableRun(run: IssueRun): boolean {
+  return (
+    run.status === "running" &&
+    run.can_supplement === true &&
+    run.supplement_capability === "task-supplement-v1"
+  );
 }
 export function isActiveRun(run: IssueRun): boolean {
   return [

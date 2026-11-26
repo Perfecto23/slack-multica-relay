@@ -26,7 +26,9 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
    python3 <adapterPath> --config "$FINAL_REPLY_CONFIG" --issue-id <当前 Issue UUID> --current-run --text-file <正文文件>
    ```
 
-   `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 要求发到 Slack 的 Multica 评论、被派单 Agent 交回的结果、定时唤醒），并采集统计和任务链接。命令只需要上面这些参数。
+   `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 要求发到 Slack 的 Multica 评论、被派单 Agent 交回的结果、定时唤醒），采集统计和任务链接，并在收尾时自动清理本轮及被折叠合并（`coalesced`）或被 Steer 插话（`supplement`）进本轮的排队/等待/离线表情。
+   - **长任务原地刷新状态卡（推荐用于耗时 >1 分钟的调查/审查/派单）**：执行 `--current-run --progress "🔍 正在拉取 PR diff 并核对调用链…"`（不带 `--text-file`）。首次调用发送一条斜体进度卡，后续重复调用原地 `chat.update` 刷新同一条消息；发送最终正文（或静默收尾）时，adapter 会**自动删除该临时进度卡再发正式回复**，既保持线程干净，又保留 Slack 新消息通知提醒。
+   - **需要保留在线程里的阶段性回复（可选）**：当请求者插话要求“先回我一句结论再继续做”，加 `--interim <步骤名>`（如 `--interim ack`）配合 `--text-file`。阶段性回复保留在线程里且不会锁死本轮最终回复。
 
 完成标准：adapter 返回 `ok: true` 和 `message_ts`；或者按下表处理完错误，并在 Multica 任务结果里写明送达状态。
 
