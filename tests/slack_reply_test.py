@@ -1558,6 +1558,180 @@ class InterimAndSteerSupplementTests(unittest.TestCase):
                 self.assertEqual(res['reason'], 'message_not_found')
                 self.assertIn(('120.000001', 'bug_eyes'), removed)
 
+    def test_footer_for_respects_model_label_and_footer_stats_on_fallback(self):
+        snapshot = {
+            'type': 'slack_reply_context', 'source': 'agent_config',
+            'status': 'available', 'agentId': 'A1', 'model': 'gemini-4-hydrogen-medium',
+            'serviceTier': None,
+        }
+        envelope = {'eventPayload': EVENT, 'replyContext': snapshot}
+        cfg_labeled = {
+            **CONFIG,
+            'icons': {'model': ':bot:'},
+            'modelLabel': ['脑子在线', '小 p 的脑子'],
+            'footerStats': ['time', 'model'],
+        }
+        footer = reply.footer_for(cfg_labeled, envelope)
+        self.assertNotIn('gemini-4-hydrogen-medium', footer)
+        self.assertNotIn('配置模型', footer)
+        self.assertIn(':bot:', footer)
+        self.assertTrue(any(label in footer for label in cfg_labeled['modelLabel']))
+        # When 'model' is excluded from footerStats, omit model completely.
+        cfg_no_model = {**CONFIG, 'footerStats': ['time']}
+        self.assertEqual(reply.footer_for(cfg_no_model, envelope), CONFIG['displayName'])
+
+    def test_progress_card_shared_across_delegated_runs_on_same_issue(self):
+        run1 = '11111111-1111-4111-8111-111111111111'
+        run2 = '22222222-2222-4222-8222-222222222222'
+        run3 = '33333333-3333-4333-8333-333333333333'
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps({
+                **CONFIG, 'workspaceId': 'W1', 'projectId': 'P1',
+                'serverUrl': 'https://multica.example', 'agentId': 'A1',
+            }))
+            final_file = Path(directory) / 'final.md'
+            final_file.write_text('全部审完了。')
+            ops = []
+            sent_blocks = []
+
+            def fake_slack(_token, method, payload=None, query=None, **_kw):
+                ops.append(method)
+                if method == 'conversations.replies' and query and query.get('limit') == '1':
+                    return {'ok': True, 'messages': [{'ts': EVENT['threadTs']}]}
+                if method == 'chat.postMessage':
+                    bid = payload['blocks'][-1]['block_id']
+                    if bid.startswith('relay-progress-'):
+                        return {'ok': True, 'channel': 'C1', 'ts': '199.000001'}
+                    sent_blocks.append(bid)
+                    return {'ok': True, 'channel': 'C1', 'ts': '200.000009'}
+                if method in ('chat.update', 'chat.delete'):
+                    return {'ok': True, 'channel': 'C1', 'ts': payload['ts']}
+                if method == 'conversations.replies':
+                    return {
+                        'ok': True,
+                        'messages': [{'ts': '200.000009', 'blocks': [{'type': 'context', 'block_id': b}]} for b in sent_blocks],
+                    }
+                if method == 'auth.test':
+                    return {'ok': True, 'team_id': 'T1', 'user_id': 'U1'}
+                if method == 'reactions.get':
+                    return {'ok': True, 'channel': 'C1', 'message': {'ts': query['timestamp'], 'reactions': []}}
+                raise AssertionError(method)
+
+            env = {'eventPayload': {**EVENT, 'messageTs': '100.000001'}}
+            for idx, rid in enumerate((run1, run2), 1):
+                run_row = {'id': rid, 'issue_id': 'I1', 'workspace_id': 'W1', 'status': 'running', 'trigger_comment_id': None}
+                with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'user', 'MULTICA_TASK_ID': rid}), \
+                        patch.object(reply, 'multica_json', return_value=[run_row]), \
+                        patch.object(reply, 'read_source', return_value=env), \
+                        patch.object(reply, 'slack_call', side_effect=fake_slack):
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--progress', f'step {idx}'])
+                    self.assertEqual(json.loads(out.getvalue())['action'], 'posted' if idx == 1 else 'updated')
+
+            run_row3 = {'id': run3, 'issue_id': 'I1', 'workspace_id': 'W1', 'status': 'running', 'trigger_comment_id': None}
+            with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'user', 'MULTICA_TASK_ID': run3}), \
+                    patch.object(reply, 'multica_json', return_value=[run_row3]), \
+                    patch.object(reply, 'collect_run_context', return_value=None), \
+                    patch.object(reply, 'read_source', return_value=env), \
+                    patch.object(reply, 'slack_call', side_effect=fake_slack):
+                fin = io.StringIO()
+                with redirect_stdout(fin):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--current-run', '--text-file', str(final_file)])
+                self.assertEqual(json.loads(fin.getvalue())['message_ts'], '200.000009')
+
+            chat_ops = [m for m in ops if m.startswith('chat.')]
+            self.assertEqual(chat_ops, ['chat.postMessage', 'chat.update', 'chat.delete', 'chat.postMessage'])
+
+    def test_stale_reply_gate_blocks_until_acknowledged_without_locking_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps({
+                **CONFIG, 'workspaceId': 'W1', 'projectId': 'P1',
+                'serverUrl': 'https://multica.example', 'agentId': 'A1',
+                'staleReplyGate': True,
+                'startReaction': {'name': 'bug_eyes', 'userId': 'U_OWNER', 'tokenEnv': 'SLACK_USER_TOKEN'},
+            }))
+            text_file = Path(directory) / 'reply.md'
+            text_file.write_text('这是延迟回复')
+            env = {'eventPayload': {**EVENT, 'threadTs': '100.000001', 'messageTs': '100.000002', 'senderUserId': 'U_PEER'}}
+
+            posted = []
+            thread_messages = [
+                {'ts': '100.000001', 'user': 'U_ROOT', 'text': 'root'},
+                {'ts': '100.000002', 'user': 'U_PEER', 'text': 'ping'},
+                {'ts': '100.000005', 'user': 'U_OWNER', 'text': '我来答了'},
+            ]
+
+            def fake_slack(_token, method, payload=None, query=None, **_kw):
+                if method == 'conversations.replies' and query and query.get('limit') == '1':
+                    return {'ok': True, 'messages': [{'ts': '100.000001'}]}
+                if method == 'conversations.replies' and query and query.get('limit') == '200' and query.get('oldest') in ('100.000002', '100.000005'):
+                    return {'ok': True, 'messages': thread_messages, 'has_more': False}
+                if method == 'chat.postMessage':
+                    posted.append(payload)
+                    return {'ok': True, 'channel': 'C1', 'ts': '200.000001'}
+                if method == 'conversations.replies':
+                    bid = posted[-1]['blocks'][-1]['block_id']
+                    return {'ok': True, 'messages': [{'ts': '200.000001', 'blocks': [{'type': 'context', 'block_id': bid}]}]}
+                raise AssertionError((method, query))
+
+            with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'user'}), \
+                    patch.object(reply, 'read_source', return_value=env), \
+                    patch.object(reply, 'slack_call', side_effect=fake_slack):
+                with self.assertRaises(reply.StaleThreadError) as ctx:
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1', '--text-file', str(text_file)])
+                self.assertEqual(ctx.exception.reason, 'owner_replied')
+                self.assertEqual(ctx.exception.latest_ts, '100.000005')
+                self.assertEqual(len(posted), 0)
+
+                # Because delivery was not locked, re-running with --ack-thread-ts 100.000005 succeeds.
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1',
+                                '--text-file', str(text_file), '--ack-thread-ts', '100.000005'])
+                res = json.loads(out.getvalue())
+                self.assertTrue(res['ok'])
+                self.assertEqual(res['message_ts'], '200.000001')
+                self.assertEqual(len(posted), 1)
+
+    def test_stale_reply_gate_variants_sender_deleted_folded_and_relay_exclusion(self):
+        cfg = {
+            **CONFIG,
+            'staleReplyGate': True,
+            'startReaction': {'name': 'bug_eyes', 'userId': 'U_OWNER', 'tokenEnv': 'SLACK_USER_TOKEN'},
+        }
+        env = {'eventPayload': {**EVENT, 'threadTs': '100.000001', 'messageTs': '100.000002', 'senderUserId': 'U_PEER'}}
+
+        # 1. Relay messages and folded supplements are ignored.
+        msgs_safe = [
+            {'ts': '100.000001', 'user': 'U_ROOT', 'text': 'root'},
+            {'ts': '100.000002', 'user': 'U_PEER', 'text': 'ping'},
+            {'ts': '100.000003', 'user': 'U_OWNER', 'blocks': [{'type': 'context', 'block_id': 'relay-delivery-abc'}]},
+            {'ts': '100.000004', 'user': 'U_PEER', 'text': 'steered follow-up'},
+        ]
+        with patch.object(reply, 'slack_call', return_value={'ok': True, 'messages': msgs_safe, 'has_more': False}):
+            reply.check_thread_freshness('tok', cfg, env, folded_message_ts={'100.000004'})
+
+        # 2. Unfolded sender follow-up blocks with sender_updated.
+        with patch.object(reply, 'slack_call', return_value={'ok': True, 'messages': msgs_safe, 'has_more': False}):
+            with self.assertRaises(reply.StaleThreadError) as ctx:
+                reply.check_thread_freshness('tok', cfg, env)
+            self.assertEqual(ctx.exception.reason, 'sender_updated')
+            self.assertEqual(ctx.exception.latest_ts, '100.000004')
+
+        # 3. Deleted trigger message blocks with trigger_deleted until acknowledged.
+        msgs_deleted = [
+            {'ts': '100.000001', 'user': 'U_ROOT', 'text': 'root'},
+            {'ts': '100.000002', 'subtype': 'tombstone', 'text': 'This message was deleted.'},
+        ]
+        with patch.object(reply, 'slack_call', return_value={'ok': True, 'messages': msgs_deleted, 'has_more': False}):
+            with self.assertRaises(reply.StaleThreadError) as ctx:
+                reply.check_thread_freshness('tok', cfg, env)
+            self.assertEqual(ctx.exception.reason, 'trigger_deleted')
+            reply.check_thread_freshness('tok', cfg, env, ack_thread_ts='100.000002')
+
 
 if __name__ == '__main__':
     unittest.main()

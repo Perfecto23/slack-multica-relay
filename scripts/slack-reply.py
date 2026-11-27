@@ -48,10 +48,16 @@ def footer_for(config, envelope):
     if (snapshot.get('type') != 'slack_reply_context' or snapshot.get('source') != 'agent_config'
             or snapshot.get('status') != 'available' or reply_assignee(config) != ('agent', snapshot.get('agentId'))):
         return footer
+    if 'model' not in footer_stats(config):
+        return footer
     model = snapshot.get('model')
     if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}', model):
         return footer
-    footer += ' · 配置模型：' + model
+    if config.get('modelLabel') is not None:
+        seed = (envelope.get('eventPayload') or {}).get('messageTs') or snapshot.get('agentId') or model
+        footer += ' · ' + icon(config, 'model') + ' ' + model_label(config, model, seed)
+    else:
+        footer += ' · 配置模型：' + model
     if snapshot.get('serviceTier') == 'priority':
         footer += ' · ⚡ Fast'
     return footer
@@ -448,6 +454,14 @@ class SlackRateLimited(ValueError):
         self.retry_after = retry_after
 
 
+class StaleThreadError(ValueError):
+    def __init__(self, reason, latest_ts, new_messages):
+        super().__init__('thread_changed_since_trigger')
+        self.reason = reason
+        self.latest_ts = latest_ts
+        self.new_messages = new_messages
+
+
 def retry_after_seconds(headers):
     value = (headers or {}).get('Retry-After', '').strip()
     # Slack specifies seconds; a missing/malformed header gets a conservative
@@ -718,10 +732,127 @@ def progress_paths(config_path, identity):
     return root / ('progress-' + identity + '.json'), root / ('progress-' + identity + '.lock')
 
 
+def _is_relay_message(message):
+    blocks = message.get('blocks')
+    if not isinstance(blocks, list):
+        return False
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        bid = block.get('block_id')
+        if isinstance(bid, str) and (bid.startswith('relay-delivery-') or bid.startswith('relay-progress-')):
+            return True
+    return False
+
+
+def _ts_tuple(ts):
+    sec, _, frac = str(ts).partition('.')
+    return int(sec), int(frac.ljust(6, '0')[:6])
+
+
+def check_thread_freshness(token, config, envelope, ack_thread_ts=None, folded_message_ts=None,
+                           opener=urllib.request.urlopen):
+    """Block blind final replies if owner replied, sender updated, or trigger was deleted after trigger time."""
+    if not config.get('staleReplyGate'):
+        return
+    event = envelope.get('eventPayload') or {}
+    channel = event.get('channelId')
+    thread_ts = event.get('threadTs')
+    message_ts = event.get('messageTs')
+    if not (isinstance(channel, str) and isinstance(thread_ts, str) and isinstance(message_ts, str)
+            and re.fullmatch(r'\d+\.\d{1,6}', message_ts)):
+        return
+    baseline = _ts_tuple(message_ts)
+    ack_valid = isinstance(ack_thread_ts, str) and bool(re.fullmatch(r'\d+\.\d{1,6}', ack_thread_ts))
+    query_oldest = message_ts
+    if ack_valid:
+        ack_tuple = _ts_tuple(ack_thread_ts)
+        if ack_tuple > baseline:
+            baseline = ack_tuple
+            query_oldest = ack_thread_ts
+
+    messages = []
+    cursor, seen_cursors = '', set()
+    has_more = False
+    for _ in range(5):
+        query = {
+            'channel': channel, 'ts': thread_ts, 'oldest': query_oldest,
+            'inclusive': 'true', 'limit': '200',
+        }
+        if cursor:
+            query['cursor'] = cursor
+        try:
+            data = slack_call(token, 'conversations.replies', query=query, opener=opener)
+        except (ValueError, OSError):
+            return
+        page = data.get('messages')
+        if not isinstance(page, list) or not page:
+            break
+        messages.extend(page)
+        has_more = bool(data.get('has_more'))
+        next_cursor = (data.get('response_metadata') or {}).get('next_cursor', '')
+        next_cursor = next_cursor.strip() if isinstance(next_cursor, str) else ''
+        if not next_cursor or next_cursor in seen_cursors:
+            break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    if not messages:
+        return
+    has_root = any(isinstance(m, dict) and m.get('ts') == thread_ts for m in messages)
+    if not has_root:
+        return
+    folded = set(folded_message_ts or ())
+    owner_id = (config.get('startReaction') or {}).get('userId')
+    sender_id = event.get('senderUserId')
+
+    trigger_msg = next((m for m in messages if isinstance(m, dict) and m.get('ts') == message_ts), None)
+    trigger_deleted = (
+        (trigger_msg is not None and trigger_msg.get('subtype') == 'tombstone')
+        or (trigger_msg is None and message_ts != thread_ts and query_oldest == message_ts and not has_more)
+    )
+
+    owner_msgs = []
+    sender_msgs = []
+    latest_ts = message_ts
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        ts = msg.get('ts')
+        if not isinstance(ts, str) or not re.fullmatch(r'\d+\.\d{1,6}', ts):
+            continue
+        if _ts_tuple(ts) > _ts_tuple(latest_ts):
+            latest_ts = ts
+        if _ts_tuple(ts) <= baseline:
+            continue
+        if ts in folded or _is_relay_message(msg):
+            continue
+        if msg.get('subtype') == 'tombstone':
+            continue
+        user = msg.get('user')
+        summary = {'ts': ts, 'user': user or '', 'text': (msg.get('text') or '')[:200]}
+        if owner_id and user == owner_id:
+            owner_msgs.append(summary)
+        elif sender_id and user == sender_id:
+            sender_msgs.append(summary)
+
+    if owner_msgs:
+        raise StaleThreadError('owner_replied', latest_ts, owner_msgs)
+    if trigger_deleted and not ack_valid:
+        raise StaleThreadError('trigger_deleted', latest_ts, [])
+    if sender_msgs:
+        raise StaleThreadError('sender_updated', latest_ts, sender_msgs)
+
+
 def progress_identity_for(config, issue_id, base_identity, task_id=None):
+    # Share a single progress card per Issue so delegated multi-run wakeups update in-place and auto-delete cleanly.
+    return delivery_identity(config, issue_id, None, 'issue-progress')
+
+
+def legacy_task_progress_identity(config, issue_id, task_id=None):
     if isinstance(task_id, str) and re.fullmatch(UUID_PATTERN, task_id):
         return delivery_identity(config, issue_id, None, f'run-progress:{task_id}')
-    return base_identity
+    return None
 
 
 def render_progress_payload(config, envelope, text, block_id):
@@ -1026,7 +1157,10 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     parser.add_argument('--current-run', action='store_true',
                         help='Derive the trigger comment, scheduled wakeup and run statistics from MULTICA_TASK_ID')
     parser.add_argument('--interim', help='Send a retry-safe mid-run progress reply with this step key without locking out the final reply')
+    parser.add_argument('--ack-thread-ts', help='Acknowledge newer Slack thread messages up to this ts after thread_changed_since_trigger')
     args = parser.parse_args(argv)
+    if args.ack_thread_ts is not None and not re.fullmatch(r'\d+\.\d{1,6}', args.ack_thread_ts):
+        raise ValueError('invalid_ack_thread_ts')
     config_path = Path(args.config)
     config = json.loads(config_path.read_text())
     occurrence, source_kind, collected_context, supplement_ids = None, 'relay', None, []
@@ -1125,6 +1259,11 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
                 result = {}
         if not args.dry_run:
             progress_cleanup = clear_progress_message(config_path, prog_identity, opener=opener)
+            legacy_prog = legacy_task_progress_identity(config, args.issue_id, os.environ.get('MULTICA_TASK_ID'))
+            if legacy_prog and legacy_prog != prog_identity:
+                legacy_cleanup = clear_progress_message(config_path, legacy_prog, opener=opener)
+                if progress_cleanup == 'absent':
+                    progress_cleanup = legacy_cleanup
             if progress_cleanup == 'absent' and prog_identity != base_identity:
                 progress_cleanup = clear_progress_message(config_path, base_identity, opener=opener)
             if progress_cleanup != 'absent':
@@ -1216,7 +1355,21 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
             raise ValueError('slack_delivery_unknown')
         verify_reply_root(token, envelope, opener)
         if args.interim is None:
+            folded_ts = set()
+            for sup_id in supplement_ids:
+                try:
+                    sup_env, sup_kind = read_reply_source(config, args.issue_id, sup_id, runner)
+                    if sup_kind == 'relay':
+                        ts = (sup_env.get('eventPayload') or {}).get('messageTs')
+                        if isinstance(ts, str):
+                            folded_ts.add(ts)
+                except ValueError:
+                    pass
+            check_thread_freshness(token, config, envelope, args.ack_thread_ts, folded_ts, opener)
             clear_progress_message(config_path, prog_identity, token=token, opener=opener)
+            legacy_prog = legacy_task_progress_identity(config, args.issue_id, os.environ.get('MULTICA_TASK_ID'))
+            if legacy_prog and legacy_prog != prog_identity:
+                clear_progress_message(config_path, legacy_prog, token=token, opener=opener)
             if prog_identity != identity:
                 clear_progress_message(config_path, identity, token=token, opener=opener)
         attempted_at = slack_timestamp()
@@ -1251,6 +1404,20 @@ if __name__ == '__main__':
     except SlackRateLimited as error:
         print(json.dumps({'ok': False, 'error': 'slack_rate_limited', 'retryable': True,
                           'retry_after_seconds': error.retry_after}), file=sys.stderr)
+        sys.exit(1)
+    except StaleThreadError as error:
+        print(json.dumps({
+            'ok': False,
+            'error': 'thread_changed_since_trigger',
+            'reason': error.reason,
+            'latest_ts': error.latest_ts,
+            'new_messages': error.new_messages,
+            'hint': (
+                'Read the new Slack thread messages before replying. '
+                'If no reply is needed, run --clear-start-reaction; '
+                f'otherwise update the reply and re-run with --ack-thread-ts {error.latest_ts}.'
+            ),
+        }, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
         # Never echo HTTP bodies, command output, authorization headers or private source content.

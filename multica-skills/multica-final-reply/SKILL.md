@@ -27,8 +27,9 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
    ```
 
    `--current-run` 按 `MULTICA_TASK_ID` 回读当前 run，自动确定回复对象（Slack 追问、owner 要求发到 Slack 的 Multica 评论、被派单 Agent 交回的结果、定时唤醒），采集统计和任务链接，并在收尾时自动清理本轮及被折叠合并（`coalesced`）或被 Steer 插话（`supplement`）进本轮的排队/等待/离线表情。
-   - **长任务原地刷新状态卡（推荐用于耗时 >1 分钟的调查/审查/派单）**：执行 `--current-run --progress "🔍 正在拉取 PR diff 并核对调用链…"`（不带 `--text-file`）。首次调用发送一条斜体进度卡，后续重复调用原地 `chat.update` 刷新同一条消息；发送最终正文（或静默收尾）时，adapter 会**自动删除该临时进度卡再发正式回复**，既保持线程干净，又保留 Slack 新消息通知提醒。
+   - **长任务原地刷新状态卡（推荐用于耗时 >1 分钟的调查/审查/派单）**：执行 `--current-run --progress "🔍 正在拉取 PR diff 并核对调用链…"`（不带 `--text-file`）。同一个 Issue 跨派单/多轮唤醒共享同一条进度卡，首次调用发送进度卡，后续重复调用原地 `chat.update` 刷新；发送最终正文（或静默收尾）时，adapter 会**自动删除该临时进度卡再发正式回复**，既保持线程干净，又保留 Slack 新消息通知提醒。
    - **需要保留在线程里的阶段性回复（可选）**：当请求者插话要求“先回我一句结论再继续做”，加 `--interim <步骤名>`（如 `--interim ack`）配合 `--text-file`。阶段性回复保留在线程里且不会锁死本轮最终回复。
+   - **发送前防过期门禁（`thread_changed_since_trigger`）**：正式回复发送前，adapter 会回看原线程在触发消息之后的新消息。若期间本人已亲自回复、原触发消息被删除、或发起人发了未折叠进本轮的新补充，adapter 会拒发并返回 `thread_changed_since_trigger` 及新消息摘要（不锁死发送记录）。先读这些新消息：不再需要回复时改用 `--clear-start-reaction` 静默收尾；仍需回复时结合新内容更新正文，再附 `--ack-thread-ts <返回的 latest_ts>` 重试发送。
 
 完成标准：adapter 返回 `ok: true` 和 `message_ts`；或者按下表处理完错误，并在 Multica 任务结果里写明送达状态。
 
@@ -44,6 +45,7 @@ description: 向 Slack 原线程发送 Relay 任务的答复时使用，覆盖�
 | `reply_failed_verify_before_retry` | 中途出错，可能已经发出 | 用 `moe-slack` 读原线程：消息已在就算送达；没有就用同一命令重试一次（adapter 的发送记录会挡住重复发送） |
 | `slack_delivery_unknown`、`slack_send_unverified`、`slack_attachment_delivery_unknown` | 已发出请求，结果不明；adapter 会锁住这条来源 | 用 `moe-slack` 读原线程：消息已在就算送达；没有就在任务结果写“结果不明，原线程未见消息”，留给本人处理 |
 | `invalid_relay_source` | 触发评论不属于 Relay、owner 或被派单的 Agent | 在任务结果说明；回复只发原线程 |
+| `thread_changed_since_trigger` | 触发消息之后原线程有本人回复、发起人新补充或原消息已删除（未锁死发送记录） | 先读返回的 `new_messages` 或用 `moe-slack` 读线程；不需要回则 `--clear-start-reaction`，仍需回则更新正文后加 `--ack-thread-ts <latest_ts>` 重试 |
 
 其他错误码照原样写进任务结果。
 
