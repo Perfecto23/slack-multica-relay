@@ -42,19 +42,10 @@ import {
 import { type ThreadStore } from "./thread-store.js";
 import {
   buildEnvelope,
-  compactInitialContext,
-  mergeParticipants,
-  projectFiles,
   compareTs,
   timestampValid,
-  updateCoverage,
   type ThreadContext,
 } from "./context-envelope.js";
-import {
-  missingSection,
-  normalizeContext,
-  noteOmission,
-} from "./context-coverage.js";
 import type { ContextReadOptions } from "./slack-context.js";
 
 export interface SteerCheckPayload {
@@ -103,6 +94,7 @@ export interface ThreadRouterConfig extends ApiConfig {
   slackStatusToken?: string;
   slackAlertChannelId?: string;
   implicitThreadMaxSilentTurns?: number;
+  ownerUserIds?: ReadonlySet<string>;
 }
 
 export interface ThreadState {
@@ -112,6 +104,7 @@ export interface ThreadState {
   creating: boolean;
   epoch?: number;
   epochStartedTs?: string;
+  lastDeliveredTs?: string;
   implicitMode?: "open" | "closed";
   lastSeenReplyTs?: string;
   implicitSilentCount?: number;
@@ -498,131 +491,116 @@ export async function routeSlackThreadEvent(
       };
     };
 
-    const selectionKey = state.epoch ? `${key}:epoch:${state.epoch}:sent-context-index` : key + ':sent-context-index';
-    type SelectionIndex = { version: 3; cutoffTs: string; initialContext: ThreadContext; request: SlackThreadEvent };
     let recoveredDescription: string | undefined;
-    const advanceSelection = async (): Promise<void> => {
-      const pending=await config.store.get(msgKey+':selection-index');
-      if(!pending)return;
-      const next=JSON.parse(pending) as SelectionIndex;
-      const old=await config.store.get(selectionKey);
-      if(old&&compareTs(JSON.parse(old).cutoffTs,next.cutoffTs)>=0)return;
-      await config.store.set(selectionKey,pending,24*60*60);
+    const recordDelivered = async (): Promise<void> => {
+      const nextDelivered = maxTimestamp(state.lastDeliveredTs, event.messageTs);
+      if (nextDelivered !== state.lastDeliveredTs) {
+        state.lastDeliveredTs = nextDelivered;
+        await save();
+      }
+    };
+    const resolveSinceTs = async (followup: boolean): Promise<string | undefined> => {
+      if (!followup || !state.issueId) return undefined;
+      if (
+        state.lastDeliveredTs &&
+        timestampValid(state.lastDeliveredTs) &&
+        compareTs(state.lastDeliveredTs, event.messageTs) < 0
+      ) {
+        return state.lastDeliveredTs;
+      }
+      const description =
+        recoveredDescription ??
+        (await getIssue(config, state.issueId, fetchImpl)).description;
+      if (!description?.startsWith(marker + "\n"))
+        throw new Error("invalid_thread_state");
+      const first = readTaskEnvelope(description);
+      if (threadKey(first.eventPayload) !== threadKey(event))
+        throw new Error("invalid_thread_state");
+      const persistedTimestamps = [first.eventPayload.messageTs];
+      for (const content of await listRelayMessageContents(
+        config,
+        state.issueId,
+        fetchImpl,
+      )) {
+        const item = readTaskEnvelope(content);
+        if (threadKey(item.eventPayload) !== threadKey(event)) continue;
+        const itemKey = messageKey(item.eventPayload);
+        if (
+          !content.startsWith(`<!-- relay-message:${digest(itemKey)} -->\n`) &&
+          !content.startsWith(`<!-- relay-message:${digest(`${itemKey}:edit`)} -->\n`)
+        ) {
+          continue;
+        }
+        persistedTimestamps.push(item.eventPayload.messageTs);
+      }
+      const validTimestamps = persistedTimestamps.filter(timestampValid);
+      const beforeDelivered = state.lastDeliveredTs;
+      for (const ts of validTimestamps) {
+        state.lastDeliveredTs = maxTimestamp(state.lastDeliveredTs, ts);
+      }
+      if (state.lastDeliveredTs !== beforeDelivered) {
+        await save();
+      }
+      return validTimestamps
+        .filter((ts) => compareTs(ts, event.messageTs) < 0)
+        .sort((a, b) => compareTs(b, a))[0];
     };
     const prepare = async (): Promise<string> => {
-      const preparedKey = msgKey + ':envelope';
+      const preparedKey = msgKey + ":envelope";
       const frozen = await config.store.get(preparedKey);
       if (frozen) {
-        try { const pf = JSON.parse(frozen) as { replyContext?: { runtimeOnline?: boolean } }; if (pf.replyContext?.runtimeOnline === false) runtimeOffline = true; } catch {}
-        console.info('relay_context',{eventId:digest(messageKey(event)),snapshot:'reused',envelopeBytes:Buffer.byteLength(frozen)});
+        try {
+          const pf = JSON.parse(frozen) as {
+            replyContext?: { runtimeOnline?: boolean };
+          };
+          if (pf.replyContext?.runtimeOnline === false) runtimeOffline = true;
+        } catch {}
+        console.info("relay_context", {
+          eventId: digest(messageKey(event)),
+          snapshot: "reused",
+          envelopeBytes: Buffer.byteLength(frozen),
+        });
         return frozen;
       }
-      const savedIndex=await config.store.get(selectionKey);
-      let index:SelectionIndex|undefined=savedIndex?JSON.parse(savedIndex):undefined;
-      // Indexes written before schema 6 carry legacy section statuses.
-      if(index?.version===3&&index.initialContext?.timeline)normalizeContext(index.initialContext);
-      if(index?.version===3&&(!index.request||threadKey(index.request)!==threadKey(event)||!timestampValid(index.cutoffTs)||index.request.messageTs!==index.cutoffTs||index.initialContext?.anchorTs!==event.threadTs||!Array.isArray(index.initialContext.timeline?.messages)))throw new Error('invalid_thread_state');
-      const followup=!!state.issueId&&messageKey(event)!==state.rootMessageKey;
-      // Initial background belongs to the Issue, independently of whether A exists before B.
-      let initialContext=index?.version===3?index.initialContext:undefined;
-      // A is a persisted mention, never a read attempt or an unconfirmed write.
-      // Cache loss and out-of-order events recover A from the scoped Issue/comments.
-      if(followup&&(!index||index.version!==3||compareTs(index.cutoffTs,event.messageTs)>=0)){
-        const description=recoveredDescription??(await getIssue(config,state.issueId!,fetchImpl)).description;
-        if(!description?.startsWith(marker+'\n'))throw new Error('invalid_thread_state');
-        const first=readTaskEnvelope(description);
-        if(threadKey(first.eventPayload)!==threadKey(event))throw new Error('invalid_thread_state');
-        const history=[first];
-        for(const content of await listRelayMessageContents(config,state.issueId!,fetchImpl)){
-          const item=readTaskEnvelope(content);
-          if(threadKey(item.eventPayload)!==threadKey(event)||!content.startsWith(`<!-- relay-message:${digest(messageKey(item.eventPayload))} -->\n`))continue;
-          history.push(item);
-        }
-        const previous=history.filter(item=>compareTs(item.eventPayload.messageTs,event.messageTs)<0)
-          .sort((a,b)=>compareTs(b.eventPayload.messageTs,a.eventPayload.messageTs))[0];
-        const original=first.context as ThreadContext|undefined;
-        // Legacy envelopes may not have a tree. Their request still bounds A.
-        initialContext=original?.timeline?(Number(first.schemaVersion)>=5?normalizeContext(structuredClone(original)):compactInitialContext(normalizeContext(structuredClone(original)))):{
-          anchorTs:event.threadTs,cutoffTs:first.eventPayload.messageTs,capturedAt:'',timeline:missingSection('legacy_background_unavailable'),
-        };
-        initialContext.timeline.messages=initialContext.timeline.messages.filter(m=>m.ts!==event.threadTs);
-        const latest=history.sort((a,b)=>compareTs(b.eventPayload.messageTs,a.eventPayload.messageTs))[0]!;
-        // A late event after cache loss must not replace a newer persisted cursor.
-        await config.store.set(selectionKey,JSON.stringify({version:3,cutoffTs:latest.eventPayload.messageTs,initialContext,request:latest.eventPayload}),24*60*60);
-        if(previous)index={version:3,cutoffTs:previous.eventPayload.messageTs,initialContext,request:previous.eventPayload};
-        else index=undefined;
-      }
-      const baseline=index?.version===3&&compareTs(index.cutoffTs,event.messageTs)<0?index:undefined;
-      const source=await config.readContext(event,{sinceTs:baseline?.cutoffTs,includeNearby:!followup,referenceTexts:typeof baseline?.request.text==='string'?[baseline.request.text]:[]});
-      if(initialContext){
-        const sides=structuredClone(initialContext.timeline.messages).filter(m=>compareTs(m.ts,event.messageTs)<=0);
-        for(const root of sides){
-          if(!root.replies)continue;
-          const before=root.replies.messages.length;
-          root.replies.messages=root.replies.messages.filter(m=>compareTs(m.ts,event.messageTs)<=0);
-          if(root.replies.messages.length<before)noteOmission(root.replies,'request_cutoff');
-          updateCoverage(root.replies);
-        }
-        const fresh=source.timeline.messages;
-        const combined=new Map(sides.map(m=>[m.ts,m]));
-        for(const message of fresh){
-          const previous=combined.get(message.ts);
-          if(previous?.replies&&message.replies){
-            message.replies.messages=[...new Map([...previous.replies.messages,...message.replies.messages].map(m=>[m.ts,m])).values()].sort((a,b)=>compareTs(a.ts,b.ts));
-          }
-          combined.set(message.ts,message);
-        }
-        source.timeline.messages=[...combined.values()].sort((a,b)=>compareTs(a.ts,b.ts));
-        source.initialCutoffTs=initialContext.cutoffTs;
-        if(initialContext.timeline.status!=='complete'){
-          source.initialStatus=initialContext.timeline.status;
-          if(initialContext.timeline.reasons?.length)source.initialReasons=[...initialContext.timeline.reasons];
-        }
-        source.participants=mergeParticipants(initialContext.participants,source.participants);
-      }else source.initialCutoffTs=event.messageTs;
-      const anchor=source.timeline.messages.find(m=>m.ts===event.threadTs);
-      if(baseline&&baseline.cutoffTs!==event.threadTs&&anchor?.replies&&!anchor.replies.messages.some(m=>m.ts===baseline.cutoffTs)){
-        if(typeof baseline.request.text!=='string')throw new Error('context_required_unavailable');
-        anchor.replies.messages.unshift({ts:baseline.cutoffTs,authorId:baseline.request.senderUserId,origin:'unknown',text:baseline.request.text,files:projectFiles(baseline.request.files,Number.MAX_SAFE_INTEGER),restoredFrom:'persisted_request',...(baseline.request.filesTruncated?{filesTruncated:true}:{})});
-        anchor.replies.messages.sort((a,b)=>compareTs(a.ts,b.ts));
-      }
-      const agentConfigStartedAt=Date.now();
-      const replyContext=await getSlackReplyContext(config,fetchImpl);
-      if(replyContext.runtimeOnline===false)runtimeOffline=true;
-      const agentConfigMs=Date.now()-agentConfigStartedAt;
-      const assemblyStart=Date.now();
-      // First nearby discussion is immutable background; no unrelated new timeline on follow-up.
-      const selected=source;
-      if(followup){
-        selected.sinceTs=baseline?.cutoffTs;
-        selected.selection={mode:'focused',baseline:baseline?'available':'unavailable',omittedRoots:0,omittedCurrentReplies:0};
-        if(anchor?.replies&&baseline)anchor.replies.messages=anchor.replies.messages.filter(m=>compareTs(m.ts,baseline.cutoffTs)>=0||m.change==='referenced'||m.change==='context');
-      }
-      const body=buildEnvelope(event,selected,replyContext);
-      const output=JSON.parse(body).context as ThreadContext;
-      const delivered=output.timeline.messages;
-      const count=(roots:ThreadContext['timeline']['messages'])=>roots.length+roots.reduce((n,m)=>n+(m.replies?.messages.length??0),0);
-      const reasons:Record<string,number>={};
-      const readReasons:Record<string,number>={};
-      for(const section of [source.timeline,...source.timeline.messages.flatMap(m=>m.replies?[m.replies]:[])])for(const reason of section.reasons??[])readReasons[reason]=(readReasons[reason]??0)+1;
-      const sections=[output.timeline,...delivered.flatMap(m=>m.replies?[m.replies]:[])];
-      for(const section of sections)for(const reason of section.reasons??[])reasons[reason]=(reasons[reason]??0)+1;
-      console.info('relay_context',{
-        eventId:digest(messageKey(event)),snapshot:'prepared',mode:followup?'focused':'full',baseline:baseline?'available':'unavailable',
-        slackCalls:source.readStats?.slackCalls,rawMessages:source.readStats?.rawMessages,
-        candidateRoots:source.timeline.messages.length,candidateMessages:count(source.timeline.messages),
-        retainedRoots:delivered.length,retainedMessages:count(delivered),omittedMessages:count(source.timeline.messages)-count(delivered),
-        added:output.selection?.added??0,updated:output.selection?.updated??0,referenced:output.selection?.referenced??0,
-        selectionReasons:selected.selectionStats,byteBudgetOmissions:count(selected.timeline.messages)-count(delivered),
-        readReasons,reasons,messageReadMs:source.readStats?.messageReadMs,nameLookupCalls:source.readStats?.nameLookupCalls,
-        nameReadMs:source.readStats?.nameReadMs,agentConfigMs,assemblyMs:Date.now()-assemblyStart,envelopeBytes:Buffer.byteLength(body),
+      const followup =
+        Boolean(state.issueId) && messageKey(event) !== state.rootMessageKey;
+      const sinceTs = await resolveSinceTs(followup);
+      const includeNearby = !followup && event.messageTs === event.threadTs;
+      const source = await config.readContext(event, {
+        ...(sinceTs ? { sinceTs } : {}),
+        includeNearby,
+      });
+      const agentConfigStartedAt = Date.now();
+      const replyContext = await getSlackReplyContext(config, fetchImpl);
+      if (replyContext.runtimeOnline === false) runtimeOffline = true;
+      const agentConfigMs = Date.now() - agentConfigStartedAt;
+      const assemblyStart = Date.now();
+      const body = buildEnvelope(event, source, replyContext, {
+        ownerUserIds: config.ownerUserIds,
+      });
+      console.info("relay_context", {
+        eventId: digest(messageKey(event)),
+        snapshot: "prepared",
+        mode: followup ? "followup" : "initial",
+        hasSinceTs: Boolean(sinceTs),
+        slackCalls: source.readStats?.slackCalls,
+        rawMessages: source.readStats?.rawMessages,
+        retainedReplies: source.replies.length,
+        omittedEarlierReplies: source.omittedEarlierReplies,
+        nearbyMessages: source.nearbyMessages.length,
+        channelCacheHit: source.readStats?.channelCacheHit,
+        channelLookupCalls: source.readStats?.channelLookupCalls,
+        userCacheHits: source.readStats?.userCacheHits,
+        userLookupCalls: source.readStats?.userLookupCalls,
+        messageReadMs: source.readStats?.messageReadMs,
+        lookupMs: source.readStats?.lookupMs,
+        agentConfigMs,
+        assemblyMs: Date.now() - assemblyStart,
+        envelopeBytes: Buffer.byteLength(body),
       });
       await config.store.setIfAbsent(preparedKey, body, 24 * 60 * 60);
       const saved = await config.store.get(preparedKey);
-      if (!saved) throw new Error('invalid_thread_state');
-      const firstContext=initialContext??structuredClone(output);
-      firstContext.timeline.messages=firstContext.timeline.messages.filter(m=>m.ts!==event.threadTs);
-      if(saved===body)await config.store.set(msgKey+':selection-index',JSON.stringify({version:3,cutoffTs:event.messageTs,initialContext:firstContext,request:JSON.parse(body).eventPayload}),24*60*60);
+      if (!saved) throw new Error("invalid_thread_state");
       return saved;
     };
 
@@ -698,7 +676,7 @@ export async function routeSlackThreadEvent(
     if (alreadyDone)
       return await finish("duplicate");
     if (messageKey(event) === state.rootMessageKey) {
-      await advanceSelection();
+      await recordDelivered();
       await config.store.set(
         msgKey,
         JSON.stringify({ phase: "done" }),
@@ -815,7 +793,7 @@ export async function routeSlackThreadEvent(
       state.implicitSilentCount = (state.implicitSilentCount ?? 0) + 1;
       await save();
     }
-    await advanceSelection();
+    await recordDelivered();
     await config.store.set(
       msgKey,
       JSON.stringify({ phase: "done" }),

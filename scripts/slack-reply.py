@@ -478,6 +478,8 @@ def slack_call(token, method, payload=None, query=None, opener=urllib.request.ur
         if isinstance(data, dict) and data.get('ok') is False and code in ('rate_limited', 'ratelimited'):
             raise SlackRateLimited(retry_after_seconds(headers))
         if payload is None:
+            if isinstance(data, dict) and data.get('ok') is False and code == 'message_not_found' and method == 'reactions.get':
+                raise ValueError('slack_message_not_found')
             raise ValueError('slack_lookup_failed')
         # Only documented admission/validation failures prove the message was
         # not sent. Server failures and unknown responses retain the intent.
@@ -613,8 +615,13 @@ def clear_configured_reaction(config, envelope, key, dry_run=False, opener=urlli
         raise ValueError('reaction_actor_mismatch')
 
     def present():
-        result = slack_call(token, 'reactions.get', query={
-            'channel': channel, 'timestamp': timestamp, 'full': 'true'}, opener=opener)
+        try:
+            result = slack_call(token, 'reactions.get', query={
+                'channel': channel, 'timestamp': timestamp, 'full': 'true'}, opener=opener)
+        except ValueError as err:
+            if str(err) == 'slack_message_not_found':
+                return None
+            raise
         message = result.get('message')
         if (not isinstance(message, dict) or message.get('ts') != timestamp
                 or result.get('channel') != channel):
@@ -633,6 +640,8 @@ def clear_configured_reaction(config, envelope, key, dry_run=False, opener=urlli
         return found
 
     exists = present()
+    if exists is None:
+        return {'ok': True, 'action': 'already_absent', 'reason': 'message_not_found'}
     if dry_run:
         return {'ok': True, 'action': 'would_remove' if exists else 'already_absent',
                 'channel': channel, 'ts': timestamp, 'reaction': setting['name'], 'user_id': setting['userId']}
@@ -1100,14 +1109,20 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
         if source_kind in ('owner_comment', 'handoff'):
             # Only Relay messages get a start reaction; the root message's belongs to its own run.
             result = {'ok': True, 'action': 'not_applicable'}
+            primary_error = None
         else:
             queued = 'dry_run' if args.dry_run else clear_queued_reaction(config, envelope, opener)
             offline = 'dry_run' if args.dry_run else clear_offline_reaction(config, envelope, opener)
-            result = clear_start_reaction(config, envelope, args.dry_run, opener)
-            if not args.dry_run:
-                result['queued_reaction'] = queued
-                if config.get('offlineReaction') is not None:
-                    result['offline_reaction'] = offline
+            primary_error = None
+            try:
+                result = clear_start_reaction(config, envelope, args.dry_run, opener)
+                if not args.dry_run:
+                    result['queued_reaction'] = queued
+                    if config.get('offlineReaction') is not None:
+                        result['offline_reaction'] = offline
+            except Exception as err:
+                primary_error = err
+                result = {}
         if not args.dry_run:
             progress_cleanup = clear_progress_message(config_path, prog_identity, opener=opener)
             if progress_cleanup == 'absent' and prog_identity != base_identity:
@@ -1118,6 +1133,8 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
                 result['supplement_reactions'] = clear_supplement_reactions(
                     config, args.issue_id, supplement_ids, True, runner, opener)
             result['session_status'] = update_session_status(config, envelope, args.issue_id, 'active', runner, opener)
+        if primary_error is not None:
+            raise primary_error
         print(json.dumps(result))
         return
     identity = delivery_identity(config, args.issue_id, args.comment_id, occurrence)

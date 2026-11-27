@@ -33,14 +33,14 @@ Issue 是任务卡，run 是一次执行；`run-messages` 接收该次执行的 
 ## 核对 Relay 上下文
 
 1. 首次请求读取 Issue description；后续请求先定位 `relay-message` 根评论，再回读该评论完整内容。Agent 的答复和触发评论是不同记录。
-2. 核对 `eventPayload` 的 team、channel、thread 和 message 时间戳与目标 Slack 请求一致。新事件使用 `schemaVersion: 6`；已冻结事件的重试可以保留旧版本。
-3. 首次检查完整当前线程，以及 30 分钟 / 12 根 / 2 线程 / 5 回复的附近范围。有更早已交付 mention 时，检查 `sinceTs`、根、该 mention 和此后全部对话；必要恢复读取成功但没有更早 mention 时，省略 `sinceTs` 并从根全读。迟到请求仍保留原 `initialCutoffTs`，背景根及回复不得晚于本次请求。
-4. 每条消息的紧凑排版不改变原文、作者或线程归属；`currentRequest` 引用 eventPayload，不重复正文。`restoredFrom: persisted_request` 表示从历史请求补入，并非本次 Slack 读取。`not_loaded` 附件不能作为已读内容，背景缺失标记不能当成完整历史。
-5. 通过 `relay_context` 核对读取范围，通过 `relay_dispatch` 核对写入结果，再独立查看 run 和原线程回复。不要因 Issue 已存在就声称本次请求已经送达。
+2. 核对 `eventPayload` 的 team、channel、thread 和 message 时间戳与目标 Slack 请求一致。新事件使用 `schemaVersion: 7`；已冻结事件的重试或历史 Issue/comment 恢复继续兼容 `v1..v6`。
+3. 核对顶部 Markdown 现场头（会话类型、频道名与人数、发送者身份与 `Asia/Singapore` 时间）及对话区：线程内首次触发包含根消息与最近 20 条前序回复；根消息触发最多带前 10 分钟 5 条紧邻根消息；同线程后续追问只携带 `(sinceTs, messageTs)` 之间的新增本线程回复，不再把对话树重复塞入底部 `<!-- relay-payload:v1 -->` JSON。
+4. 核对行内 `<@U...>` 是否解析为真实姓名、`小 p (Agent 已回复)` 是否已剥离签名 Footer、转发卡片与 Block Kit 富文本是否提取完整，以及 `not_loaded` 附件是否在需要看图或读链接时生成了 `moe-slack` 按需提示。
+5. 通过 `relay_context`（含 `channelCacheHit`、`userCacheHits`、`envelopeBytes`）核对读取与目录缓存命中，通过 `relay_dispatch` 核对写入结果，再独立查看 run 和原线程回复。不要因 Issue 已存在就声称本次请求已经送达。
 
 `context_required_page_limit`、`context_required_unavailable` 和 `context_request_too_large` 表示必需上下文未能完整交付，consumer 会拒绝启动并保留原边界。暂时性的 429、5xx、超时交由有限重试。不要清理 Redis 或 delivery ledger 来强行重发。完整合同见 [Slack 上下文组装](CONTEXT-ASSEMBLY-DESIGN.md)。
 
-若消息带 `footerOmitted: true`，应对照 Slack 原始 blocks 的正文 section 验证；不能要求其 text 与含 Footer 的 Slack fallback text 完全相同。`replyContext.status=unavailable` 与执行统计中的模型是不同证据；读取失败时检查 Worker 的请求模式、上游状态和身份校验，不据此判定 Agent 没有运行。风格文件读取失败则核对私有 styleGuide 和 SKILLS.md 索引的实际路径。
+Agent 历史回复通过签名 `relay-delivery-<sha256>` block 识别并剥离 Footer，核对时应对照原始 Slack blocks 的正文部分，不能要求与含 Footer 的 fallback text 完全相同。`replyContext.status=unavailable` 与执行统计中的模型是不同证据；读取失败时检查 Worker 的请求模式、上游状态和身份校验，不据此判定 Agent 没有运行。风格文件读取失败则核对私有 styleGuide 和 SKILLS.md 索引的实际路径。
 
 ## 更新 Agent 配置
 

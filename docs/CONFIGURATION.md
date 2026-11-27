@@ -27,7 +27,7 @@ Slack ID 使用逗号分隔的大写标识符。`SLACK_TARGET_USER_IDS` 与 `SLA
 | `SLACK_WAKE_PATTERNS` | 否 | 逗号分隔的称呼唤醒词（如 `小 p,little perf`），大小写不敏感。 |
 | `SLACK_IMPLICIT_THREAD_FOLLOWUP` | 否 | 设为 `true` 时开启活跃线程免 `@` 续聊：仅对已参与或运行中的线程生效，自动忽略频道广播、首词 `@其他成员` 及部署者本人的无 `@` 普通回复，入场零表情且连续静默后自动冷却（默认 `SLACK_IMPLICIT_THREAD_MAX_SILENT=3`）。 |
 | `SLACK_EDIT_MENTION_WAKE` | 否 | 默认 `true`；真人编辑旧消息补上目标 `@` 或唤醒词时触发一次（忽略单纯链接展开）。 |
-| `SLACK_CONTEXT_TOKEN` | 是 | 带目标会话 history scopes 的 user token。consumer 用它读取有界 history/replies；如需通过 `users.info` 补充参与者姓名，还需 `users:read`。可以与 reaction 使用同一个已授权 token，但必须显式配置。 |
+| `SLACK_CONTEXT_TOKEN` | 是 | 带目标会话 history scopes 的 user token。consumer 用它读取有界 history/replies，并通过 `conversations.info` 与 `users.info` 解析会话画像和参与者姓名（需对应会话读取权限与 `users:read`，结果在 Redis 缓存 24 小时）。可以与 reaction 使用同一个已授权 token，但必须显式配置。 |
 | `SLACK_REACTION_NAME` | 是 | 不带冒号的 Slack emoji shortcode，例如 `eyes`。reaction 只确认 Relay 已持久化，不证明 Agent 已完成。 |
 | `SLACK_QUEUED_REACTION_NAME` | 否 | 排队提示表情，例如 `hourglass_flowing_sand`。后续消息进来时，若 `MULTICA_QUEUE_AGENT_ID` 在同一 Issue 上有进行中的任务（Multica 对同一 Agent 同一 Issue 只跑一个任务），再加这个表情，含义是“收到了，还没回复”；Agent 回复或静默收尾时由 adapter 的 `queuedReaction` 配置移除，名字须与这里一致。 |
 | `SLACK_STEER_PENDING_REACTION_NAME` | 否 | 运行中 Steer 插话等待 Agent 读取时的表情，默认沿用 `SLACK_QUEUED_REACTION_NAME`（或 `hourglass_flowing_sand`）；读取成功后自动替换为 `SLACK_STEER_READ_REACTION_NAME`（默认 `SLACK_REACTION_NAME`）。 |
@@ -65,11 +65,11 @@ Relay 调用普通 Issue 和 Comment API，不需要 Multica Autopilot 或 webho
 
 Redis 必须由该 Relay 独占，用于保存线程映射、锁和写入确认状态。QStash 保存排队的 Slack payload，并重试失败的 consumer；其访问控制与保留时间应按 Slack 消息内容的敏感程度配置。
 
-Redis 将 v3 已交付边界、最近请求及首次附近背景缓存 24 小时；缓存包含已交付的最小消息文本与附件引用，不含附件内容或 private URL。只有 Multica 写入确认后才推进边界；过期或乱序时从 scoped Issue/comments 恢复。准备好的 envelope 同样冻结 24 小时。新 mention 读取完整同线程间隔并沿用首次背景，重试复用冻结输入；旧 Issue/comment 不回写。Multica 的保留策略与 Redis TTL 独立。
+Redis 在 `ThreadState` 中缓存 `lastDeliveredTs` 增量游标，并将频道画像（`relay:dir:v1:ch:*`）、用户姓名（`relay:dir:v1:user:*`）与准备好的冻结 envelope（`:envelope`）各缓存 24 小时；缓存不含附件二进制内容、private URL 或个人邮箱。只有 Multica 写入确认后才推进 `lastDeliveredTs`；缓存过期或乱序投递时从 scoped Issue/comments 恢复已交付边界。重试复用冻结 envelope，旧 Issue/comment 不回写。Multica 的保留策略与 Redis TTL 独立。
 
-上下文窗口和展示版本由代码固定，不是新增的环境变量：首次附近讨论为 30 分钟内最近 12 根，其中 2 个活跃线程各带 5 条回复；后续保留上次已交付 mention 到本次请求的完整同线程区间。升级不需要迁移 Redis 或修改 Agent 配置，旧索引通过 Multica 已持久化记录恢复；读取失败或状态损坏会重试或拒绝，只有恢复读取成功且没有更早 mention 才从根全读。首次背景独立于 mention 边界保存，迟到请求也保留其原始时间。具体边界见 [上下文合同](CONTEXT-ASSEMBLY-DESIGN.md)。
+上下文窗口和展示版本（`schemaVersion: 7`）由代码固定，不新增环境变量：线程内首次触发只读当前线程（根消息 + 最多 20 条回复），会话根消息触发最多补读前 10 分钟内紧邻的 5 条根消息（不展开旁支子线程），同线程后续追问只传 `(lastDeliveredTs, messageTs)` 之间的本线程增量回复（最多 30 条）；跨频道消息链接、超长早先历史与附件原文件交由 Agent 绑定的 Slack Skill 按需主动拉取。升级不需要迁移 Redis 或修改 Agent 配置，旧 `v1..v6` Issue/comment 可直接恢复游标。具体边界见 [上下文合同](CONTEXT-ASSEMBLY-DESIGN.md)。
 
-Relay 在发布到 QStash 前，把每个 Slack file object 投影为 `id`、`name`、`mime`、`size` 和 `contentStatus`，并额外携带由完整安全字段生成的 fingerprint。下载内容、private URL、thumbnail、shares 和凭据不会进入队列 payload。暂时性或结果不明的失败返回 503 交给 QStash 有限重试；无效队列 payload、损坏的持久状态、scope 违反、无法消除的映射歧义和确定性体积超限返回 `rejected` 与 `retryable: false`。必需区间的明确权限失败、根缺失或分页预算耗尽也拒绝启动；可选背景缺失则按上下文合同标记。
+Relay 在发布到 QStash 前，把每个 Slack file object 投影为 `id`、`name`、`mime`、`size` 和 `contentStatus`。下载内容、private URL、thumbnail、shares 和凭据不会进入队列 payload。暂时性或结果不明的失败返回 503 交给 QStash 有限重试；无效队列 payload、损坏的持久状态、scope 违反、无法消除的映射歧义和确定性体积超限返回 `rejected` 与 `retryable: false`。必需线程区间的明确权限失败、根缺失或分页预算耗尽拒绝启动；根触发时的紧邻消息读取失败或目录元数据查询失败则 fail-open 降级，不阻塞建单。
 
 ## 取消与 reaction 身份
 
