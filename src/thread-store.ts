@@ -1,8 +1,20 @@
 export interface ThreadStore {
   get(key: string): Promise<string | null>;
+  mget?(keys: string[]): Promise<(string | null)[]>;
   set(key: string, value: string, ttlSeconds: number): Promise<void>;
   setIfAbsent(key: string, value: string, ttlSeconds: number): Promise<boolean>;
   releaseIfOwner(key: string, owner: string): Promise<void>;
+}
+
+export async function readStoreKeys(
+  store: ThreadStore,
+  keys: readonly string[],
+): Promise<(string | null)[]> {
+  if (!keys.length) return [];
+  if (typeof store.mget === 'function') {
+    return store.mget([...keys]);
+  }
+  return Promise.all(keys.map((key) => store.get(key)));
 }
 
 interface UpstashResponse {
@@ -24,6 +36,13 @@ export class UpstashThreadStore implements ThreadStore {
   async get(key: string): Promise<string | null> {
     const result = await this.command(['GET', key]);
     return typeof result === 'string' ? result : null;
+  }
+
+  async mget(keys: string[]): Promise<(string | null)[]> {
+    if (!keys.length) return [];
+    const result = await this.command(['MGET', ...keys]);
+    if (!Array.isArray(result)) return keys.map(() => null);
+    return result.map((item) => (typeof item === 'string' ? item : null));
   }
 
   async set(key: string, value: string, ttlSeconds: number): Promise<void> {
@@ -74,6 +93,10 @@ export class MemoryThreadStore implements ThreadStore {
       return null;
     }
     return entry.value;
+  }
+
+  async mget(keys: string[]): Promise<(string | null)[]> {
+    return Promise.all(keys.map((key) => this.get(key)));
   }
 
   async set(key: string, value: string, ttlSeconds: number): Promise<void> {

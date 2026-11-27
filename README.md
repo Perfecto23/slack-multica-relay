@@ -18,9 +18,8 @@
 
 - **严格准入**：校验 Slack 签名与时间戳，并支持 Team、mention target、channel、sender 的 allowlist/blocklist。
 - **持久化接收**：使用 QStash 解耦 Slack 的短响应窗口与后续上下文读取、Multica 写入。
-- **Thread → Issue 路由**：同一 Slack thread 首次创建 Issue，后续 mention 追加 comment。
-- **有界附近讨论**：首次 mention 带入前 30 分钟最近 12 条主消息，展开其中 2 个最近活跃线程，各保留 5 条回复。
-- **完整后续对话**：保留根、上次已交付的 mention 和此后全部线程发言，沿用首次附近背景；每条消息一行，无需 Agent 合并差异。
+- **Thread → Issue 路由**：同一 Slack thread 首次创建 Issue，后续消息追加 comment（支持运行中 Steer 插话与排队折叠）。
+- **场景化轻量上下文（v7）**：通过 24h Redis 缓存补齐频道名、会话类型（`im`/`mpim`/`private`/`public`）、人数、发送者及正文 `<@U...>` 姓名与可读时间；根消息首次触发附前 10 分钟最多 5 条紧邻主消息，后续追问仅带本线程新增回复，跨频道链接与长历史交由本机 `moe-slack` 按需主动拉取。
 - **明确的缺失边界**：可选背景缺失显式标记；必需对话读取不完整或放不下时拒绝启动，不静默裁剪。
 - **隐私最小化**：Slack file object 在进入 QStash 前完成字段投影；private URL、thumbnail、shares、下载内容和凭据不会进入队列 payload。
 - **确定性 footer**：显示名、配置 model 和 Fast 标记由 adapter 代码生成，不依赖模型正文。

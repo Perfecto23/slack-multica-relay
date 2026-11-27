@@ -11,7 +11,7 @@
     "lint": "tsc --noEmit -p tsconfig.json",
     "dev:cf": "wrangler dev",
     "build:cf": "wrangler deploy --dry-run",
-    "deploy:cf": "wrangler deploy"
+    "deploy:cf": "wrangler deploy --keep-vars"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

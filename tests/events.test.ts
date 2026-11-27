@@ -2,7 +2,6 @@ import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { acceptSlack, consumeQueue, consumerFailure, ADMISSION_BUDGET_MS } from "../src/http.js";
 import { readContext } from "../src/slack-context.js";
-import { messageFingerprint } from "../src/context-envelope.js";
 vi.mock("@upstash/qstash", () => ({
   Receiver: class {
     verify = vi.fn().mockResolvedValue(true);
@@ -233,14 +232,11 @@ describe("durable admission", () => {
     const queued=JSON.parse(String(fetcher.mock.calls[0]![1]?.body));
     expect(queued.files).toHaveLength(6);expect(queued.files[0]).toEqual({id:"F1",name:"photo.png",mime:"image/png",size:12,contentStatus:"not_loaded"});
     expect(queued.filesTruncated).toBeUndefined();
-    expect(queued.sourceFingerprint).toMatch(/^[a-f0-9]{64}$/u);
     expect(JSON.stringify(queued)).not.toContain("private.test");
     const initial=await readContext(queued,"test",async()=>Response.json({ok:true,messages:[]}));
-    const followup={...queued,messageTs:"101.000001",text:"<@U1> next",files:undefined,filesTruncated:undefined,sourceFingerprint:undefined};
-    const refreshed=await readContext(followup,"test",async input=>String(input).includes("history")
-      ? Response.json({ok:true,messages:[]})
-      : Response.json({ok:true,messages:[{...event,files},{...event,ts:"101.000001",thread_ts:event.ts,text:"<@U1> next"}]}));
-    expect(messageFingerprint(initial.timeline.messages[0]!)).toBe(messageFingerprint(refreshed.timeline.messages[0]!));
+    const followup={...queued,messageTs:"101.000001",text:"<@U1> next",files:undefined,filesTruncated:undefined};
+    const refreshed=await readContext(followup,"test",async()=>Response.json({ok:true,messages:[{...event,files},{...event,ts:"101.000001",thread_ts:event.ts,text:"<@U1> next"}]}));
+    expect(initial.rootMessage?.files).toEqual(refreshed.rootMessage?.files);
     const logged=JSON.stringify(info.mock.calls);
     expect(logged).not.toContain("T1:C1:100.000001");
     expect(logged).toContain("eventId");

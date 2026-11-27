@@ -1,129 +1,73 @@
-# Slack 上下文组装
+# Slack 上下文组装（v7）
 
 [English](CONTEXT-ASSEMBLY-DESIGN_EN.md) | **简体中文**
 
-Relay 把当前请求放在最前，每条对话压成一行 JSON，保留线程关系和原话。上下文选择由时间、线程和明确链接决定，不调用模型做预摘要，也不按字数、表情或主观相关性筛掉同线程发言。
+Relay 采用「**轻量精准推现场 + 深度背景由 `moe-slack` 主动拉**」的分工模型：入站消息渲染为对人类与 Agent 均直接可读的 Markdown 现场描述，底部 `<!-- relay-payload:v1 -->` 仅保留确定性回复路由所需的紧凑 JSON（`schemaVersion: 7`）。
 
-## 确定的输入范围
+## 1. 推与拉的职责边界
 
-B 为本次 mention；A 为同一 workspace/project/agent/thread 中，时间早于 B、且已确认写入 Multica 的最近一次 mention。
+B 为本次入站消息；A 为同一 `workspace / project / scope / thread` 中早于 B、且已确认持久化到 Multica 的最近一次入站消息（记录在 `ThreadState.lastDeliveredTs`）。
 
-| 场景 | 带入内容 |
-| --- | --- |
-| 首次 mention | 当前线程根到 B 的全部对话；新建根消息时就是 B 本身 |
-| 首次附近讨论 | 同一会话 `[B - 30 分钟, B)` 内最近 12 条其他根消息；其中最近活跃的 2 个线程，各带末尾 5 条回复 |
-| 同线程再次 mention | 根、A、`(A, B]` 内所有对话，包括 non-mention、机器人、其他作者、表情和附件引用 |
-| 首次背景 | 保留首次已交付的附近讨论，记录 `initialCutoffTs`；后续不自动刷新不相关的主时间线 |
-| 明确链接 | 本次请求、A、当前根及本轮对话里的同会话 Slack permalink；最多展开 3 个去重目标，带根、目标及前后各 2 条回复；引用根时带其后 2 条回复 |
-| 没有更早的 A | 正常首次请求，或必要恢复读取成功但未找到早于 B 的已交付 mention：从根到 B 全读 |
+| 场景 | Relay 被动推送范围 | 按需主动拉取（`moe-slack`） |
+| --- | --- | --- |
+| **会话与人物画像** | `conversations.info` 与 `users.info`（经 `ThreadStore` 批量 `MGET` 缓存 24h）：输出 `#频道名`、精确类型（`1v1 私聊` / `多人私聊 mpim` / `私有频道` / `公共频道`）、成员人数、首帖频道 Topic、发送者及正文内所有 `<@U...>` 的显示名，明确区分 `本人`、`小 p (Agent 已回复)`、同事与 `[Bot]` | 查询不在场成员、邮箱或频道列表时使用 `users` / `channels` / `resolve` |
+| **会话根消息首次触发**（`messageTs === threadTs`） | 本次根消息 + 同一会话 `[B - 10 分钟, B)` 内最近最多 **5 条紧邻主消息**（不展开旁支线程，专门承接连发消息/先贴图后 `@`） | 需要浏览更早频道讨论时执行 `history --channel <id> --limit 1d --include-thread-replies` |
+| **线程内首次触发**（`messageTs !== threadTs`，尚无 A） | 线程根消息 + 最近最多 **20 条前序回复** + 本次消息（不拉取频道旁支消息；超出 20 条时标注省略条数与原消息链接） | 需要完整长线程时执行 `replies --url <原消息链接>` |
+| **同线程后续追问 / Steer / 合并** | `(A, B)` 之间本线程新增回复（最多保留最近 **30 条**）+ 本次消息；不重复搬运首次附近频道消息或已交付的旧回复 | 怀疑历史消息刚被编辑/撤回或需要回溯更早段落时执行 `replies --url <原消息链接>` |
+| **链接与附件** | 提取转发引用、卡片标题/正文及 Block Kit 文本；当请求或当前线程含图片时列出最多 **6 张必看图片**（`<= 10 MB`）的 `fileId`；检测到 Slack permalink 时提示按需主动读取，不在 Worker 内被动抓取窗口 | 跨频道/同频道 Slack 链接由 `replies/get --url` 读取；图片与文件由 `files_download` 下载 |
 
-首次线程即使很早开始，也保留完整当前线程；附近窗口围绕首次 mention。附近主消息按时间倒序选取、顺序展示；旁支按 `latest_reply` 排序。少于上限就照实带入，不扩到更早时间。明确链接不递归展开，跨会话链接只保留原文；当前必需区间中已经存在的目标不重复读取。链接不能解析、权限不足或可选读取预算不足时，不声称已看过。
+## 2. 展示结构与紧凑数据合同
 
-必需区间通过 `conversations.replies` 的 `oldest=A`、`latest=B`、`inclusive=true` 读取并完成游标分页；根不在结果中时单独精确读取。时间过滤与游标可组合，依据 [Slack replies 合同](https://docs.slack.dev/reference/methods/conversations.replies/)。单消息定位使用 [Slack history 合同](https://docs.slack.dev/reference/methods/conversations.history/)。
+每条 Multica Issue 描述与追问评论均由两部分组成：
 
-## 紧凑展示与数据合同
-
-第一行保持原 marker，之后是请求引用、单行来源、范围说明和 JSON 数据区。`relay-payload:v1` 成对标记及动态长度的数据围栏保持不变。
-
-`schemaVersion: 6`（v5 起）每条普通消息独占一行；`origin=unknown`、空 `files` 和 currentRequest 的空正文在展示中省略。有附件、bot 来源或缺失标记时保留实际字段。时间戳、作者 ID、姓名映射、原文、回复父子关系和回复路由均保留，不把旁支回复摊平成主消息。
+1. **Markdown 现场描述**：
+   - 标题行：`## Slack 请求 · #频道名（类型 · 人数 · channelId）`（追问为 `## Slack 线程追问 · ...`）。
+   - 元数据：发送者、精确 `Asia/Singapore` 时间与距上一条发言间隔、触发方式（显式 `@` / 称呼唤醒 / 编辑补 `@` / 活跃线程免 `@` 跟帖）及可直接传给 `moe-slack --url` 的 Slack 原消息链接。
+   - 前序对话 / 增量新消息列表：每行格式为 ``- `[HH:MM:SS]` **作者**: 内容``（跨日自动带 `YYYY-MM-DD`），内联展示附件元数据。
+   - `### 本次消息` 引用块及按需出现的「必看图片」「按需主动补读」提示。
+   - 外部文本在进入 Markdown 前移除/转义 `<!--`、`-->`、`[@` 与 `mention://` 控制序列，并约束行首标题，防止伪造 Multica 派单或破坏 payload 围栏。
+2. **底部紧凑路由 JSON（`<!-- relay-payload:v1 -->`）**：
 
 ```json
 {
-  "schemaVersion": 5,
-  "eventPayload": {"teamId":"T1","channelId":"C1","threadTs":"1000.000001","messageTs":"1100.000001","text":"本次请求"},
-  "context": {
-    "anchorTs":"1000.000001","sinceTs":"1050.000001","cutoffTs":"1100.000001",
-    "timeline": {"status":"complete","messages":[
-      {"ts":"1000.000001","authorId":"U1","text":"线程根","replies":{"status":"complete","messages":[
-        {"ts":"1050.000001","authorId":"U1","text":"上次 mention"},
-        {"ts":"1060.000001","authorId":"U2","text":"中间未 mention 的讨论"},
-        {"ts":"1100.000001","authorId":"U1","currentRequest":true}
-      ]}}
-    ]}
+  "schemaVersion": 7,
+  "eventPayload": {
+    "teamId": "T1",
+    "channelId": "C1",
+    "channelType": "private",
+    "channelName": "dev-moego-receptionist",
+    "threadTs": "1000.000001",
+    "messageTs": "1100.000001",
+    "senderUserId": "U1",
+    "senderName": "Nook",
+    "text": "原始未改写请求文本",
+    "mention": { "type": "user", "id": "U2" },
+    "files": []
+  },
+  "replyContext": {
+    "type": "slack_reply_context",
+    "source": "agent_config",
+    "agentId": "A1",
+    "capturedAt": "2026-11-27T00:00:00.000Z",
+    "status": "available",
+    "model": "gemini-4-hydrogen-medium",
+    "serviceTier": null
   }
 }
 ```
 
-示例省略固定任务解释和部分路由字段。完整请求及附件在 `eventPayload` 中，`currentRequest` 节点只引用它；首屏原文引用最多 4 KiB，数据区保留完整请求。TS 恢复解析器补回省略的默认字段。Python reply adapter 继续读取同一个 eventPayload/replyContext。历史裸 JSON、v4 围栏和旧 marker 仍可恢复；重复或损坏的数据区拒绝恢复。旧 Issue/comment 不回写。
+对话历史只出现在上方 Markdown 中，不在 JSON 内重复存储整棵消息树。`scripts/slack-reply.py` 继续从 `eventPayload` 与 `replyContext` 读取回复目的地与模型快照；`readTaskEnvelope` 同时兼容历史 `v1–v6` 任务正文。
 
-每个区段的 `status` 只有三种：`complete` 是该读取范围读全了；`selected` 是按策略只取了一部分（附近根消息上限、只展开 2 个旁支、旁支回复上限、链接窗口、可选背景的字节预算等），不算缺失；`missing` 是本该有却没拿到（分页或调用预算、限流、权限、根消息缺失、被字节预算挤掉的链接引用等）。`reasons` 记录全部原因，只追加不覆盖。`coveredFromTs/coveredThroughTs` 是实际保留范围，不证明区间之外没有消息。
+## 3. Agent 自发消息降噪与卡片提取
 
-v6 在顶层加 `coverage`，由 `src/context-coverage.ts` 根据最终交付的树计算：`currentThread`（当前线程是否完整；追问时上次 mention 之前的回复只会经链接进入，被字节预算挤掉时记在 `references`）、`nearby`（附近讨论，含首次背景的 `initialStatus/initialReasons`）、`references`（链接引用）和 `attachments`。`attachments.view` 列出本次请求和当前线程里要先看的图片（从新到旧最多 6 张、单张不超过 10 MB），超出的进 `skipped`（最多 10 条，再多只计数）；背景里的图片和非图片文件只计入 `listedOnly`。Relay 不下载附件：Multica 不会把附件交给模型看，Agent 用 moe-slack `files_download --types image` 下载后用 `view_image` 查看。`task.instructions` 由 `coverage` 生成，与数据不会矛盾。附件始终 `not_loaded`，不把附件引用当成已读取内容。v5 及更早的 `truncated/unavailable` + `reason` 在恢复时按同一词汇转换；旧版只保留最后一个原因，转换结果可能低估当时的缺失。
+- 带 `relay-progress-<64位十六进制>` 尾块的临时进度卡在入站和上下文读取时直接跳过。
+- 带 `relay-delivery-<64位十六进制>` 尾块的已送达回复提取正文并剥离统计/签名栏，在对话区标记为 `小 p (Agent 已回复)`。
+- 普通消息与 Bot 消息在 `raw.text` 为空或带转发附件时，自动从 `blocks`（`rich_text` / `section` / `header` / `table`）和 `attachments`（`title` / `text` / `fallback`）补齐可读正文。
 
-## Agent Footer 降噪
+## 4. 预算、缓存与恢复不变量
 
-历史消息只有同时具备 bot/app 来源、尾部 `relay-delivery-<64位十六进制>` context 标记，以及 adapter 的 section → context 布局时，才从正文 section 提取文本并标记 `footerOmitted: true`。多个正文 section 仅接受 adapter 的 3000 Unicode 字符分块形式，直接拼回正文。作者、时间戳、bot 来源与附件引用不变；正文中出现的 “Sent by”、模型名或表情不按关键词删除。
-
-未标记消息、人类消息、含图片/附件 block、fields/accessory 或不支持的布局保留原 text。旧快照已丢失 blocks 时也不猜测删 Footer；只影响后续新读取，历史 Issue/comment 和冻结快照不回写。
-
-## 预算与失败
-
-| 项目 | 上限与策略 |
-| --- | --- |
-| 当前线程必需内容 | 不按最近 20/100 条裁剪；不截断原文或删附件引用 |
-| 可选消息 | 正文 4 KiB、最多 5 个附件引用；超限显式标记 |
-| 分页 | history 最多 5 页；必需 replies 最多 10 页；可选 replies 最多 3 页；conversation 请求总计 20 次 |
-| 时间 | Slack 消息共 20 秒；先当前线程，再附近讨论和明确链接；旁支并发最多 2 |
-| 输入响应 | 每个 Slack 响应最多 2 MiB |
-| 输出 | 完整 envelope 48 KiB、最终 Issue/comment 64 KiB |
-
-字节不足先移除可选旁支，再移除 A 之前仅因链接加入的可选回复。根、A、`(A,B]` 和 B 正文仍放不下时返回 `context_request_too_large`，不启动带缺失对话的任务，也不推进 A。必需分页到不了末尾返回 `context_required_page_limit`；明确权限失败或根缺失返回 `context_required_unavailable`，均为确定性拒绝。429、5xx、超时交由队列有限重试。可选读取失败只标记相应背景；跨频道或跨线程响应始终拒绝。
-
-## 持久化、缓存与恢复
-
-- 同一事件的 `:envelope` 和待提交上下文状态冻结 24 小时，重试不重建。
-- `:sent-context-index` v3 缓存最近已写入的请求、边界和首次背景 24 小时；不再用消息指纹决定是否省略中间发言。缓存含已交付的最小上下文，无附件内容或 private URL。
-- 只有 Issue/comment 写入成功或稳定 marker 回读确认后才推进 A。读取成功、准备成功、启动 reaction 都不是交付回执。
-- 缓存丢失、旧版索引或乱序事件，从当前 scoped Issue 和 Relay comments 恢复早于 B 的最近已交付 mention；同时恢复全局最新已交付边界，防止迟到事件倒退索引。
-- 旧版首次 Issue 的附近树按 30 分钟 / 12 根 / 2 线程 / 5 回复重新选取，避免旧的大快照延续到新 comment；只使用原快照已有证据，不补写历史。
-- 正常首次请求，或必要恢复读取成功但未找到早于 B 的已交付 mention 时，保留完整根到 B。恢复接口失败、状态损坏或归属不匹配时按错误类型重试或拒绝，不把读取失败当成“没有 A”，也不绕过写入结果核对。
-- thread mapping 缺失时通过唯一 thread marker 搜索恢复；Multica 历史保留策略与 Redis TTL 独立。
-
-## 升级与兼容
-
-首次背景与 A 分开保存：迟到的 B 即使早于首次已交付请求，仍保留原 `initialCutoffTs` 和该背景中 `ts <= B` 的根消息及回复。筛选只作用于本轮副本，不改变后续可复用的原始背景；可选背景仍受字节预算约束。
-
-A 在本次 Slack 结果中缺失时，使用已持久化 eventPayload 的正文、作者和附件引用补入，并标记 `restoredFrom: persisted_request`；旧附件截断标记也保留。这不是本次 Slack 读取的正文。无法取得已保存正文时拒绝交付；线程根读取失败仍单独拒绝。时间边界按 Slack 消息 `ts` 判断。
-
-`schemaVersion: 6` 是任务正文版本（Relay 仍能读取 v5 及更早的正文），`:sent-context-index` v3 是 Relay 内部缓存版本，两者独立。部署新版 Relay 即可启用，无需新增变量、修改 Agent Instructions 或重新绑定最终回复 Skill。
-
-新 mention 使用新规则；同一事件的冻结 envelope 在 24 小时缓存有效期内复用，即使它是旧格式。缓存过期后先核对持久化记录，确需重新准备时才读取上下文。旧版首次背景在恢复后按当前范围重新选取，再写入新的 comment，原 Issue/comment 不回写。不要为强制切换格式清理事件快照、线程映射或 delivery ledger；这些记录承担幂等与恢复职责。
-
-核验时分别比较任务正文中的 `schemaVersion`、`eventPayload.messageTs`、`context.sinceTs` 和 `initialCutoffTs`，再检查同线程区间及旁支范围。具体只读步骤见 [Multica 操作说明](MULTICA-OPERATIONS.md)。
-
-## 姓名、职责与验收
-
-姓名映射只供阅读：最多解析 10 个用户、并发 4、预算 3 秒；失败保留 ID，不带邮箱或完整 profile。固定 task.instructions 只解释数据和原线程回复合同；背景不是新授权，marker 不是签名。长期人格与私有规则仍属于 Runtime。
-
-自动化覆盖首次附近讨论、完整 130 条跨页 non-mention、长正文和全部附件引用、明确链接窗口、跨会话拒绝、缓存丢失、乱序、失败不推进、重试冻结、v4/v5 恢复及发送目的地兼容。离线测试和 Worker build 不等于真实 Slack → Multica → 回复 E2E。
-
-## 展示与模型配置快照
-
-标题使用消息摘要 + 稳定 scoped thread 短标识。正文引用仅展示前 4 KiB，完整请求在 envelope 中保留；安全转义引用、JSON 字符串和数据围栏，避免 Slack 文本改变结构或触发 Multica mention。原有 envelope 48 KiB 上限不变，展示正文整体上限 64 KiB，超出时先减少 JSON 排版空白，仍放不下则拒绝发送。
-
-配置 GET 使用 `redirect: manual`，以兼容 workerd；3xx 按失败降级，不把凭据转发到重定向目标。真实 workerd 测试覆盖成功读取、重定向拒绝和身份不匹配。
-
-`replyContext` 与 eventPayload/context 同级，来自经过 Agent/Workspace ID 校验的 Agent 配置快照。每次新消息准备时查询一次，最多 2 秒，失败标记 unavailable；随 envelope 冻结。模型为空/非法时为 null，serviceTier 只接受 priority/default，否则为 null。仅投影模型、档位、来源、身份和采集时间，不传 instructions、凭据或完整配置。
-
-footer 使用每个新事件各自冻结的快照和 `messageTs`；只有配置模型已知且 Agent 匹配时显示。priority 追加 Fast，default/null 不追加 Fast，null 不证明默认档位关闭。查询失败或模型为空时省略模型字段，自动化标识仍由发送适配器追加。scripts/slack-reply.py 从原 Issue/Comment 回读 envelope，从私有配置读取固定显示名，将正文发送为一个 markdown block（超过 12000 字时退回 3000 字一段的 mrkdwn section），并追加 context/mrkdwn footer；fallback text 同样包含正文和 footer。任务说明只指向运行时发送入口，格式与标识由代码负责，人格 Instructions 不要求模型生成标识。
-
-
-
-发送适配器配置保存在私有 Runtime 中，字段为 displayName（包含 emoji 的完整显示文字）、agentId、workspaceId、projectId、teamId、serverUrl，不包含凭据。--issue-id/--comment-id 定位本次来源，--text-file 提供正文；适配器核对 Issue 的 workspace/project/assignee 与配置一致，路由取自原 envelope。认证沿用 multica CLI 和 `SLACK_USER_TOKEN`。--dry-run 只生成 payload，不发消息。每个 source Issue/comment 生成稳定的 delivery block ID，并在配置旁、已忽略的私有 `.slack-reply-state/` 原子记录 `attempting/accepted/sent`；文件和父目录均在 POST 前同步。Slack 返回的消息时间用于窄范围发送后回读；`sent` 重跑直接返回持久结果。结果不明时从本机尝试时间前五分钟开始核对，不从原请求扫描整条长线程；查不到 marker 时返回 `slack_delivery_unknown`，不得自动重复 POST，清理该状态前必须在原线程独立核对。本机同源锁不可获得时立即返回 `reply_delivery_busy`。
-
-这里保证经适配器发送的回复格式；它不是对全部本地工具或直接 Slack API 调用的强制安全代理。普通 Relay 回复的调用入口通过私有 Skills 配置绑定。
-
-可选的最终回复 Skill 在发送前只读采集当前 `MULTICA_TASK_ID` 的运行统计和 GitHub 操作候选。业务相关性由 Agent 判断，结构化结果交给 adapter 校验并渲染；未唯一配对、失败、截断或仅出现在文档示例中的记录不能作为 PR/分支成果。现有 source scope、at-most-once ledger 和发送后回读保持不变。
-
-
-发送明确限流时持久化 `rate_limited/retryAt`，到期才允许重试；服务端错误和未知结果保留 `attempting`，回读失败不授权再次发送。详细错误分类与 CLI 返回字段见 [配置说明](CONFIGURATION.md)。
-
-`--deliver-task-attachments` 交付当前 task 的 Multica 评论附件。正文首次发送及每个附件上传前均检查精确 Slack 根消息；附件逐个保存回执，未知上传不重复执行。附件发现、下载、权限与回执合同见 [附件交付](../multica-skills/multica-final-reply/references/attachment-delivery.md)。
-
-## 构建诊断
-
-`relay_context` 只记录事件摘要、读取/保留数量、缺失原因、阶段耗时和 envelope 字节数；不包含聊天正文、姓名、凭据或完整快照。与 `relay_dispatch` 的写入结果分别核对。
-
-## Team 作用域
-
-线程 scope 由 assignee 或显式迁移 scope 决定，既有单 Agent 的 key 保持不变。Team 仍使用同一 v5 上下文与冻结/恢复协议；从缓存继续写入前核对真实 Issue 归属和 marker。Team 的 replyContext 标记 unavailable、agentId=null，避免借用旧 Agent 模型。唯一回复角色从当前 run 采集模型与已知 service_tier，adapter 确定性追加 Fast 标记。配置及共享 ledger 迁移见 [配置说明](CONFIGURATION.md#agent--team-路由)。
+- **准备快照冻结**：同一事件的准备结果在 `msgKey + ':envelope'` 冻结 24 小时，队列重试直接复用，不重复请求 Slack 或 Agent 配置。
+- **目录缓存**：频道画像（`relay:dir:v1:ch:<team>:<channel>`）与用户显示名（`relay:dir:v1:user:<team>:<user>`）在 `ThreadStore` 缓存 24 小时，单次消费通过批量 `MGET` 读取；查询失败自动降级保留原始 ID，永不阻塞任务投递，也不保存邮箱等隐私字段。
+- **游标推进与恢复**：仅当 Issue 或评论确认写入 Multica 后才推进 `ThreadState.lastDeliveredTs`。若 Redis 缓存过期或遇到乱序迟到事件，从当前 scoped Issue 描述及 `<!-- relay-message:` 评论回读已持久化的 `messageTs`，选取早于本次请求的最新已交付时间戳作为 `sinceTs`，且不倒退全局最新游标。
+- **确定性失败语义**：当前线程读取遇 429 或 5xx 返回可重试错误交由 QStash 重试；明确权限缺失或根消息不存在返回 `context_required_unavailable` 终止重试；单事件准备上限 48 KiB，最终 Markdown 描述上限 64 KiB。
+- **本地发送幂等**：`scripts/slack-reply.py` 维持本地 `.slack-reply-state/` 的 `attempting → accepted → sent` 账本；静默收尾（`--clear-start-reaction`）在原触发消息已被发送者删除（`message_not_found`）时视为已无需清理，并继续清理本轮合并/插话（`supplement`）消息上的残留表情与会话状态。
