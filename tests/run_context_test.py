@@ -66,7 +66,7 @@ class FinalReplyTests(unittest.TestCase):
 
 
     def test_query_reports_cli_failures_without_exposing_output(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.object(final, "QUERY_RETRY_DELAYS", ()):
             commands = [
                 [str(Path(directory) / "missing-cli")],
                 [sys.executable, "-c", 'raise SystemExit("private CLI error")'],
@@ -76,6 +76,22 @@ class FinalReplyTests(unittest.TestCase):
                 with self.subTest(command=command), self.assertRaises(final.RunContextError) as error:
                     final.query(command)
                 self.assertNotIn("private", str(error.exception))
+
+    def test_query_retries_transient_cli_failure(self):
+        sleeps = []
+        calls = [0]
+
+        def flaky_run(command, **_kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise subprocess.CalledProcessError(1, command, stderr="Could not reach the Multica server")
+            return subprocess.CompletedProcess(command, 0, '{"ok": true}', '')
+
+        with patch.object(final.subprocess, "run", side_effect=flaky_run):
+            result = final.query(["multica", "issue", "runs", "I1"], sleep=sleeps.append)
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(calls[0], 2)
+        self.assertEqual(sleeps, [2])
 
 
     def test_query_runs_without_a_command_wrapper(self):

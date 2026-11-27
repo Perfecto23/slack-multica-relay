@@ -8,8 +8,13 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+import time
 from urllib.parse import urlsplit
 from uuid import UUID
+
+
+# Multica CLI 偶发瞬断（"Could not reach the Multica server"），只读查询退避重试。
+QUERY_RETRY_DELAYS = (2, 5)
 
 
 class RunContextError(Exception):
@@ -23,13 +28,18 @@ def write_new(path, value):
         json.dump(value, file, ensure_ascii=False, indent=2)
 
 
-def query(command, *, text=False):
-    try:
-        result = subprocess.run(command, capture_output=True,
-                                text=True, timeout=30, check=True)
-        return result.stdout if text else json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        raise RunContextError("只读查询失败；请检查 CLI 安装、认证和目标") from None
+def query(command, *, text=False, sleep=time.sleep):
+    for delay in (*QUERY_RETRY_DELAYS, None):
+        try:
+            result = subprocess.run(command, capture_output=True,
+                                    text=True, timeout=30, check=True)
+            return result.stdout if text else json.loads(result.stdout)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            raise RunContextError("只读查询失败；请检查 CLI 安装、认证和目标") from None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            if delay is None:
+                raise RunContextError("只读查询失败；请检查 CLI 安装、认证和目标") from None
+            sleep(delay)
 
 
 def scope(env):
