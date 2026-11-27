@@ -72,7 +72,16 @@ function fixture() {
     multicaProjectId: "project",
     multicaAgentId: "agent",
     store: new MemoryThreadStore(),
-    readContext: async (event) => ({ anchorTs: event.threadTs, cutoffTs: event.messageTs, capturedAt: '2026-01-01T00:00:00Z', timeline: { status: 'complete', messages: [] } }),
+    readContext: async (event, options) => ({
+      anchorTs: event.threadTs,
+      ...(options?.sinceTs ? { sinceTs: options.sinceTs } : {}),
+      cutoffTs: event.messageTs,
+      capturedAt: '2026-01-01T00:00:00Z',
+      replies: [],
+      omittedEarlierReplies: 0,
+      nearbyMessages: [],
+      hasSlackLinks: false,
+    }),
   };
   return {
     config,
@@ -221,30 +230,50 @@ describe("direct Issue routing", () => {
 });
 
 
-it('freezes first nearby discussion across follow-ups, cache loss and out-of-order events',async()=>{
-  const f=fixture();let text='original';let reads=0;
-  f.config.readContext=async (e,options)=>{reads++;return {anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[...(options?.includeNearby?[{ts:'99.000001',authorId:'U1',origin:'unknown' as const,text,files:[]}]:[]),{ts:e.threadTs,authorId:'U2',origin:'unknown',text:'root',files:[]}]}};};
-  const decode=(s:string):any=>readTaskEnvelope(s);
+it('tracks lastDeliveredTs across follow-ups, cache loss and out-of-order events without repeating nearby roots',async()=>{
+  const f=fixture();let reads=0;
+  const calls:{ts:string;sinceTs?:string;includeNearby?:boolean}[]=[];
+  f.config.readContext=async (e,options)=>{
+    reads++;
+    calls.push({ts:e.messageTs,sinceTs:options?.sinceTs,includeNearby:options?.includeNearby});
+    return {
+      anchorTs:e.threadTs,
+      ...(options?.sinceTs?{sinceTs:options.sinceTs}:{}),
+      cutoffTs:e.messageTs,
+      capturedAt:'fixed',
+      replies:[],
+      omittedEarlierReplies:0,
+      nearbyMessages:options?.includeNearby?[{ts:'99.000001',authorId:'U1',origin:'human',text:'nearby-once',files:[]}]:[],
+      hasSlackLinks:false,
+    };
+  };
   await routeSlackThreadEvent(root,f.config,f.fetcher);
+  expect(f.issues[0]!.description).toContain('nearby-once');
   for(const ts of ['101.000001','102.000001'])await routeSlackThreadEvent({...root,messageTs:ts},f.config,f.fetcher);
-  expect(f.comments.every(c=>decode(c.content).context.timeline.messages.length===2)).toBe(true);
-  text='edited';f.loseCommentResponse();
+  // Follow-ups never repeat Turn 1's nearby channel roots
+  expect(f.comments.every(c=>!c.content.includes('nearby-once'))).toBe(true);
+  expect(calls.slice(0,3)).toEqual([
+    {ts:'100.000001',sinceTs:undefined,includeNearby:true},
+    {ts:'101.000001',sinceTs:'100.000001',includeNearby:false},
+    {ts:'102.000001',sinceTs:'101.000001',includeNearby:false},
+  ]);
+
+  f.loseCommentResponse();
   const e={...root,messageTs:'103.000001'};
   await expect(routeSlackThreadEvent(e,f.config,f.fetcher)).rejects.toThrow();
   const before=reads;await routeSlackThreadEvent(e,f.config,f.fetcher);expect(reads).toBe(before);
-  expect(decode(f.comments.at(-1)!.content).context.timeline.messages[0].text).toBe('original');
+
   const fetcher:typeof fetch=async(input,init)=>{
     if(init?.method==='POST'){const value={id:'last',content:JSON.parse(String(init.body)).content};f.comments.push(value);return Response.json(value);}
     return f.fetcher(input,init);
   };
   await routeSlackThreadEvent({...root,messageTs:'104.000001'},f.config,fetcher);
-  expect(decode(f.comments.at(-1)!.content).context.timeline.messages).toHaveLength(2);
   f.config.store=new MemoryThreadStore();
+  // Late out-of-order event after cache loss recovers exact preceding persisted messageTs (102.000001) without rolling back global cursor (104.000001)
   await routeSlackThreadEvent({...root,messageTs:'102.500001'},f.config,fetcher);
-  expect(decode(f.comments.at(-1)!.content).context.sinceTs).toBe('102.000001');
+  expect(calls.at(-1)).toEqual({ts:'102.500001',sinceTs:'102.000001',includeNearby:false});
   await routeSlackThreadEvent({...root,messageTs:'105.000001'},f.config,fetcher);
-  expect(decode(f.comments.at(-1)!.content).context.timeline.messages).toHaveLength(2);
-  expect(decode(f.comments.at(-1)!.content).context.sinceTs).toBe('104.000001');
+  expect(calls.at(-1)).toEqual({ts:'105.000001',sinceTs:'104.000001',includeNearby:false});
 });
 
 it('freezes the Agent configuration snapshot across retries and refreshes it for new messages',async()=>{
@@ -263,34 +292,33 @@ it('freezes the Agent configuration snapshot across retries and refreshes it for
   expect(readTaskEnvelope(f.comments[0]!.content).replyContext).toMatchObject({model:'model-two'});
 });
 
-it('retains first sibling context without refreshing unrelated side replies',async()=>{
-  const f=fixture();let added=false;
-  f.config.readContext=async (e,options)=>({anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[
-    ...(options?.includeNearby?[
-    {ts:'90.000001',authorId:'U1',origin:'unknown' as const,text:'side-root',files:[],replies:{status:'complete' as const,messages:[
-      {ts:'91.000001',authorId:'U1',origin:'unknown' as const,text:'old-reply',files:[]},
-      ...(added?[{ts:'100.500001',authorId:'U1',origin:'unknown' as const,text:'new-reply',files:[]}]:[])
-    ]}}]:[]),
-    {ts:e.threadTs,authorId:'U2',origin:'unknown',text:'current-root',files:[]}
-  ]}});
-  await routeSlackThreadEvent(root,f.config,f.fetcher);added=true;
-  await routeSlackThreadEvent({...root,messageTs:'101.000001'},f.config,f.fetcher);
-  const second=readTaskEnvelope(f.comments[0]!.content) as any;
-  expect(second.context.timeline.messages[0].replies.messages.map((m:any)=>m.text)).toEqual(['old-reply']);
-  expect(second.context.initialCutoffTs).toBe(root.messageTs);
-  await routeSlackThreadEvent({...root,messageTs:'102.000001'},f.config,f.fetcher);
-  expect((readTaskEnvelope(f.comments[1]!.content) as any).context.timeline.messages).toHaveLength(2);
-});
-
-
-it('logs content-free clipping measurements',async()=>{
+it('logs content-free context and directory cache measurements',async()=>{
   const f=fixture();const info=vi.spyOn(console,'info').mockImplementation(()=>{});
   try {
-    f.config.readContext=async e=>({anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',readStats:{slackCalls:3,rawMessages:5,messageReadMs:7,nameLookupCalls:2,nameReadMs:3},timeline:{status:'complete',messages:[{ts:e.threadTs,authorId:'U2',origin:'unknown',text:'PRIVATE_BODY_MARKER',files:[]}]}});
+    f.config.readContext=async e=>({
+      anchorTs:e.threadTs,
+      cutoffTs:e.messageTs,
+      capturedAt:'fixed',
+      rootMessage:{ts:e.threadTs,authorId:'U2',origin:'human',text:'PRIVATE_BODY_MARKER',files:[]},
+      replies:[],
+      omittedEarlierReplies:0,
+      nearbyMessages:[],
+      hasSlackLinks:false,
+      readStats:{slackCalls:1,rawMessages:2,messageReadMs:7,channelCacheHit:true,channelLookupCalls:0,userCacheHits:2,userLookupCalls:0,lookupMs:3},
+    });
     await routeSlackThreadEvent(root,f.config,f.fetcher);
     const row=info.mock.calls.find(c=>c[0]==='relay_context')![1] as Record<string,unknown>;
-    expect(row).toMatchObject({slackCalls:3,rawMessages:5,candidateRoots:1,candidateMessages:1,retainedRoots:1,retainedMessages:1,omittedMessages:0});
-    expect(row).toMatchObject({messageReadMs:7,nameLookupCalls:2,nameReadMs:3});
+    expect(row).toMatchObject({
+      slackCalls:1,
+      rawMessages:2,
+      retainedReplies:0,
+      omittedEarlierReplies:0,
+      nearbyMessages:0,
+      channelCacheHit:true,
+      userCacheHits:2,
+      messageReadMs:7,
+      lookupMs:3,
+    });
     expect(row.agentConfigMs).toBeGreaterThanOrEqual(0);expect(row.envelopeBytes).toBeGreaterThan(0);
     const log=JSON.stringify(row);expect(log).not.toContain('PRIVATE_BODY_MARKER');expect(log).not.toContain(root.text);expect(log).not.toContain('multicaApiToken');
   } finally {info.mockRestore();}
@@ -300,7 +328,7 @@ it('advances the interval only after confirmed persistence, not after a rejected
   const f=fixture();const bounds:(string|undefined)[]=[];
   f.config.readContext=async(e,options)=>{
     bounds.push(options?.sinceTs);
-    return {anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[]}};
+    return {anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',replies:[],omittedEarlierReplies:0,nearbyMessages:[],hasSlackLinks:false};
   };
   let reject=true;
   const fetcher:typeof fetch=async(input,init)=>{
@@ -320,35 +348,24 @@ it('advances the interval only after confirmed persistence, not after a rejected
   expect(bounds.at(-1)).toBe('102.000001');
 });
 
-it.each([false,true])('preserves initial background for an earlier late mention (cache lost: %s), without future content',async(lost)=>{
+it.each([false,true])('handles an earlier late mention cleanly (cache lost: %s)',async(lost)=>{
   const f=fixture();
-  const node=(ts:string,text:string)=>({ts,authorId:'U1',origin:'unknown' as const,text,files:[]});
-  const reader=vi.fn<ThreadRouterConfig['readContext']>().mockImplementation(async(e,options)=>({anchorTs:e.threadTs,cutoffTs:e.messageTs,capturedAt:'fixed',timeline:{status:'complete',messages:[
-    ...(options?.includeNearby?[
-      {...node('99.000001','initial background'),replies:{status:'complete' as const,messages:[node('99.500001','past reply'),node('101.500001','future reply')]}},
-      node('101.600001','future root'),
-    ]:[]),
-    {...node(e.threadTs,'root'),replies:{status:'complete',messages:[node(e.messageTs,e.text)]}},
-  ]}}));
+  const seen:(string|undefined)[]=[];
+  const reader=vi.fn<ThreadRouterConfig['readContext']>().mockImplementation(async(e,options)=>{
+    seen.push(options?.sinceTs);
+    return {anchorTs:e.threadTs,...(options?.sinceTs?{sinceTs:options.sinceTs}:{}),cutoffTs:e.messageTs,capturedAt:'fixed',replies:[],omittedEarlierReplies:0,nearbyMessages:[],hasSlackLinks:false};
+  });
   f.config.readContext=reader;
   await routeSlackThreadEvent({...root,messageTs:'102.000001'},f.config,f.fetcher);
   if(lost)f.config.store=new MemoryThreadStore();
   await routeSlackThreadEvent({...root,messageTs:'101.000001'},f.config,f.fetcher);
-  const late=readTaskEnvelope(f.comments[0]!.content).context as import('../src/context-envelope.js').ThreadContext;
-  expect(late.initialCutoffTs).toBe('102.000001');expect(late.sinceTs).toBeUndefined();
-  expect(late.timeline.messages.map(m=>m.text)).toEqual(['initial background','root']);
-  expect(late.timeline.messages[0]!.replies!.messages.map(m=>m.text)).toEqual(['past reply']);
-  expect(late.timeline.messages[0]!.replies!.reasons).toEqual(['request_cutoff']);
-  expect(reader.mock.calls[1]![1]).toMatchObject({includeNearby:false,sinceTs:undefined});
+  expect(reader.mock.calls[1]![1]).toMatchObject({includeNearby:false});
+  expect(seen[1]).toBeUndefined();
   const count=reader.mock.calls.length;
   await routeSlackThreadEvent({...root,messageTs:'101.000001'},f.config,f.fetcher);
   expect(reader).toHaveBeenCalledTimes(count);
   await routeSlackThreadEvent({...root,messageTs:'103.000001'},f.config,f.fetcher);
-  const next=readTaskEnvelope(f.comments[1]!.content).context as import('../src/context-envelope.js').ThreadContext;
-  expect(next.initialCutoffTs).toBe('102.000001');expect(next.sinceTs).toBe('102.000001');
-  expect(next.timeline.messages.some(m=>m.text==='future root')).toBe(true);
-  expect(next.timeline.messages[0]!.replies!.messages.map(m=>m.text)).toEqual(['past reply','future reply']);
-  expect(next.timeline.messages.find(m=>m.ts===root.threadTs)!.replies!.messages[0]).toMatchObject({ts:'102.000001',text:root.text,restoredFrom:'persisted_request'});
+  expect(seen[2]).toBe('102.000001');
 });
 
 it('does not treat failed baseline recovery as proof that there is no previous mention',async()=>{
@@ -954,5 +971,54 @@ describe("Steer 实时插话与等待读取/已读取表情反馈", () => {
       { op: "remove", name: "hourglass_flowing_sand", ts: "101.000001" },
       { op: "add", name: "bug_eyes", ts: "101.000001" },
     ]);
+  });
+
+  it("never regresses lastDeliveredTs after Redis loss when an out-of-order event retries from frozen envelope", async () => {
+    const f = fixture();
+    const seenSince: (string | undefined)[] = [];
+    const cfg: ThreadRouterConfig = {
+      ...f.config,
+      readContext: async (ev, opts) => {
+        seenSince.push(opts?.sinceTs);
+        return {
+          anchorTs: ev.threadTs,
+          ...(opts?.sinceTs ? { sinceTs: opts.sinceTs } : {}),
+          cutoffTs: ev.messageTs,
+          capturedAt: "fixed",
+          rootMessage: { ts: ev.threadTs, authorId: "U2", origin: "human", text: "root", files: [] },
+          replies: [],
+          omittedEarlierReplies: 0,
+          nearbyMessages: [],
+          hasSlackLinks: false,
+        };
+      },
+    };
+
+    await routeSlackThreadEvent(root, cfg, f.fetcher);
+    await routeSlackThreadEvent({ ...root, messageTs: "104.000001", text: "<@U1> newer" }, cfg, f.fetcher);
+
+    // Simulate Redis eviction of ThreadState (while Multica still holds 100.000001 + 104.000001)
+    const freshStore = new MemoryThreadStore();
+    const cfgAfterLoss: ThreadRouterConfig = { ...cfg, store: freshStore };
+
+    let failNextCommentPost = true;
+    const flakyFetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.includes("/comments") && init?.method === "POST" && failNextCommentPost) {
+        failNextCommentPost = false;
+        return new Response("rate limited", { status: 429 });
+      }
+      return f.fetcher(input, init);
+    };
+
+    const lateEvent: SlackThreadEvent = { ...root, messageTs: "102.500001", text: "<@U1> late" };
+    await expect(routeSlackThreadEvent(lateEvent, cfgAfterLoss, flakyFetcher)).rejects.toThrow();
+    // Retry hits frozen :envelope and succeeds; lastDeliveredTs must stay at 104.000001 (not 102.500001)
+    const retried = await routeSlackThreadEvent(lateEvent, cfgAfterLoss, flakyFetcher);
+    expect(retried.action).toBe("comment_persisted");
+
+    seenSince.length = 0;
+    await routeSlackThreadEvent({ ...root, messageTs: "105.000001", text: "<@U1> after" }, cfgAfterLoss, flakyFetcher);
+    expect(seenSince).toEqual(["104.000001"]);
   });
 });

@@ -1,220 +1,374 @@
 import { Buffer } from 'node:buffer';
-import { clip, compareTs, projectFiles, sourceMessageFingerprint, timestampValid, updateCoverage, type ContextSection, type ContextMessage, type ThreadContext } from './context-envelope.js';
+import {
+  clip,
+  compareTs,
+  projectFiles,
+  timestampValid,
+  type SceneMessage,
+  type ThreadContext,
+} from './context-envelope.js';
+import { resolveSlackDirectory } from './slack-directory.js';
+import { extractMessageContent, isRelayProgressMessage } from './slack-message-text.js';
 import type { SlackThreadEvent } from './thread-router.js';
-import { agentBody, isRelayProgressMessage } from './slack-message-text.js';
-import { missingSection, noteOmission } from './context-coverage.js';
+import type { ThreadStore } from './thread-store.js';
 
 type RawMessage = Record<string, unknown>;
-const permissionErrors = new Set(['missing_scope', 'not_in_channel', 'channel_not_found', 'access_denied', 'token_revoked', 'invalid_auth', 'account_inactive', 'thread_not_found']);
-const MAX_CONTEXT_CALLS = 20;
-const MAX_OPTIONAL_ROOTS = 2;
-const MAX_NAME_LOOKUPS = 10;
-const project = (raw: RawMessage, optional = false): ContextMessage => {
-  const body=agentBody(raw);
-  const text = body ?? (typeof raw.text === 'string' ? raw.text : '');
-  return { ts: String(raw.ts), authorId: typeof raw.user === 'string' ? raw.user : typeof raw.bot_id === 'string' ? raw.bot_id : '',
-    origin: raw.bot_id || raw.app_id ? 'bot_or_app' : 'unknown', text: optional ? clip(text,4096) : text, files: projectFiles(raw.files, optional ? 5 : Number.MAX_SAFE_INTEGER),
-    ...(body!==undefined?{footerOmitted:true}:{}),
-    sourceFingerprint: typeof raw.sourceFingerprint === 'string' && /^[a-f0-9]{64}$/u.test(raw.sourceFingerprint)
-      ? raw.sourceFingerprint : sourceMessageFingerprint(raw),
-    ...(optional&&Buffer.byteLength(text)>4096 ? {textTruncated:true} : {}),
-    ...(optional&&Array.isArray(raw.files)&&raw.files.length>5 ? {filesTruncated:true} : {}) };
-};
-export interface ContextReadOptions { sinceTs?: string; includeNearby?: boolean; referenceTexts?: string[] }
-export async function readContext(event: SlackThreadEvent, token: string, fetchImpl: typeof fetch = fetch, options: ContextReadOptions = {}): Promise<ThreadContext> {
-  const readStartedAt = Date.now();
-  if (!timestampValid(event.threadTs) || !timestampValid(event.messageTs) || compareTs(event.threadTs,event.messageTs)>0) throw new Error('invalid_context_scope');
-  const deadline = AbortSignal.timeout(20_000);
-  if(options.sinceTs&&(!timestampValid(options.sinceTs)||compareTs(options.sinceTs,event.threadTs)<0||compareTs(options.sinceTs,event.messageTs)>=0))throw new Error('invalid_context_scope');
-  // Nearby discussion precedes the first mention, not the later follow-up.
-  const [seconds,fraction] = event.messageTs.split('.');
-  const oldest = `${BigInt(seconds!)>1800n ? BigInt(seconds!)-1800n : 0n}.${fraction}`;
-  const threadRoots = new Map<string,string>();
-  const parents = new Map<string,string>();
-  let requests = 0, rawMessages = 0, sideStopped = false;
-  const read = async (method: 'history'|'replies', rootTs = event.threadTs, optional = false, referenceTs?: string): Promise<ContextSection> => {
-    const section: ContextSection = {status:'complete',messages:[]};
-    let cursor = ''; const cursors = new Set<string>();
-    try {
-      const pageLimit = method === 'history' ? 5 : optional ? 3 : 10;
-      let reachedEnd = false;
-      for (let page=0;page<pageLimit;page++) {
-        if (requests>=MAX_CONTEXT_CALLS || (optional && (sideStopped || deadline.aborted))) { noteOmission(section,'read_budget'); break; }
-        deadline.throwIfAborted(); requests++;
-        const params = new URLSearchParams({channel:event.channelId,limit:referenceTs&&method==='history'?'1':optional?'100':'200',latest:referenceTs&&method==='history'?referenceTs:event.messageTs,inclusive:'true',
-          ...(method==='history'?{oldest:referenceTs??oldest}:{ts:rootTs,...(!optional&&options.sinceTs?{oldest:options.sinceTs}:{})}),...(cursor?{cursor}:{})});
-        const response = await fetchImpl(`https://slack.com/api/conversations.${method}?${params}`,{headers:{authorization:`Bearer ${token}`},signal:deadline});
-        if (response.status===429) throw new Error('context_rate_limited');
-        if (!response.ok) throw new Error('context_upstream_failed');
-        const reader=response.body?.getReader(); if(!reader)throw new Error('context_invalid_response');
-        const chunks:Uint8Array[]=[];let bytes=0;
-        try { for (;;) {const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;if(bytes>2*1024*1024)throw new Error('context_response_too_large');chunks.push(part.value);} }
-        finally {await reader.cancel().catch(()=>{});}
-        const body=JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        if(body.ok!==true) {if(permissionErrors.has(body.error))return missingSection(body.error);throw new Error('context_upstream_failed');}
-        if(!Array.isArray(body.messages))throw new Error('context_invalid_response');
-        rawMessages += body.messages.length;
-        for(const raw of body.messages as RawMessage[]) {
-          if(!timestampValid(raw.ts))throw new Error('context_invalid_response');
-          if(raw.channel&&raw.channel!==event.channelId)throw new Error('invalid_context_scope');
-          if(method==='replies'&&raw.thread_ts&&raw.thread_ts!==rootTs)throw new Error('invalid_context_scope');
-          if(compareTs(raw.ts,event.messageTs)>0)continue;
-          if(method==='history'&&(referenceTs?raw.ts!==referenceTs:compareTs(raw.ts,oldest)<0||compareTs(raw.ts,event.messageTs)>=0||(raw.thread_ts&&raw.thread_ts!==raw.ts)))continue;
-          if(method==='history'&&!referenceTs&&raw.ts===event.threadTs)continue;
-          if(method==='replies'&&compareTs(raw.ts,rootTs)<0)continue;
-          if(method==='replies'&&!optional&&options.sinceTs&&raw.ts!==rootTs&&compareTs(raw.ts,options.sinceTs)<0)continue;
-          if(isRelayProgressMessage(raw))continue;
-          if(optional&&raw.subtype&&!['bot_message','file_share','thread_broadcast','me_message'].includes(String(raw.subtype)))continue;
-          if(timestampValid(raw.thread_ts))parents.set(raw.ts,raw.thread_ts);
-          if(method==='history'&&typeof raw.reply_count==='number'&&raw.reply_count>0)
-            threadRoots.set(raw.ts,timestampValid(raw.latest_reply)&&compareTs(raw.latest_reply,event.messageTs)<=0?raw.latest_reply:raw.ts);
-          if(!section.messages.some(m=>m.ts===raw.ts))section.messages.push(project(raw,optional));
-        }
-        cursor=body.response_metadata?.next_cursor?.trim()||'';
-        if(!cursor&&body.has_more===true)throw new Error('context_invalid_cursor');
-        if(!cursor||method==='history'&&referenceTs){reachedEnd=true;break;}
-        if(cursors.has(cursor))throw new Error('context_invalid_cursor');cursors.add(cursor);
-        if(method==='history'&&section.messages.length>=12){noteOmission(section,'timeline_root_limit');break;}
-        if(page===pageLimit-1)noteOmission(section,'page_limit');
-      }
-      if(method==='replies'&&!reachedEnd){
-        if(!optional)throw new Error('context_required_page_limit');
-        section.messages=section.messages.filter(m=>m.ts===rootTs);
-        noteOmission(section,'latest_suffix_unavailable');
-      }
-    } catch(error) {
-      if(!optional || (error instanceof Error && error.message==='invalid_context_scope'))throw error;
-      sideStopped=true;
-      if(method==='replies')section.messages=section.messages.filter(m=>m.ts===rootTs);
-      noteOmission(section,error instanceof Error&&error.message==='context_rate_limited'?'rate_limited':'read_failed');
-    }
-    if (method==='replies' && section.status==='complete' && !section.messages.some(m=>m.ts===rootTs)&&!(options.sinceTs&&!optional)) {
-      if(!optional)throw new Error('context_required_unavailable');
-      return missingSection('thread_root_missing');
-    }
-    section.messages.sort((a,b)=>compareTs(a.ts,b.ts));
-    if(referenceTs&&method==='replies'){
-      const replies=section.messages.filter(m=>m.ts!==rootTs);
-      const index=replies.findIndex(m=>m.ts===referenceTs);
-      const chosen=index>=0?replies.slice(Math.max(0,index-2),index+3):referenceTs===rootTs?replies.slice(0,2):[];
-      section.messages=[...section.messages.filter(m=>m.ts===rootTs),...chosen];
-      for(const message of section.messages)message.change=message.ts===referenceTs?'referenced':'context';
-      if(chosen.length<replies.length)noteOmission(section,'reference_window');
-      if(index<0&&referenceTs!==rootTs)noteOmission(section,'reference_target_missing');
-    }
-    const limit=method==='history'?12:optional?6:Number.MAX_SAFE_INTEGER;
-    if(section.messages.length>limit){
-      const root=method==='replies'?section.messages.find(m=>m.ts===rootTs):undefined;
-      section.messages=[...(root?[root]:[]),...section.messages.filter(m=>!root||m.ts!==root.ts).slice(-(limit-(root?1:0)))];
-      noteOmission(section,method==='history'?'timeline_root_limit':'thread_message_limit');
-    }
-    if(section.messages.some(m=>m.textTruncated||m.filesTruncated))noteOmission(section,'message_projection_limit');
-    updateCoverage(section); return section;
+
+const PERMISSION_ERRORS = new Set([
+  'missing_scope',
+  'not_in_channel',
+  'channel_not_found',
+  'access_denied',
+  'token_revoked',
+  'invalid_auth',
+  'account_inactive',
+  'thread_not_found',
+]);
+
+const MAX_REPLY_PAGES = 10;
+export const MAX_TURN1_REPLIES = 20;
+export const MAX_FOLLOWUP_REPLIES = 30;
+export const NEARBY_WINDOW_SECONDS = 600n;
+export const MAX_NEARBY_ROOTS = 5;
+
+const SLACK_PERMALINK_RE = /https:\/\/[^\s<>|]+\.slack\.com\/archives\/[A-Z0-9]+\/p\d{7,}/u;
+
+function projectSceneMessage(raw: RawMessage, capText = false): SceneMessage {
+  const extracted = extractMessageContent(raw);
+  const fullText = extracted.text;
+  const text = capText ? clip(fullText, 4096) : clip(fullText, 12_288);
+  const maxFiles = capText ? 5 : 20;
+  return {
+    ts: String(raw.ts),
+    authorId:
+      typeof raw.user === 'string'
+        ? raw.user
+        : typeof raw.bot_id === 'string'
+          ? raw.bot_id
+          : '',
+    origin: extracted.origin,
+    ...(extracted.botName ? { botName: extracted.botName } : {}),
+    text,
+    files: projectFiles(raw.files, maxFiles),
+    ...(Buffer.byteLength(fullText) > Buffer.byteLength(text) ? { textTruncated: true } : {}),
+    ...(Array.isArray(raw.files) && raw.files.length > maxFiles ? { filesTruncated: true } : {}),
   };
-  // Reserve the first reads for the current thread before expanding optional branches.
-  const current = event.messageTs===event.threadTs ? {status:'complete' as const,messages:[project({ts:event.messageTs,user:event.senderUserId,text:event.text,files:event.files,sourceFingerprint:event.sourceFingerprint})]} : await read('replies');
-  if(current.status!=='complete')throw new Error('context_required_unavailable');
-  let currentRoot=current.messages.find(m=>m.ts===event.threadTs);
-  if(!currentRoot&&options.sinceTs){
-    const root=await read('history',event.threadTs,false,event.threadTs);
-    currentRoot=root.messages.find(m=>m.ts===event.threadTs);
-  }
-  if(!currentRoot)throw new Error('context_required_unavailable');
-  const currentReplies:ContextSection={...current,messages:current.messages.filter(m=>m.ts!==event.threadTs)};
-  if(event.messageTs!==event.threadTs&&!currentReplies.messages.some(m=>m.ts===event.messageTs))currentReplies.messages.push(project({ts:event.messageTs,user:event.senderUserId,text:event.text,files:event.files,sourceFingerprint:event.sourceFingerprint}));
-  currentReplies.messages.sort((a,b)=>compareTs(a.ts,b.ts));
-  updateCoverage(currentReplies);currentRoot.replies=currentReplies;
-  const timeline:ContextSection=options.includeNearby===false?{status:'complete',messages:[]}:await read('history',event.threadTs,true);
-  timeline.messages=timeline.messages.filter(m=>m.ts!==event.threadTs);
-  const optionalRoots=timeline.messages.filter(m=>threadRoots.has(m.ts))
-    .sort((a,b)=>compareTs(threadRoots.get(b.ts)!,threadRoots.get(a.ts)!)).slice(0,MAX_OPTIONAL_ROOTS);
-  if(timeline.messages.filter(m=>threadRoots.has(m.ts)).length>optionalRoots.length)noteOmission(timeline,'thread_reply_selection');
-  let next=0;
-  await Promise.all(Array.from({length:Math.min(4,optionalRoots.length)},async()=>{
-    while(next<optionalRoots.length){const root=optionalRoots[next++]!;const section=await read('replies',root.ts,true);section.messages=section.messages.filter(m=>m.ts!==root.ts);updateCoverage(section);root.replies=section;}
-  }));
-  // Explicit same-conversation links have a deterministic window; never recurse
-  // through retrieved messages or read a linked conversation with wider access.
-  const references=new Map<string,string|undefined>();
-  const texts=[event.text,...(options.referenceTexts??[]),currentRoot.text,...current.messages.map(m=>m.text)];
-  for(const text of texts)for(const match of text.matchAll(/https:\/\/[^\s<>|]+/g)){
-    let url:URL;try{url=new URL(match[0]);}catch{continue;}
-    const target=url.pathname.match(/^\/archives\/([A-Z0-9]+)\/p(\d{7,})$/);
-    if(!url.hostname.endsWith('.slack.com')||!target||target[1]!==event.channelId)continue;
-    const digits=target[2]!;const ts=digits.slice(0,-6)+'.'+digits.slice(-6);
-    if(compareTs(ts,event.messageTs)>0)continue;
-    const parent=url.searchParams.get('thread_ts');
-    references.set(ts,timestampValid(parent)&&compareTs(parent,ts)<=0?parent:undefined);
-  }
-  for(const [ts,hint] of [...references].slice(0,3)){
-    if(currentRoot.ts===ts||currentReplies.messages.some(m=>m.ts===ts))continue;
-    let rootTs=hint;
-    if(!rootTs){
-      const exact=await read('history',event.threadTs,true,ts);
-      if(!exact.messages.length){timeline.messages.push({ts,authorId:'',origin:'unknown',text:'',files:[],contentStatus:'unavailable',change:'referenced'});continue;}
-      rootTs=parents.get(ts)??ts;
-    }
-    const section=await read('replies',rootTs,true,ts);
-    const root=section.messages.find(m=>m.ts===rootTs);
-    if(!root){noteOmission(timeline,'reference_unavailable');continue;}
-    if(rootTs===event.threadTs){
-      // The current thread itself is complete; a failed link read into it is a reference gap.
-      if(section.status==='missing')noteOmission(timeline,'reference_unavailable');
-      currentReplies.messages=[...new Map([...section.messages.filter(m=>m.ts!==rootTs),...currentReplies.messages].map(m=>[m.ts,m])).values()].sort((a,b)=>compareTs(a.ts,b.ts));
-      updateCoverage(currentReplies);
-    }else{
-      root.change='referenced';root.replies={...section,messages:section.messages.filter(m=>m.ts!==rootTs)};updateCoverage(root.replies);
-      const existing=timeline.messages.find(m=>m.ts===rootTs);
-      if(existing){existing.replies={...root.replies,messages:[...new Map([...(existing.replies?.messages??[]),...root.replies.messages].map(m=>[m.ts,m])).values()].sort((a,b)=>compareTs(a.ts,b.ts))};existing.change='referenced';updateCoverage(existing.replies);}
-      else timeline.messages.push(root);
-    }
-  }
-  if(references.size>3)noteOmission(timeline,'reference_limit');
-  timeline.messages.push(currentRoot);timeline.messages.sort((a,b)=>compareTs(a.ts,b.ts));updateCoverage(timeline);
-  return {anchorTs:event.threadTs,cutoffTs:event.messageTs,capturedAt:new Date().toISOString(),timeline,...(options.sinceTs?{sinceTs:options.sinceTs}:{}),
-    readStats:{slackCalls:requests,rawMessages,messageReadMs:Date.now()-readStartedAt}};
 }
 
-// Names are display metadata only. Lookup failures must not block delivery of the request.
-export async function enrichParticipantNames(event: SlackThreadEvent, context: ThreadContext, token: string, fetchImpl: typeof fetch = fetch): Promise<ThreadContext> {
-  const nameStartedAt = Date.now();
-  const ids = [...new Set([event.senderUserId, ...(event.mention.type === 'user' ? [event.mention.id] : []),
-    ...context.timeline.messages.flatMap(m => [m.authorId, ...(m.replies?.messages.map(r => r.authorId) ?? [])])])].filter(Boolean);
-  const participants: NonNullable<ThreadContext['participants']> = ids.map(id => ({ id }));
-  const pending = participants.filter(p => /^[UW][A-Z0-9]+$/.test(p.id)).slice(0, MAX_NAME_LOOKUPS);
-  const deadline = AbortSignal.timeout(3_000);
-  let next = 0, stopped = false, lookups = 0;
-  await Promise.all(Array.from({ length: Math.min(4, pending.length) }, async () => {
-    while (!stopped && !deadline.aborted && next < pending.length) {
-      const person = pending[next++]!;
-      try {
-        lookups++;
-        const response = await fetchImpl(`https://slack.com/api/users.info?${new URLSearchParams({ user: person.id })}`, {
-          headers: { authorization: `Bearer ${token}` }, signal: deadline,
-        });
-        if (!response.ok) { stopped = true; continue; }
-        const reader = response.body?.getReader();
-        if (!reader) continue;
-        const chunks: Uint8Array[] = []; let bytes = 0;
-        try {
-          for (;;) {
-            const part = await reader.read(); if (part.done) break;
-            bytes += part.value.byteLength;
-            if (bytes > 128 * 1024) throw new Error('profile_response_too_large');
-            chunks.push(part.value);
-          }
-        } finally { await reader.cancel().catch(() => {}); }
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        if (!body.ok) { if (body.error !== 'user_not_found') stopped = true; continue; }
-        if (body.user?.id !== person.id) continue;
-        const profile = body.user.profile;
-        const name = [profile?.display_name, profile?.real_name, body.user.name]
-          .find(value => typeof value === 'string' && value.trim());
-        if (name) person.name = clip(name.trim(), 256);
-      } catch { stopped = true; }
+async function readSlackJson(response: Response): Promise<Record<string, unknown>> {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error('context_invalid_response');
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      bytes += part.value.byteLength;
+      if (bytes > 2 * 1024 * 1024) throw new Error('context_response_too_large');
+      chunks.push(part.value);
     }
-  }));
-  return { ...context, participants, readStats: {
-    ...(context.readStats ?? {slackCalls:0,rawMessages:0}), nameLookupCalls:lookups, nameReadMs:Date.now()-nameStartedAt,
-  } };
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('context_invalid_response');
+  }
+  return parsed as Record<string, unknown>;
+}
+
+export interface ContextReadOptions {
+  sinceTs?: string;
+  includeNearby?: boolean;
+}
+
+export async function readContext(
+  event: SlackThreadEvent,
+  token: string,
+  fetchImpl: typeof fetch = fetch,
+  options: ContextReadOptions = {},
+): Promise<ThreadContext> {
+  const startedAt = Date.now();
+  if (
+    !timestampValid(event.threadTs) ||
+    !timestampValid(event.messageTs) ||
+    compareTs(event.threadTs, event.messageTs) > 0
+  ) {
+    throw new Error('invalid_context_scope');
+  }
+  if (
+    options.sinceTs &&
+    (!timestampValid(options.sinceTs) ||
+      compareTs(options.sinceTs, event.threadTs) < 0 ||
+      compareTs(options.sinceTs, event.messageTs) >= 0)
+  ) {
+    throw new Error('invalid_context_scope');
+  }
+
+  const deadline = AbortSignal.timeout(20_000);
+  let slackCalls = 0;
+  let rawMessages = 0;
+
+  let rootMessage: SceneMessage | undefined;
+  let replies: SceneMessage[] = [];
+  let omittedEarlierReplies = 0;
+  let nearbyMessages: SceneMessage[] = [];
+  let nearbyOmittedReason: string | undefined;
+
+  if (event.messageTs === event.threadTs) {
+    rootMessage = projectSceneMessage({
+      ts: event.messageTs,
+      user: event.senderUserId,
+      text: event.text,
+      files: event.files,
+    });
+
+    if (options.includeNearby !== false) {
+      const [seconds, fraction] = event.messageTs.split('.');
+      const oldestSec = BigInt(seconds!) > NEARBY_WINDOW_SECONDS ? BigInt(seconds!) - NEARBY_WINDOW_SECONDS : 0n;
+      const oldest = `${oldestSec}.${fraction}`;
+      try {
+        slackCalls++;
+        const params = new URLSearchParams({
+          channel: event.channelId,
+          oldest,
+          latest: event.messageTs,
+          inclusive: 'true',
+          limit: '15',
+        });
+        const response = await fetchImpl(`https://slack.com/api/conversations.history?${params}`, {
+          headers: { authorization: `Bearer ${token}` },
+          signal: deadline,
+        });
+        if (response.status === 429) {
+          nearbyOmittedReason = 'rate_limited';
+        } else if (!response.ok) {
+          nearbyOmittedReason = 'read_failed';
+        } else {
+          const body = await readSlackJson(response);
+          if (body.ok !== true) {
+            nearbyOmittedReason = typeof body.error === 'string' ? body.error : 'read_failed';
+          } else if (!Array.isArray(body.messages)) {
+            nearbyOmittedReason = 'invalid_response';
+          } else {
+            rawMessages += body.messages.length;
+            const collected: SceneMessage[] = [];
+            for (const item of body.messages) {
+              if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+              const raw = item as RawMessage;
+              if (!timestampValid(raw.ts)) throw new Error('context_invalid_response');
+              if (raw.channel && raw.channel !== event.channelId) throw new Error('invalid_context_scope');
+              if (compareTs(raw.ts, oldest) < 0 || compareTs(raw.ts, event.messageTs) >= 0) continue;
+              if (raw.thread_ts && raw.thread_ts !== raw.ts) continue;
+              if (isRelayProgressMessage(raw)) continue;
+              if (
+                raw.subtype &&
+                !['bot_message', 'file_share', 'thread_broadcast', 'me_message'].includes(
+                  String(raw.subtype),
+                )
+              ) {
+                continue;
+              }
+              if (!collected.some((m) => m.ts === raw.ts)) {
+                collected.push(projectSceneMessage(raw, true));
+              }
+            }
+            collected.sort((a, b) => compareTs(a.ts, b.ts));
+            if (collected.length > MAX_NEARBY_ROOTS) {
+              nearbyMessages = collected.slice(-MAX_NEARBY_ROOTS);
+            } else {
+              nearbyMessages = collected;
+            }
+          }
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message === 'invalid_context_scope') throw error;
+        nearbyOmittedReason = 'read_failed';
+      }
+    }
+  } else {
+    const fetched: SceneMessage[] = [];
+    let cursor = '';
+    const seenCursors = new Set<string>();
+    let reachedEnd = false;
+
+    for (let page = 0; page < MAX_REPLY_PAGES; page++) {
+      deadline.throwIfAborted();
+      slackCalls++;
+      const params = new URLSearchParams({
+        channel: event.channelId,
+        ts: event.threadTs,
+        latest: event.messageTs,
+        inclusive: 'true',
+        limit: '200',
+        ...(options.sinceTs ? { oldest: options.sinceTs } : {}),
+        ...(cursor ? { cursor } : {}),
+      });
+      const response = await fetchImpl(`https://slack.com/api/conversations.replies?${params}`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: deadline,
+      });
+      if (response.status === 429) throw new Error('context_rate_limited');
+      if (!response.ok) throw new Error('context_upstream_failed');
+      const body = await readSlackJson(response);
+      if (body.ok !== true) {
+        if (typeof body.error === 'string' && PERMISSION_ERRORS.has(body.error)) {
+          throw new Error('context_required_unavailable');
+        }
+        throw new Error('context_upstream_failed');
+      }
+      if (!Array.isArray(body.messages)) throw new Error('context_invalid_response');
+      rawMessages += body.messages.length;
+
+      for (const item of body.messages) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          throw new Error('context_invalid_response');
+        }
+        const raw = item as RawMessage;
+        if (!timestampValid(raw.ts)) throw new Error('context_invalid_response');
+        if (raw.channel && raw.channel !== event.channelId) throw new Error('invalid_context_scope');
+        if (raw.thread_ts && raw.thread_ts !== event.threadTs) throw new Error('invalid_context_scope');
+        if (compareTs(raw.ts, event.threadTs) < 0 || compareTs(raw.ts, event.messageTs) > 0) continue;
+        if (isRelayProgressMessage(raw)) continue;
+        if (!fetched.some((m) => m.ts === raw.ts)) {
+          fetched.push(projectSceneMessage(raw, false));
+        }
+      }
+
+      const meta = body.response_metadata;
+      cursor =
+        meta && typeof meta === 'object' && typeof (meta as { next_cursor?: unknown }).next_cursor === 'string'
+          ? ((meta as { next_cursor: string }).next_cursor.trim())
+          : '';
+      if (!cursor && body.has_more === true) throw new Error('context_invalid_cursor');
+      if (!cursor) {
+        reachedEnd = true;
+        break;
+      }
+      if (seenCursors.has(cursor)) throw new Error('context_invalid_cursor');
+      seenCursors.add(cursor);
+    }
+
+    if (!reachedEnd) throw new Error('context_required_page_limit');
+
+    rootMessage = fetched.find((m) => m.ts === event.threadTs);
+    if (!rootMessage && options.sinceTs) {
+      deadline.throwIfAborted();
+      slackCalls++;
+      const rootParams = new URLSearchParams({
+        channel: event.channelId,
+        oldest: event.threadTs,
+        latest: event.threadTs,
+        inclusive: 'true',
+        limit: '1',
+      });
+      const rootRes = await fetchImpl(`https://slack.com/api/conversations.history?${rootParams}`, {
+        headers: { authorization: `Bearer ${token}` },
+        signal: deadline,
+      });
+      if (rootRes.status === 429) throw new Error('context_rate_limited');
+      if (!rootRes.ok) throw new Error('context_upstream_failed');
+      const rootBody = await readSlackJson(rootRes);
+      if (rootBody.ok !== true) {
+        if (typeof rootBody.error === 'string' && PERMISSION_ERRORS.has(rootBody.error)) {
+          throw new Error('context_required_unavailable');
+        }
+        throw new Error('context_upstream_failed');
+      }
+      if (Array.isArray(rootBody.messages)) {
+        rawMessages += rootBody.messages.length;
+        const exact = rootBody.messages.find(
+          (m): m is RawMessage =>
+            Boolean(m) && typeof m === 'object' && (m as RawMessage).ts === event.threadTs,
+        );
+        if (exact) {
+          if (exact.channel && exact.channel !== event.channelId) {
+            throw new Error('invalid_context_scope');
+          }
+          rootMessage = projectSceneMessage(exact, false);
+        }
+      }
+    }
+
+    if (!rootMessage) throw new Error('context_required_unavailable');
+
+    const candidates = fetched
+      .filter((m) => m.ts !== event.threadTs && m.ts !== event.messageTs)
+      .filter((m) => (!options.sinceTs ? true : compareTs(m.ts, options.sinceTs) > 0))
+      .sort((a, b) => compareTs(a.ts, b.ts));
+
+    const cap = options.sinceTs ? MAX_FOLLOWUP_REPLIES : MAX_TURN1_REPLIES;
+    if (candidates.length > cap) {
+      omittedEarlierReplies = candidates.length - cap;
+      replies = candidates.slice(-cap);
+    } else {
+      replies = candidates;
+    }
+  }
+
+  const allTexts = [
+    event.text,
+    ...(options.sinceTs ? [] : [rootMessage?.text ?? '']),
+    ...replies.map((m) => m.text),
+    ...nearbyMessages.map((m) => m.text),
+  ];
+  const hasSlackLinks = allTexts.some((t) => SLACK_PERMALINK_RE.test(t));
+
+  return {
+    anchorTs: event.threadTs,
+    ...(options.sinceTs ? { sinceTs: options.sinceTs } : {}),
+    cutoffTs: event.messageTs,
+    capturedAt: new Date().toISOString(),
+    ...(rootMessage ? { rootMessage } : {}),
+    replies,
+    omittedEarlierReplies,
+    nearbyMessages,
+    ...(nearbyOmittedReason ? { nearbyOmittedReason } : {}),
+    hasSlackLinks,
+    readStats: {
+      slackCalls,
+      rawMessages,
+      messageReadMs: Date.now() - startedAt,
+    },
+  };
+}
+
+export async function enrichContextDirectory(
+  event: SlackThreadEvent,
+  context: ThreadContext,
+  options: {
+    token: string;
+    store?: ThreadStore;
+    fetchImpl?: typeof fetch;
+  },
+): Promise<ThreadContext> {
+  const texts = [
+    event.text,
+    context.rootMessage?.text ?? '',
+    ...context.replies.map((m) => m.text),
+    ...context.nearbyMessages.map((m) => m.text),
+  ];
+  const authorIds = [
+    context.rootMessage?.authorId ?? '',
+    ...context.replies.map((m) => m.authorId),
+    ...context.nearbyMessages.map((m) => m.authorId),
+  ].filter(Boolean);
+
+  const directory = await resolveSlackDirectory(event, texts, authorIds, options);
+  return {
+    ...context,
+    directory: {
+      channel: directory.channel,
+      users: directory.users,
+    },
+    readStats: {
+      ...(context.readStats ?? { slackCalls: 0, rawMessages: 0, messageReadMs: 0 }),
+      channelCacheHit: directory.stats.channelCacheHit,
+      channelLookupCalls: directory.stats.channelLookupCalls,
+      userCacheHits: directory.stats.userCacheHits,
+      userLookupCalls: directory.stats.userLookupCalls,
+      lookupMs: directory.stats.lookupMs,
+    },
+  };
 }

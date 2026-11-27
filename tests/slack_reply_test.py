@@ -1495,6 +1495,69 @@ class InterimAndSteerSupplementTests(unittest.TestCase):
                 self.assertFalse(res2['duplicate'])
                 self.assertIn('chat.delete', chat_ops)
 
+    def test_clear_start_reaction_handles_deleted_trigger_message_and_still_cleans_supplements(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / 'config.json'
+            config_path.write_text(json.dumps({
+                **CONFIG,
+                'workspaceId': 'W1',
+                'projectId': 'P1',
+                'serverUrl': 'https://multica.example',
+                'agentId': 'A1',
+                'startReaction': {'name': 'bug_eyes', 'userId': 'U1', 'tokenEnv': 'SLACK_USER_TOKEN'},
+                'steerPendingReaction': {'name': 'hourglass_flowing_sand', 'userId': 'U1', 'tokenEnv': 'SLACK_USER_TOKEN'},
+            }))
+            steer_id = '88888888-8888-4888-8888-888888888888'
+            run_row = {
+                'id': self.run_id,
+                'issue_id': 'I1',
+                'workspace_id': 'W1',
+                'status': 'running',
+                'trigger_comment_id': None,
+                'supplement_comment_ids': [steer_id],
+            }
+            root_env = {'schemaVersion': 7, 'eventPayload': {**EVENT, 'messageTs': '100.000001'}}
+            steer_env = {'schemaVersion': 7, 'eventPayload': {**EVENT, 'messageTs': '120.000001'}}
+            removed = []
+            steer_reaction_present = [True]
+
+            def fake_opener(request, timeout=20):
+                url = request.full_url
+                if 'auth.test' in url:
+                    raw = {'ok': True, 'user_id': 'U1', 'team_id': 'T1'}
+                elif 'reactions.get' in url and 'timestamp=100.000001' in url:
+                    raw = {'ok': False, 'error': 'message_not_found'}
+                elif 'reactions.get' in url and 'timestamp=120.000001' in url:
+                    reactions = [{'name': 'bug_eyes', 'users': ['U1']}] if steer_reaction_present[0] else []
+                    raw = {'ok': True, 'channel': 'C1', 'message': {'ts': '120.000001', 'reactions': reactions}}
+                elif 'reactions.remove' in url:
+                    body = json.loads(request.data.decode())
+                    removed.append((body['timestamp'], body['name']))
+                    steer_reaction_present[0] = False
+                    raw = {'ok': True}
+                else:
+                    raise AssertionError(url)
+
+                class Resp:
+                    headers = {}
+                    def __enter__(self): return io.StringIO(json.dumps(raw))
+                    def __exit__(self, *a): return False
+                return Resp()
+
+            with patch.dict(os.environ, {'SLACK_USER_TOKEN': 'user', 'MULTICA_TASK_ID': self.run_id}), \
+                    patch.object(reply, 'multica_json', return_value=[run_row]), \
+                    patch.object(reply, 'read_source', return_value=root_env), \
+                    patch.object(reply, 'read_reply_source', return_value=(steer_env, 'relay')):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    reply.main(['--config', str(config_path), '--issue-id', 'I1',
+                                '--current-run', '--clear-start-reaction'], opener=fake_opener)
+                res = json.loads(out.getvalue())
+                self.assertTrue(res['ok'])
+                self.assertEqual(res['action'], 'already_absent')
+                self.assertEqual(res['reason'], 'message_not_found')
+                self.assertIn(('120.000001', 'bug_eyes'), removed)
+
 
 if __name__ == '__main__':
     unittest.main()

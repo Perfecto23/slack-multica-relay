@@ -11,7 +11,7 @@ import {
   type InboundOperation,
   type TriggerSource,
 } from "./inbound-policy.js";
-import { readContext, enrichParticipantNames } from "./slack-context.js";
+import { readContext, enrichContextDirectory } from "./slack-context.js";
 import {
   routeSlackThreadEvent,
   isThreadOpenForImplicitFollowup,
@@ -27,7 +27,6 @@ import {
   projectFiles,
   compareTs,
   timestampValid,
-  sourceMessageFingerprint,
 } from "./context-envelope.js";
 import { setSlackSessionStatus } from "./slack-session.js";
 import { agentBody, isRelayProgressMessage } from "./slack-message-text.js";
@@ -339,7 +338,6 @@ export async function acceptSlack(
       mention: candidate.mention,
       operation: candidate.operation,
       ...(candidate.trigger ? { trigger: candidate.trigger } : {}),
-      sourceFingerprint: sourceMessageFingerprint(candidate.rawForFingerprint),
       ...(candidate.files
         ? { files: projectFiles(candidate.files, Number.MAX_SAFE_INTEGER) }
         : {}),
@@ -496,12 +494,18 @@ export async function consumeQueue(
     });
   };
   try {
+    const store = new UpstashThreadStore(
+      config.kvRestApiUrl,
+      config.kvRestApiToken,
+      boundedFetch,
+    );
     const result = await routeSlackThreadEvent(
       event,
       {
         ...config,
+        ownerUserIds: config.targetUserIds,
         readContext: async (event, options) =>
-          enrichParticipantNames(
+          enrichContextDirectory(
             event,
             await readContext(
               event,
@@ -509,14 +513,13 @@ export async function consumeQueue(
               boundedFetch,
               options,
             ),
-            config.slackContextToken,
-            boundedFetch,
+            {
+              token: config.slackContextToken,
+              store,
+              fetchImpl: boundedFetch,
+            },
           ),
-        store: new UpstashThreadStore(
-          config.kvRestApiUrl,
-          config.kvRestApiToken,
-          boundedFetch,
-        ),
+        store,
       },
       boundedFetch,
     );

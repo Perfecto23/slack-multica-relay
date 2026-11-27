@@ -83,14 +83,22 @@ export function extractSupplementalText(
   if (Array.isArray(raw.attachments)) {
     for (const item of raw.attachments) {
       if (!isRecord(item)) continue;
-      const shared =
+      const pieces: string[] = [];
+      if (typeof item.title === "string" && item.title.trim()) {
+        pieces.push(item.title.trim());
+      }
+      const body =
         typeof item.text === "string" && item.text.trim()
           ? item.text.trim()
-          : item.is_share === true &&
+          : (item.is_share === true || !baseText.trim()) &&
               typeof item.fallback === "string" &&
               item.fallback.trim()
             ? item.fallback.trim()
             : "";
+      if (body && !pieces.includes(body)) {
+        pieces.push(body);
+      }
+      const shared = pieces.join("\n").trim();
       if (!shared || baseText.includes(shared)) continue;
       const quoted = shared
         .slice(0, 4096)
