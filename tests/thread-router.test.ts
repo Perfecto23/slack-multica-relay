@@ -788,6 +788,70 @@ describe("Steer 实时插话与等待读取/已读取表情反馈", () => {
     expect(reactions).toEqual(["bug_eyes", "bug_eyes"]);
   });
 
+  it("recovers implicit_thread participation from agent_reply in thread context when :replied key is missing", async () => {
+    const f = fixture();
+    f.config.multicaQueueAgentId = "agent";
+    f.config.implicitThreadMaxSilentTurns = 2;
+
+    let readCalls = 0;
+    let threadReplies: Array<{
+      ts: string;
+      senderUserId: string;
+      text: string;
+      origin: "human" | "agent_reply" | "bot_or_app";
+    }> = [];
+    const baseReadContext = f.config.readContext;
+    f.config.readContext = async (ev, options) => {
+      readCalls++;
+      const ctx = await baseReadContext(ev, options);
+      return {
+        ...ctx,
+        replies: threadReplies.map((r) => ({
+          ts: r.ts,
+          authorId: r.senderUserId,
+          text: r.text,
+          origin: r.origin,
+          files: [],
+          filesTruncated: false,
+        })),
+      };
+    };
+
+    let runs: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/task-runs")) {
+        return Response.json(runs);
+      }
+      return f.fetcher(input, init);
+    };
+
+    const first = { ...root, messageTs: "100.000001", threadTs: "100.000001", text: "<@UOWNER> follow up with Sai" };
+    await routeSlackThreadEvent(first, f.config, fetcher);
+
+    // Agent replied in Slack (101.500001), but Slack did not echo the user-token message back so `:replied` is absent.
+    runs = [{ id: "r1", issue_id: "issue-1", workspace_id: "ws", agent_id: "agent", status: "completed" }];
+    threadReplies = [
+      { ts: "101.500001", senderUserId: "UOWNER", text: "好的，请补一下这 3 个信息", origin: "agent_reply" },
+      { ts: "102.000001", senderUserId: "UOTHER", text: "1. 频道已建好 2. 周一早 9 点", origin: "human" },
+    ];
+    readCalls = 0;
+
+    const res = await routeSlackThreadEvent(
+      { ...first, senderUserId: "UOTHER", messageTs: "102.000001", text: "1. 频道已建好 2. 周一早 9 点", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    expect(res.action).toBe("comment_persisted");
+    expect(f.comments).toHaveLength(1);
+    // Probe reused the single readContext result without double-fetching Slack!
+    expect(readCalls).toBe(1);
+
+    // Verify `:replied` key was backfilled in store.
+    const { threadRepliedStorageKey } = await import("../src/thread-router.js");
+    expect(await f.config.store.get(threadRepliedStorageKey(f.config, first))).toBe("101.500001");
+  });
+
   it("supports !new session reset, offline runtime zzz reaction, and failed-run watchdog cleanup + alert", async () => {
     const f = fixture();
     f.config.slackReactionToken = "test-token";

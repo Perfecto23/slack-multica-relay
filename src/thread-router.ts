@@ -361,6 +361,9 @@ export async function routeSlackThreadEvent(
     const isImplicit = event.trigger === "implicit_thread";
     let pendingImplicitIncrement = false;
     let preloadedRuns: IssueRun[] | undefined;
+    let preloadedContext:
+      | { sinceTs?: string; includeNearby: boolean; source: ThreadContext }
+      | undefined;
     if (isImplicit && !alreadyDone) {
       if (!state.issueId) return { action: "ignored" };
       const rawReplied = await config.store.get(repliedKey);
@@ -381,6 +384,58 @@ export async function routeSlackThreadEvent(
             run.agent_id === config.multicaQueueAgentId) &&
           isActiveRun(run),
       );
+      const maxSilent = config.implicitThreadMaxSilentTurns ?? 3;
+      const streak = state.implicitSilentCount ?? 0;
+      const needsReplyProbe =
+        !hasActive &&
+        (!state.lastSeenReplyTs || (maxSilent > 0 && streak >= maxSilent));
+      if (needsReplyProbe) {
+        // Slack does not reliably echo app-authored user-token replies back to Events API
+        // in 1v1 DMs, so fall back to checking actual agent_reply messages in the thread.
+        const probeSinceTs =
+          state.lastDeliveredTs &&
+          timestampValid(state.lastDeliveredTs) &&
+          compareTs(state.lastDeliveredTs, event.messageTs) < 0
+            ? state.lastDeliveredTs
+            : undefined;
+        try {
+          const source = await config.readContext(event, {
+            ...(probeSinceTs ? { sinceTs: probeSinceTs } : {}),
+            includeNearby: false,
+          });
+          preloadedContext = {
+            sinceTs: probeSinceTs,
+            includeNearby: false,
+            source,
+          };
+          let latestReplyTs: string | undefined;
+          for (const msg of source.replies) {
+            if (msg.origin !== "agent_reply" || !timestampValid(msg.ts)) continue;
+            if (compareTs(msg.ts, event.messageTs) >= 0) continue;
+            if (
+              state.epochStartedTs &&
+              compareTs(msg.ts, state.epochStartedTs) <= 0
+            ) {
+              continue;
+            }
+            if (!latestReplyTs || compareTs(msg.ts, latestReplyTs) > 0) {
+              latestReplyTs = msg.ts;
+            }
+          }
+          if (
+            latestReplyTs &&
+            (!state.lastSeenReplyTs ||
+              compareTs(latestReplyTs, state.lastSeenReplyTs) > 0)
+          ) {
+            state.lastSeenReplyTs = latestReplyTs;
+            state.implicitSilentCount = 0;
+            state.implicitMode = "open";
+            await config.store
+              .set(repliedKey, latestReplyTs, STATE_TTL_SECONDS)
+              .catch(() => {});
+          }
+        } catch {}
+      }
       const hasParticipated = Boolean(state.lastSeenReplyTs);
       if (!hasParticipated && !hasActive) {
         state.implicitMode = "closed";
@@ -388,9 +443,8 @@ export async function routeSlackThreadEvent(
         return { action: "ignored", issueId: state.issueId };
       }
       if (hasParticipated && !hasActive) {
-        const maxSilent = config.implicitThreadMaxSilentTurns ?? 3;
-        const streak = state.implicitSilentCount ?? 0;
-        if (maxSilent > 0 && streak >= maxSilent) {
+        const currentStreak = state.implicitSilentCount ?? 0;
+        if (maxSilent > 0 && currentStreak >= maxSilent) {
           state.implicitMode = "closed";
           await save();
           return { action: "ignored", issueId: state.issueId };
@@ -566,10 +620,15 @@ export async function routeSlackThreadEvent(
         Boolean(state.issueId) && messageKey(event) !== state.rootMessageKey;
       const sinceTs = await resolveSinceTs(followup);
       const includeNearby = !followup && event.messageTs === event.threadTs;
-      const source = await config.readContext(event, {
-        ...(sinceTs ? { sinceTs } : {}),
-        includeNearby,
-      });
+      const source =
+        preloadedContext &&
+        preloadedContext.sinceTs === sinceTs &&
+        preloadedContext.includeNearby === includeNearby
+          ? preloadedContext.source
+          : await config.readContext(event, {
+              ...(sinceTs ? { sinceTs } : {}),
+              includeNearby,
+            });
       const agentConfigStartedAt = Date.now();
       const replyContext = await getSlackReplyContext(config, fetchImpl);
       if (replyContext.runtimeOnline === false) runtimeOffline = true;
