@@ -75,6 +75,7 @@ export interface SlackThreadEvent {
   trigger?: TriggerSource;
   steerCheck?: SteerCheckPayload;
   watchdogCheck?: WatchdogCheckPayload;
+  steerWaitAttempt?: number;
 }
 
 export interface ThreadRouterConfig extends ApiConfig {
@@ -94,6 +95,7 @@ export interface ThreadRouterConfig extends ApiConfig {
   slackStatusToken?: string;
   slackAlertChannelId?: string;
   implicitThreadMaxSilentTurns?: number;
+  maxDeferredSteerAttempts?: number;
   ownerUserIds?: ReadonlySet<string>;
 }
 
@@ -137,6 +139,7 @@ export interface ThreadRouteResult {
     | "steer_delivered"
     | "steer_pending"
     | "steer_failed"
+    | "deferred_steer"
     | "watchdog_active"
     | "watchdog_cleaned";
   issueId?: string;
@@ -491,8 +494,24 @@ export async function routeSlackThreadEvent(
                 fetchImpl,
               );
           } else if (steerReceipt && steerReceipt.status === "delivered") {
+            const pendingReaction =
+              config.slackSteerPendingReactionName ??
+              config.slackQueuedReactionName;
             const readReaction =
               config.slackSteerReadReactionName ?? config.slackReactionName;
+            if (
+              event.steerWaitAttempt &&
+              pendingReaction &&
+              pendingReaction !== readReaction
+            ) {
+              await removeSlackReaction(
+                config.slackReactionToken,
+                event.channelId,
+                event.messageTs,
+                pendingReaction,
+                fetchImpl,
+              ).catch(() => {});
+            }
             if (readReaction)
               await addSlackReaction(
                 config.slackReactionToken,
@@ -502,6 +521,23 @@ export async function routeSlackThreadEvent(
                 fetchImpl,
               );
           } else {
+            const pendingReaction =
+              config.slackSteerPendingReactionName ??
+              config.slackQueuedReactionName;
+            if (
+              event.steerWaitAttempt &&
+              !queued &&
+              pendingReaction &&
+              pendingReaction !== config.slackReactionName
+            ) {
+              await removeSlackReaction(
+                config.slackReactionToken,
+                event.channelId,
+                event.messageTs,
+                pendingReaction,
+                fetchImpl,
+              ).catch(() => {});
+            }
             if (!isImplicit && config.slackReactionName) {
               await addSlackReaction(
                 config.slackReactionToken,
@@ -788,6 +824,34 @@ export async function routeSlackThreadEvent(
                 (queuedCommentRun.trigger_thread_id ||
                   queuedCommentRun.trigger_comment_id) ??
                 undefined;
+            }
+            const startingRun = !coalesceParentId
+              ? runs.find(
+                  (run) =>
+                    run.agent_id === config.multicaQueueAgentId &&
+                    (run.status === "queued" ||
+                      run.status === "dispatched" ||
+                      run.status === "waiting_local_directory"),
+                )
+              : undefined;
+            const maxWait = config.maxDeferredSteerAttempts ?? 0;
+            const waited = event.steerWaitAttempt ?? 0;
+            if (startingRun && maxWait > 0 && waited < maxWait) {
+              if (waited === 0 && !isImplicit && config.slackReactionToken) {
+                const pendingReaction =
+                  config.slackSteerPendingReactionName ??
+                  config.slackQueuedReactionName;
+                if (pendingReaction) {
+                  await addSlackReaction(
+                    config.slackReactionToken,
+                    event.channelId,
+                    event.messageTs,
+                    pendingReaction,
+                    fetchImpl,
+                  ).catch(() => {});
+                }
+              }
+              return { action: "deferred_steer", issueId: state.issueId };
             }
             if (config.slackQueuedReactionName) {
               queued = observedActiveRun;

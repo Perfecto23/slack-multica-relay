@@ -852,6 +852,113 @@ describe("Steer 实时插话与等待读取/已读取表情反馈", () => {
     expect(await f.config.store.get(threadRepliedStorageKey(f.config, first))).toBe("101.500001");
   });
 
+  it("defers follow-up during dispatched startup window and upgrades to steer once run becomes running", async () => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "bug_eyes";
+    f.config.slackQueuedReactionName = "hourglass_flowing_sand";
+    f.config.multicaQueueAgentId = "agent";
+    f.config.maxDeferredSteerAttempts = 3;
+
+    const reactions: string[] = [];
+    const postedPayloads: Record<string, unknown>[] = [];
+    let runs: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/reactions.add")) {
+        reactions.push("+" + JSON.parse(String(init?.body)).name);
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/reactions.remove")) {
+        reactions.push("-" + JSON.parse(String(init?.body)).name);
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/task-runs")) {
+        return Response.json(runs);
+      }
+      if (url.endsWith("/comments") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        postedPayloads.push(body);
+        return Response.json({
+          id: "c-steered-1",
+          content: body.content,
+          supplements: [
+            { task_id: "r1", status: "delivered" },
+          ],
+        });
+      }
+      return f.fetcher(input, init);
+    };
+
+    const first = { ...root, messageTs: "100.000001", threadTs: "100.000001", text: "<@U1> 干活" };
+    await routeSlackThreadEvent(first, f.config, fetcher);
+    reactions.length = 0;
+
+    // 1. Follow-up arrives while Run 1 is still `dispatched` (startup window) -> deferred_steer + hourglass!
+    runs = [{ id: "r1", issue_id: "issue-1", workspace_id: "ws", agent_id: "agent", status: "dispatched" }];
+    const followup = { ...first, messageTs: "101.000001", text: "<@U1> 补充条件" };
+    const r1 = await routeSlackThreadEvent(followup, f.config, fetcher);
+    expect(r1.action).toBe("deferred_steer");
+    expect(postedPayloads).toHaveLength(0);
+    expect(reactions).toEqual(["+hourglass_flowing_sand"]);
+
+    // 2. Retry arrives once Run 1 is `running` with task-supplement-v1 -> steers into r1 & swaps hourglass -> bug_eyes!
+    runs = [
+      {
+        id: "r1",
+        issue_id: "issue-1",
+        workspace_id: "ws",
+        agent_id: "agent",
+        status: "running",
+        can_supplement: true,
+        supplement_capability: "task-supplement-v1",
+      },
+    ];
+    const r2 = await routeSlackThreadEvent({ ...followup, steerWaitAttempt: 1 }, f.config, fetcher);
+    expect(r2.action).toBe("comment_persisted");
+    expect(postedPayloads).toHaveLength(1);
+    expect(postedPayloads[0]?.steer_task_ids).toEqual(["r1"]);
+    expect(reactions).toEqual(["+hourglass_flowing_sand", "-hourglass_flowing_sand", "+bug_eyes"]);
+  });
+
+  it("falls back to normal queued comment if deferred steer budget is exhausted", async () => {
+    const f = fixture();
+    f.config.slackReactionToken = "test-token";
+    f.config.slackReactionName = "bug_eyes";
+    f.config.slackQueuedReactionName = "hourglass_flowing_sand";
+    f.config.multicaQueueAgentId = "agent";
+    f.config.maxDeferredSteerAttempts = 2;
+
+    const postedPayloads: Record<string, unknown>[] = [];
+    let runs: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/reactions.add") || url.endsWith("/reactions.remove")) {
+        return Response.json({ ok: true });
+      }
+      if (url.endsWith("/task-runs")) {
+        return Response.json(runs);
+      }
+      if (url.endsWith("/comments") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        postedPayloads.push(body);
+        return Response.json({ id: "c-fallback-1", content: body.content });
+      }
+      return f.fetcher(input, init);
+    };
+
+    const first = { ...root, messageTs: "100.000001", threadTs: "100.000001", text: "<@U1> 干活" };
+    await routeSlackThreadEvent(first, f.config, fetcher);
+
+    runs = [{ id: "r1", issue_id: "issue-1", workspace_id: "ws", agent_id: "agent", status: "dispatched" }];
+    const followup = { ...first, messageTs: "101.000001", text: "<@U1> 补充条件" };
+    // At attempt === maxDeferredSteerAttempts (2), must NOT defer again; must persist normal comment!
+    const res = await routeSlackThreadEvent({ ...followup, steerWaitAttempt: 2 }, f.config, fetcher);
+    expect(res.action).toBe("comment_persisted");
+    expect(postedPayloads).toHaveLength(1);
+    expect(postedPayloads[0]?.steer_task_ids).toBeUndefined();
+  });
+
   it("supports !new session reset, offline runtime zzz reaction, and failed-run watchdog cleanup + alert", async () => {
     const f = fixture();
     f.config.slackReactionToken = "test-token";

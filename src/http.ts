@@ -35,6 +35,7 @@ import { lookupSlackAuthor, SlackAuthorLookupError } from "./slack-author.js";
 export const ADMISSION_BUDGET_MS = 2750;
 export const QUEUE_PUBLISH_BUDGET_MS = 2000;
 export const STEER_ACK_DELAYS_SECONDS = [3, 5, 10, 20, 30] as const;
+export const DEFERRED_STEER_DELAYS_SECONDS = [5, 10, 15, 15, 15, 15] as const;
 
 const VALID_OPERATIONS = new Set<InboundOperation>([
   "dispatch",
@@ -116,6 +117,11 @@ function parsedEvent(value: unknown): SlackThreadEvent {
         value.watchdogCheck.attempt < 1 ||
         value.watchdogCheck.attempt > 2)) ||
     (value.operation !== "watchdog" && value.watchdogCheck !== undefined) ||
+    (value.steerWaitAttempt !== undefined &&
+      (typeof value.steerWaitAttempt !== "number" ||
+        !Number.isInteger(value.steerWaitAttempt) ||
+        value.steerWaitAttempt < 1 ||
+        value.steerWaitAttempt > DEFERRED_STEER_DELAYS_SECONDS.length)) ||
     (value.trigger !== undefined &&
       (!VALID_TRIGGERS.has(value.trigger as TriggerSource) ||
         (value.trigger === "native_stop" &&
@@ -504,6 +510,7 @@ export async function consumeQueue(
       {
         ...config,
         ownerUserIds: config.targetUserIds,
+        maxDeferredSteerAttempts: DEFERRED_STEER_DELAYS_SECONDS.length,
         readContext: async (event, options) =>
           enrichContextDirectory(
             event,
@@ -533,6 +540,21 @@ export async function consumeQueue(
         "active",
         boundedFetch,
       );
+    if (result.action === "deferred_steer") {
+      const nextAttempt = (event.steerWaitAttempt ?? 0) + 1;
+      if (nextAttempt <= DEFERRED_STEER_DELAYS_SECONDS.length) {
+        await scheduleDelayedCheck(
+          {
+            ...event,
+            steerWaitAttempt: nextAttempt,
+          },
+          `deferred_steer:${messageKey(event)}:${nextAttempt}`,
+          DEFERRED_STEER_DELAYS_SECONDS[nextAttempt - 1] ?? 15,
+          config,
+          boundedFetch,
+        );
+      }
+    }
     if (
       result.steerReceipt &&
       (result.steerReceipt.status === "pending" ||
