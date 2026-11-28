@@ -308,6 +308,18 @@ export async function acceptSlack(
   const evaluation = evaluateInboundSlackEvent(body.team_id, event, config);
   if (!evaluation.admitted) {
     if (evaluation.invalid) return json({ error: "invalid_event" }, 400);
+    if (
+      typeof event.thread_ts === "string" &&
+      typeof event.ts === "string" &&
+      event.thread_ts !== event.ts
+    ) {
+      console.info("relay_ignored", {
+        stage: "evaluate",
+        reason: evaluation.reason,
+        channelId: typeof event.channel === "string" ? event.channel : undefined,
+        implicitEnabled: config.implicitThreadFollowup,
+      });
+    }
     return json({
       action: "ignored",
       ...(evaluation.reason !== "ignored" ? { reason: evaluation.reason } : {}),
@@ -328,6 +340,12 @@ export async function acceptSlack(
       return json({ error: "queue_unavailable", retryable: true }, 503);
     }
     if (!open) {
+      console.info("relay_ignored", {
+        stage: "active_thread_gate",
+        reason: "thread_not_open",
+        channelId: candidate.channelId,
+        trigger: candidate.trigger,
+      });
       return json({ action: "ignored", reason: "not_addressed" });
     }
   }
