@@ -336,7 +336,11 @@ export async function acceptSlack(
     let open = false;
     try {
       open = await isThreadOpenForImplicitFollowup(store, config, candidate);
-    } catch {
+    } catch (error) {
+      console.warn("relay_active_thread_error", {
+        channelId: candidate.channelId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return json({ error: "queue_unavailable", retryable: true }, 503);
     }
     if (!open) {

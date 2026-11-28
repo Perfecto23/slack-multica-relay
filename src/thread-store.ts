@@ -66,7 +66,10 @@ export class UpstashThreadStore implements ThreadStore {
   }
 
   private async command(command: string[]): Promise<unknown> {
-    const response = await this.fetchImpl(this.url, {
+    // Call fetch without binding `this` to the store instance; Cloudflare Workers
+    // throws `TypeError: Illegal invocation` if global `fetch` is called as a method.
+    const runFetch = this.fetchImpl;
+    const response = await runFetch(this.url, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${this.token}`,
