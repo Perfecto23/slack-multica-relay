@@ -1,5 +1,6 @@
 """验证运行资料整理的归属、统计和代码证据。"""
 import importlib.util
+import json
 import sys
 import subprocess
 from pathlib import Path
@@ -451,6 +452,36 @@ class FinalReplyTests(unittest.TestCase):
         summary = final.summarize(self.data)
         self.assertEqual(summary["code_evidence"], [])
         self.assertIsNone(summary["last_message_seq"])
+
+
+class TaskEnvFileTests(unittest.TestCase):
+    def overlay(self, directory, payload):
+        path = Path(directory) / "task-env.json"
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        return str(path)
+
+    def test_active_overlay_supplies_only_the_task_id_without_mutating_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = {"MULTICA_WORKSPACE_ID": "ws", "MULTICA_TASK_ENV_FILE": self.overlay(
+                directory, {"active": True, "env": {"MULTICA_TASK_ID": "run", "MULTICA_TOKEN": "task-token"}})}
+            env = final.with_task_env_file(source)
+        self.assertEqual(env["MULTICA_TASK_ID"], "run")
+        self.assertNotIn("MULTICA_TOKEN", env)
+        self.assertNotIn("MULTICA_TASK_ID", source)
+
+    def test_process_environment_wins_and_unusable_overlay_is_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            active = self.overlay(directory, {"active": True, "env": {"MULTICA_TASK_ID": "overlay"}})
+            self.assertEqual(final.with_task_env_file(
+                {"MULTICA_TASK_ID": "env", "MULTICA_TASK_ENV_FILE": active})["MULTICA_TASK_ID"], "env")
+            for payload in ({"active": False, "env": {"MULTICA_TASK_ID": "run"}}, {"active": True, "env": {}},
+                            {"active": True, "env": {"MULTICA_TASK_ID": 7}}, [], "not json"):
+                with self.subTest(payload=payload):
+                    env = final.with_task_env_file({"MULTICA_TASK_ENV_FILE": self.overlay(directory, payload)})
+                    self.assertNotIn("MULTICA_TASK_ID", env)
+            self.assertNotIn("MULTICA_TASK_ID", final.with_task_env_file(
+                {"MULTICA_TASK_ENV_FILE": str(Path(directory) / "absent.json")}))
+        self.assertEqual(final.with_task_env_file({}), {})
 
 
 if __name__ == "__main__":
