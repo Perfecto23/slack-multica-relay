@@ -34,6 +34,7 @@ export interface InboundPolicyConfig {
   newSessionKeywords: ReadonlySet<string>;
   wakePatterns: readonly string[];
   implicitThreadFollowup: boolean;
+  selfDmChannelIds?: ReadonlySet<string>;
   allowEditMentionWake: boolean;
 }
 
@@ -454,7 +455,10 @@ export function evaluateInboundSlackEvent(
   if (isAddressedToOtherUser(text, config.targetUserIds)) {
     return { admitted: false, reason: "addressed_to_other" };
   }
-  if (config.controlUserIds.has(senderUserId)) {
+  if (
+    config.controlUserIds.has(senderUserId) &&
+    !config.selfDmChannelIds?.has(channelId)
+  ) {
     return { admitted: false, reason: "owner_unaddressed" };
   }
   const mention = fallbackTargetMention(config);

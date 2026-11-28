@@ -10,6 +10,8 @@ export interface RelayConfig extends ApiConfig {
   wakePatterns: string[];
   implicitThreadFollowup: boolean;
   implicitThreadMaxSilentTurns: number;
+  implicitGroupHotWindowSeconds: number;
+  selfDmChannelIds: Set<string>;
   allowEditMentionWake: boolean;
   controlUserIds: Set<string>;
   slackStatusToken?: string;
@@ -87,6 +89,8 @@ export function loadRelayConfig(
     wakePatterns: wakePatternList(env.SLACK_WAKE_PATTERNS),
     implicitThreadFollowup: boolFlag(env.SLACK_IMPLICIT_THREAD_FOLLOWUP, false),
     implicitThreadMaxSilentTurns: boundedInt(env.SLACK_IMPLICIT_THREAD_MAX_SILENT, 3, 0, 20),
+    implicitGroupHotWindowSeconds: boundedInt(env.SLACK_IMPLICIT_GROUP_HOT_WINDOW_SECONDS, 0, 0, 86400),
+    selfDmChannelIds: ids(env.SLACK_SELF_DM_CHANNEL_IDS),
     allowEditMentionWake: boolFlag(env.SLACK_EDIT_MENTION_WAKE, true),
     controlUserIds: env.SLACK_CONTROL_USER_IDS === undefined ? targetUserIds : ids(env.SLACK_CONTROL_USER_IDS),
     slackStatusToken: env.SLACK_STATUS_TOKEN?.trim() || undefined,

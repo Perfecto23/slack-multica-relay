@@ -254,6 +254,30 @@ describe("inbound policy & Hermes/OpenClaw inspired gating", () => {
       ),
     ).toEqual({ admitted: false, reason: "owner_unaddressed" });
 
+    // 3b. Owner replying without @ inside configured self-DM channel -> admitted as implicit_thread!
+    const selfDmPolicy = {
+      ...policy,
+      allowedChannelIds: new Set(["C1", "DSELF"]),
+      selfDmChannelIds: new Set(["DSELF"]),
+    };
+    const selfDmRes = evaluateInboundSlackEvent(
+      "T1",
+      {
+        type: "message",
+        channel: "DSELF",
+        user: "UOWNER",
+        ts: "102.000004",
+        thread_ts: "100.000001",
+        text: "顺便再帮我查一下另一个指标",
+      },
+      selfDmPolicy,
+    );
+    expect(selfDmRes.admitted).toBe(true);
+    if (selfDmRes.admitted) {
+      expect(selfDmRes.candidate.trigger).toBe("implicit_thread");
+      expect(selfDmRes.candidate.requiresActiveThread).toBe(true);
+    }
+
     // 4. Owner explicitly calling wake pattern "小 p" in thread without <@UOWNER> -> admitted!
     const ownerWake = evaluateInboundSlackEvent(
       "T1",

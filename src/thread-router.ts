@@ -95,6 +95,7 @@ export interface ThreadRouterConfig extends ApiConfig {
   slackStatusToken?: string;
   slackAlertChannelId?: string;
   implicitThreadMaxSilentTurns?: number;
+  implicitGroupHotWindowSeconds?: number;
   maxDeferredSteerAttempts?: number;
   ownerUserIds?: ReadonlySet<string>;
 }
@@ -388,10 +389,20 @@ export async function routeSlackThreadEvent(
           isActiveRun(run),
       );
       const maxSilent = config.implicitThreadMaxSilentTurns ?? 3;
+      const hotWindow = config.implicitGroupHotWindowSeconds ?? 0;
+      const isDirectDm = event.channelId.startsWith("D");
+      const isOutsideHotWindow = (replyTs: string | undefined): boolean => {
+        if (isDirectDm || hotWindow <= 0 || !replyTs) return false;
+        const msgSec = Number(event.messageTs.split(".")[0]);
+        const replySec = Number(replyTs.split(".")[0]);
+        return Number.isFinite(msgSec) && Number.isFinite(replySec) && msgSec - replySec > hotWindow;
+      };
       const streak = state.implicitSilentCount ?? 0;
       const needsReplyProbe =
         !hasActive &&
-        (!state.lastSeenReplyTs || (maxSilent > 0 && streak >= maxSilent));
+        (!state.lastSeenReplyTs ||
+          (maxSilent > 0 && streak >= maxSilent) ||
+          isOutsideHotWindow(state.lastSeenReplyTs));
       if (needsReplyProbe) {
         // Slack does not reliably echo app-authored user-token replies back to Events API
         // in 1v1 DMs, so fall back to checking actual agent_reply messages in the thread.
@@ -446,6 +457,11 @@ export async function routeSlackThreadEvent(
         return { action: "ignored", issueId: state.issueId };
       }
       if (hasParticipated && !hasActive) {
+        if (isOutsideHotWindow(state.lastSeenReplyTs)) {
+          state.implicitMode = "closed";
+          await save();
+          return { action: "ignored", issueId: state.issueId };
+        }
         const currentStreak = state.implicitSilentCount ?? 0;
         if (maxSilent > 0 && currentStreak >= maxSilent) {
           state.implicitMode = "closed";

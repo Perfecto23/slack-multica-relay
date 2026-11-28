@@ -959,6 +959,54 @@ describe("Steer 实时插话与等待读取/已读取表情反馈", () => {
     expect(postedPayloads[0]?.steer_task_ids).toBeUndefined();
   });
 
+  it("enforces implicitGroupHotWindowSeconds in multi-person channels while keeping 1v1 DMs evergreen", async () => {
+    const f = fixture();
+    f.config.multicaQueueAgentId = "agent";
+    f.config.implicitGroupHotWindowSeconds = 1800; // 30 minutes
+
+    let runs: Record<string, unknown>[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/task-runs")) return Response.json(runs);
+      return f.fetcher(input, init);
+    };
+
+    const { threadRepliedStorageKey } = await import("../src/thread-router.js");
+
+    // 1. Multi-person channel C1: within 30m -> admitted; after 30m -> closed & ignored
+    const groupRoot = { ...root, channelId: "C1", messageTs: "1000.000001", threadTs: "1000.000001", text: "<@U1> hi" };
+    await routeSlackThreadEvent(groupRoot, f.config, fetcher);
+    runs = [{ id: "r1", issue_id: "issue-1", workspace_id: "ws", agent_id: "agent", status: "completed" }];
+    await f.config.store.set(threadRepliedStorageKey(f.config, groupRoot), "1100.000001", 3600);
+
+    const withinHot = await routeSlackThreadEvent(
+      { ...groupRoot, messageTs: "2000.000001", text: "15分钟后追问", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    expect(withinHot.action).toBe("comment_persisted");
+
+    const afterHot = await routeSlackThreadEvent(
+      { ...groupRoot, messageTs: "3000.000001", text: "超过30分钟后的群聊闲聊", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    expect(afterHot.action).toBe("ignored");
+
+    // 2. 1v1 DM D1: even 2 hours (7200s) after last reply -> still admitted!
+    const dmRoot = { ...root, channelId: "D1", messageTs: "1000.000001", threadTs: "1000.000001", text: "<@U1> hi" };
+    const dmCreated = await routeSlackThreadEvent(dmRoot, f.config, fetcher);
+    runs = [{ id: "r2", issue_id: dmCreated.issueId, workspace_id: "ws", agent_id: "agent", status: "completed" }];
+    await f.config.store.set(threadRepliedStorageKey(f.config, dmRoot), "1100.000001", 3600);
+
+    const dmLate = await routeSlackThreadEvent(
+      { ...dmRoot, messageTs: "8300.000001", text: "两小时后在1v1私聊续聊", trigger: "implicit_thread" },
+      f.config,
+      fetcher,
+    );
+    expect(dmLate.action).toBe("comment_persisted");
+  });
+
   it("supports !new session reset, offline runtime zzz reaction, and failed-run watchdog cleanup + alert", async () => {
     const f = fixture();
     f.config.slackReactionToken = "test-token";
