@@ -42,6 +42,28 @@ def query(command, *, text=False, sleep=time.sleep):
             sleep(delay)
 
 
+def with_task_env_file(env):
+    """环境里没有 MULTICA_TASK_ID 时，从 daemon 的任务环境文件补上。
+
+    常驻的 Runtime（持久 Claude Code、Codex app-server）跨任务复用进程，daemon 不把每轮变量放进
+    进程环境，而是写入 MULTICA_TASK_ENV_FILE 指向的 JSON：{"active": true, "env": {...}}。
+    只取任务 ID；任务 token 留在文件里，由 multica CLI 自己读取。
+    """
+    env = dict(env)
+    path = env.get("MULTICA_TASK_ENV_FILE")
+    if env.get("MULTICA_TASK_ID") or not path:
+        return env
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return env
+    overlay = payload.get("env") if isinstance(payload, dict) and payload.get("active") is True else None
+    task_id = overlay.get("MULTICA_TASK_ID") if isinstance(overlay, dict) else None
+    if isinstance(task_id, str) and task_id:
+        env["MULTICA_TASK_ID"] = task_id
+    return env
+
+
 def scope(env):
     keys = ("MULTICA_SERVER_URL", "MULTICA_WORKSPACE_ID", "MULTICA_TASK_ID")
     if any(not env.get(key) for key in keys):
@@ -305,8 +327,9 @@ def main():
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     try:
-        data = snapshot(args.issue, os.environ)
-        link_args = link_context(data, args.issue_identifier, args.workspace_slug, args.app_url, os.environ)
+        env = with_task_env_file(os.environ)
+        data = snapshot(args.issue, env)
+        link_args = link_context(data, args.issue_identifier, args.workspace_slug, args.app_url, env)
         summary = summarize(data, *link_args)
         write_new(args.output, summary)
     except Exception as error:

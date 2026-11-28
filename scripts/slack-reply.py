@@ -331,6 +331,30 @@ def read_wakeup_source(config, issue_id, comment_id, task_id, runner=subprocess.
     return envelope, source_comment_id, 'wakeup:' + wakeup['id'] + ':run:' + task_id
 
 
+def adopt_task_env_file(environ=None):
+    """Fill MULTICA_TASK_ID from the daemon's task env overlay when the process environment lacks it.
+
+    A warm pooled runtime (persistent Claude Code, Codex app-server) outlives one task, so the daemon
+    keeps per-task variables out of the process environment and writes them to the JSON file named
+    by MULTICA_TASK_ENV_FILE: {"active": true, "env": {...}}. Only the task id is copied; the task
+    token stays in the file, where the multica CLI reads it.
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get('MULTICA_TASK_ID'):
+        return
+    path = environ.get('MULTICA_TASK_ENV_FILE')
+    if not path:
+        return
+    try:
+        payload = json.loads(Path(path).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    env = payload.get('env') if isinstance(payload, dict) and payload.get('active') is True else None
+    task_id = env.get('MULTICA_TASK_ID') if isinstance(env, dict) else None
+    if isinstance(task_id, str) and task_id:
+        environ['MULTICA_TASK_ID'] = task_id
+
+
 TIME_WAKEUP_KINDS = ('cron', 'every', 'at')
 RUN_CONTEXT_SCRIPT = Path(__file__).resolve().parents[1] / 'multica-skills/multica-final-reply/scripts/run_context.py'
 
@@ -1159,6 +1183,7 @@ def main(argv=None, opener=urllib.request.urlopen, runner=subprocess.run):
     parser.add_argument('--interim', help='Send a retry-safe mid-run progress reply with this step key without locking out the final reply')
     parser.add_argument('--ack-thread-ts', help='Acknowledge newer Slack thread messages up to this ts after thread_changed_since_trigger')
     args = parser.parse_args(argv)
+    adopt_task_env_file()
     if args.ack_thread_ts is not None and not re.fullmatch(r'\d+\.\d{1,6}', args.ack_thread_ts):
         raise ValueError('invalid_ack_thread_ts')
     config_path = Path(args.config)

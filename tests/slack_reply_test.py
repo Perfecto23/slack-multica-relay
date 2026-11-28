@@ -1733,5 +1733,61 @@ class InterimAndSteerSupplementTests(unittest.TestCase):
             reply.check_thread_freshness('tok', cfg, env, ack_thread_ts='100.000002')
 
 
+class TaskEnvFileTests(unittest.TestCase):
+    task_id = '11111111-2222-4333-8444-555555555555'
+
+    def overlay(self, directory, payload):
+        path = Path(directory) / 'task-env.json'
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        return str(path)
+
+    def test_active_overlay_supplies_only_the_task_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environ = {'MULTICA_TASK_ENV_FILE': self.overlay(directory, {
+                'active': True, 'env': {'MULTICA_TASK_ID': self.task_id, 'MULTICA_TOKEN': 'task-token'}})}
+            reply.adopt_task_env_file(environ)
+        self.assertEqual(environ.get('MULTICA_TASK_ID'), self.task_id)
+        self.assertNotIn('MULTICA_TOKEN', environ)
+
+    def test_process_environment_wins_over_overlay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environ = {'MULTICA_TASK_ID': 'from-env', 'MULTICA_TASK_ENV_FILE': self.overlay(
+                directory, {'active': True, 'env': {'MULTICA_TASK_ID': self.task_id}})}
+            reply.adopt_task_env_file(environ)
+        self.assertEqual(environ['MULTICA_TASK_ID'], 'from-env')
+
+    def test_inactive_missing_or_corrupt_overlay_leaves_task_id_unset(self):
+        payloads = ({'active': False, 'env': {'MULTICA_TASK_ID': self.task_id}}, {'active': True}, {'active': True, 'env': {}},
+                    {'active': True, 'env': {'MULTICA_TASK_ID': 7}}, {'active': 'true', 'env': {'MULTICA_TASK_ID': self.task_id}},
+                    [], 'not json')
+        with tempfile.TemporaryDirectory() as directory:
+            for payload in payloads:
+                with self.subTest(payload=payload):
+                    environ = {'MULTICA_TASK_ENV_FILE': self.overlay(directory, payload)}
+                    reply.adopt_task_env_file(environ)
+                    self.assertNotIn('MULTICA_TASK_ID', environ)
+            environ = {'MULTICA_TASK_ENV_FILE': str(Path(directory) / 'absent.json')}
+            reply.adopt_task_env_file(environ)
+            self.assertNotIn('MULTICA_TASK_ID', environ)
+        environ = {}
+        reply.adopt_task_env_file(environ)
+        self.assertEqual(environ, {})
+
+    def test_current_run_resolves_from_overlay_when_environment_has_no_task_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text(json.dumps(CONFIG))
+            text = Path(directory) / 'body.md'
+            text.write_text('body')
+            overlay = self.overlay(directory, {'active': True, 'env': {'MULTICA_TASK_ID': self.task_id}})
+            environ = {key: value for key, value in os.environ.items() if key != 'MULTICA_TASK_ID'}
+            environ['MULTICA_TASK_ENV_FILE'] = overlay
+            with patch.dict(os.environ, environ, clear=True), \
+                    patch.object(reply, 'resolve_current_run', side_effect=ValueError('stop_after_resolve')) as resolve:
+                with self.assertRaisesRegex(ValueError, 'stop_after_resolve'):
+                    reply.main(['--config', str(config), '--issue-id', 'I1', '--current-run', '--text-file', str(text)])
+        self.assertEqual(resolve.call_args.args[3], self.task_id)
+
+
 if __name__ == '__main__':
     unittest.main()
